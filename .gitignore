@@ -29,3 +29,13 @@ venv/
 backend/venv/
 __pycache__/
 *.py[cod]
+
+
+.claude/
+.vscode/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/venv/
+**/.venv/
