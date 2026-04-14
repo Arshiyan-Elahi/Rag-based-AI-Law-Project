@@ -1,0 +1,121 @@
+/* MainLayout.css — Cybrain QS */
+
+/* ─── Base three-column grid ─── */
+.main-layout-container {
+  display: grid;
+  grid-template-columns: 260px 1fr 340px;
+  grid-template-rows: 100vh;
+  min-height: 100vh;
+  background-color: #F0F2F5;
+  overflow: hidden;
+  position: relative;
+}
+
+.main-content-area {
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  overflow-x: hidden;
+  position: relative;
+  height: 100vh;
+  min-width: 0;
+}
+
+.page-outlet {
+  flex: 1;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  min-width: 0;
+}
+
+.ai-assistant-sidebar {
+  background-color: #ffffff;
+  border-left: 1px solid rgba(0, 0, 0, 0.1);
+  height: 100vh;
+  position: sticky;
+  top: 0;
+  overflow-y: auto;
+  min-width: 0;
+}
+
+/* ─── Mobile overlay ─── */
+.sidebar-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  z-index: 200;
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+  animation: overlay-fade-in 200ms ease;
+}
+
+@keyframes overlay-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+/* ─── Breakpoints ─── */
+
+/* Large desktop */
+@media (min-width: 1441px) {
+  .main-layout-container {
+    grid-template-columns: 260px 1fr 360px;
+  }
+}
+
+/* Tablet-lg: shrink both sidebars a bit */
+@media (max-width: 1440px) {
+  .main-layout-container {
+    grid-template-columns: 240px 1fr 300px;
+  }
+}
+
+/* Tablet: icon-only sidebar (80px) + smaller AI panel */
+@media (max-width: 1200px) {
+  .main-layout-container {
+    grid-template-columns: 80px 1fr 260px;
+  }
+}
+
+/* Small tablet / large mobile: sidebar as drawer, hide AI panel */
+@media (max-width: 1024px) {
+  .main-layout-container {
+    grid-template-columns: 0 1fr 0;
+  }
+
+  .ai-assistant-sidebar {
+    display: none;
+  }
+
+  .page-outlet {
+    padding: 16px;
+    gap: 16px;
+  }
+}
+
+/* Mobile */
+@media (max-width: 768px) {
+  .main-layout-container {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto;
+  }
+
+  .main-content-area {
+    height: 100dvh;
+  }
+
+  .page-outlet {
+    padding: 12px;
+    gap: 12px;
+  }
+}
+
+/* Very small mobile */
+@media (max-width: 480px) {
+  .page-outlet {
+    padding: 10px;
+    gap: 10px;
+  }
+}
