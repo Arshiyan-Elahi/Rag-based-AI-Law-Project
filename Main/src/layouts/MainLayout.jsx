@@ -4,6 +4,7 @@ import Sidebar from '../components/Layout/Sidebar'
 import Topbar from '../components/Layout/Topbar'
 import AIWidget from '../components/Dashboard/AIWidget'
 import './MainLayout.css'
+import FloatingAskAIButton from '../components/Common/FloatingAskAIButton'
 
 /**
  * MainLayout
@@ -55,6 +56,8 @@ export default function MainLayout() {
           aria-hidden="true"
         />
       )}
+
+      <FloatingAskAIButton />
     </div>
   )
 }
