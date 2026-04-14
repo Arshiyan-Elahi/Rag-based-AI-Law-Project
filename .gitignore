@@ -8,6 +8,7 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
+node_modules_REDUNDANT
 dist
 dist-ssr
 *.local
@@ -39,3 +40,6 @@ __pycache__/
 **/*.pyd
 **/venv/
 **/.venv/
+.kombai/
+archive-unused/
+review-needed/
