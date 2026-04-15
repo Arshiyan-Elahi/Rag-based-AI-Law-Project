@@ -106,6 +106,7 @@ function mapSOP(s) {
     date: s.updated_at ? new Date(s.updated_at).toLocaleDateString('de-DE') : '—',
     owner: cv?.metadata_json?.sopMetadata?.author || s.department || 'System',
     is_active: s.is_active,
+    updated_at_raw: s.updated_at || null, // kept for client-side sorting
   }
 }
 
@@ -148,6 +149,7 @@ export default function SOPsPage() {
   const [kiSummaryOpen, setKiSummaryOpen] = useState(true)
   const [searchTerm, setSearchTerm] = useState('')
   const [activeFilterTab, setActiveFilterTab] = useState('Alle')
+  const [sortOrder, setSortOrder] = useState('asc') // 'asc' | 'recent' | 'oldest'
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [sops, setSops] = useState([])
@@ -157,14 +159,8 @@ export default function SOPsPage() {
     setError(null)
     try {
       const raw = await getSOPs()
-      const mapped = Array.isArray(raw)
-        ? raw
-          .sort((a, b) => {
-            if (a.is_active !== b.is_active) return a.is_active ? -1 : 1
-            return new Date(b.updated_at) - new Date(a.updated_at)
-          })
-          .map(mapSOP)
-        : []
+      // Raw data — no hardcoded sort; user-controlled dropdown owns ordering
+      const mapped = Array.isArray(raw) ? raw.map(mapSOP) : []
       setSops(mapped)
     } catch (err) {
       console.error('Failed to load SOPs:', err)
@@ -194,6 +190,18 @@ export default function SOPsPage() {
     if (activeFilterTab === 'Alle') return matchesSearch
     const allowed = STATUS_MAP[activeFilterTab] || []
     return matchesSearch && allowed.includes((sop.status || '').toLowerCase())
+  })
+
+  // ── Client-side sorting (works on real backend data) ─────────────────────
+  const sortedSops = [...filteredSops].sort((a, b) => {
+    if (sortOrder === 'recent') {
+      return new Date(b.updated_at_raw || 0) - new Date(a.updated_at_raw || 0)
+    }
+    if (sortOrder === 'oldest') {
+      return new Date(a.updated_at_raw || 0) - new Date(b.updated_at_raw || 0)
+    }
+    // Default: ascending A→Z by SOP number
+    return (a.sop_number || a.code || '').localeCompare(b.sop_number || b.code || '', 'de')
   })
 
   // ── Actions ──────────────────────────────────────────────────────────────
@@ -303,6 +311,16 @@ export default function SOPsPage() {
                     </button>
                   ))}
                 </div>
+                <select
+                  className="sop-sort-select"
+                  value={sortOrder}
+                  onChange={e => setSortOrder(e.target.value)}
+                  aria-label="Sortierung"
+                >
+                  <option value="asc">A → Z</option>
+                  <option value="recent">Neueste zuerst</option>
+                  <option value="oldest">Älteste zuerst</option>
+                </select>
               </div>
             </section>
 
@@ -313,10 +331,10 @@ export default function SOPsPage() {
                 </div>
               ) : error ? (
                 <div className="table-loading" style={{ color: 'var(--error)' }}>{error}</div>
-              ) : filteredSops.length === 0 ? (
+              ) : sortedSops.length === 0 ? (
                 <div className="table-loading">Keine SOPs gefunden.</div>
               ) : (
-                <SOPTable data={filteredSops} onRowClick={(id) => handleOpen(id)} />
+                <SOPTable data={sortedSops} onRowClick={(id) => handleOpen(id)} />
               )}
             </div>
           </div>
@@ -396,7 +414,19 @@ export default function SOPsPage() {
             <KISummary open={kiSummaryOpen} onToggle={() => setKiSummaryOpen(v => !v)} />
 
             {/* Relevant SOPs from backend */}
-            <h2 className="sops-section-title">Relevante SOPs im aktuellen Kontext</h2>
+            <div className="sops-section-title-row">
+              <h2 className="sops-section-title">Relevante SOPs im aktuellen Kontext</h2>
+              <select
+                className="sop-sort-select"
+                value={sortOrder}
+                onChange={e => setSortOrder(e.target.value)}
+                aria-label="Sortierung"
+              >
+                <option value="asc">A → Z</option>
+                <option value="recent">Neueste zuerst</option>
+                <option value="oldest">Älteste zuerst</option>
+              </select>
+            </div>
 
             <div className="sops-cards-grid">
               {loading && (
@@ -412,7 +442,7 @@ export default function SOPsPage() {
                   Keine SOPs in der Datenbank gefunden.
                 </div>
               )}
-              {!loading && sops.slice(0, 4).map(sop => (
+              {!loading && sortedSops.map(sop => (
                 <SOPCard
                   key={sop.id}
                   sop={sop}
