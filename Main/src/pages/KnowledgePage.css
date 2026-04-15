@@ -1,4 +1,4 @@
-/* WissensuchePage.css — Cybrain QS Knowledge Search */
+/* KnowledgePage.css — Cybrain QS Knowledge Search */
 
 .ws-page {
   display: flex;
@@ -139,7 +139,9 @@
 }
 
 @keyframes ws-spin {
-  to { transform: rotate(360deg); }
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 /* Source count tags */
@@ -646,6 +648,14 @@
     flex-wrap: wrap;
   }
 
+  .ws-chip {
+    white-space: normal;
+    text-align: left;
+    height: auto;
+    padding: 8px 14px;
+    line-height: 1.4;
+  }
+
   .ws-source-tags {
     flex-wrap: wrap;
   }
@@ -654,5 +664,50 @@
     flex-direction: column;
     align-items: flex-start;
     gap: 4px;
+  }
+}
+
+@media (max-width: 480px) {
+  .ws-search-card {
+    padding: 12px;
+    gap: 12px;
+  }
+
+  .ws-title {
+    font-size: 20px;
+  }
+
+  .ws-search-input-box {
+    flex-direction: column;
+    height: auto;
+    border: none;
+    gap: 6px;
+  }
+
+  .ws-search-input {
+    width: 100%;
+    border: 1px solid rgba(0, 0, 0, 0.10);
+    border-radius: 5px;
+    height: 40px;
+  }
+
+  .ws-kontext-btn {
+    width: 100%;
+    border-radius: 5px;
+    height: 40px;
+    justify-content: center;
+  }
+
+  .ws-summary-header-row {
+    padding: 10px 14px;
+  }
+
+  .ws-summary-card {
+    padding: 12px 14px;
+  }
+
+  .ws-result-card {
+    padding: 12px 14px;
+    gap: 12px;
   }
 }

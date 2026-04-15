@@ -1240,16 +1240,16 @@ const EditorPage = ({ isEmbedded = false, initialDocId = undefined }) => {
 
           <div className="editor-scroller">
             <div
-              className={`editor-portal-grid ${(isContractProfile && showVariablesPanel) || isSOPProfile ? 'has-sidebar' : ''}`}
+              className={`editor-layout ${((isContractProfile && showVariablesPanel) || isSOPProfile) ? 'with-right-panel' : ''}`}
             >
-              <div className="editor-paper-container">
+              <div className="pdf-export-wrapper">
                 <div ref={editorRef} className="editor-paper-surface">
                   <EditorContent editor={editor} />
                 </div>
               </div>
 
               {((isContractProfile && featureFlags.contractProfileEnabled && showVariablesPanel) || isSOPProfile) && (
-                <aside className="editor-right-sidebar">
+                <aside className="right-panel">
                   {isContractProfile && (
                     <>
                       {!isClientReviewMode && (

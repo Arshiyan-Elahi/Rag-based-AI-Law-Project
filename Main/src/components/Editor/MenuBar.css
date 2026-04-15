@@ -133,3 +133,64 @@
   from { transform: rotate(0deg); }
   to { transform: rotate(360deg); }
 }
+
+/* ═══════════════════════════════════════════════════════════════
+   RESPONSIVE
+   ═══════════════════════════════════════════════════════════════ */
+
+/* Tablet (≤1024px) */
+@media (max-width: 1024px) {
+  .editor-menubar {
+    padding: 6px 12px;
+    gap: 6px;
+    top: 0; /* Sticky to top if Topbar is hidden or relative in some views */
+  }
+
+  .menubar-btn {
+    height: 32px;
+    padding: 0 8px;
+    font-size: 12px;
+  }
+}
+
+/* Mobile (≤768px) */
+@media (max-width: 768px) {
+  .editor-menubar {
+    padding: 4px 8px;
+    gap: 4px;
+    justify-content: center;
+  }
+
+  /* Hide button text on mobile to save space, keep icons */
+  .menubar-btn span {
+    display: none;
+  }
+
+  .menubar-btn {
+    width: 32px;
+    padding: 0;
+    justify-content: center;
+  }
+
+  .menubar-btn svg {
+    margin: 0 !important;
+  }
+
+  .menubar-divider {
+    height: 20px;
+    margin: 0 2px;
+  }
+}
+
+/* Small mobile (≤480px) */
+@media (max-width: 480px) {
+  .editor-menubar {
+    position: static; /* Let it scroll if it doesn't fit? Actually, keep sticky but maybe smaller */
+    padding: 4px;
+  }
+
+  .menubar-group {
+    gap: 2px;
+  }
+}
+

@@ -337,6 +337,7 @@
   .sidebar-header {
     display: block;
     width: 100%;
+    padding-top: 40px; /* Important: Create space for absolute positioned close btn */
     padding-bottom: 24px;
   }
 

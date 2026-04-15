@@ -138,6 +138,19 @@ export async function getDecisions() {
   return res.json()
 }
 
+export async function searchKnowledge(query) {
+  const params = new URLSearchParams({ q: query })
+  const res = await fetch(`${API_BASE}/api/search?${params}`)
+  if (!res.ok) await throwApiError(res, 'Failed to perform knowledge search')
+  return res.json()
+}
+
+export async function getKnowledgeStats() {
+  const res = await fetch(`${API_BASE}/api/stats`)
+  if (!res.ok) await throwApiError(res, 'Failed to fetch knowledge stats')
+  return res.json()
+}
+
 // TODO: Connect to real AI endpoint when available (e.g. POST /api/ai/query)
 // The AI endpoint should accept { question: string } and return
 // { answer: string, sources: Array<{ id: string, type: string, label: string }> }

@@ -3,6 +3,7 @@ import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-d
 import MainLayout from './layouts/MainLayout'
 import DashboardPage from './pages/DashboardPage'
 import SOPsPage from './pages/SOPsPage'
+import KnowledgePage from './pages/KnowledgePage'
 import EditorPage from './pages/EditorPage'
 
 // Placeholder for other pages
@@ -27,16 +28,16 @@ function App() {
         <Route path="/" element={<MainLayout />}>
           <Route index element={<DashboardPage />} />
           <Route path="dashboard" element={<Navigate to="/" replace />} />
-          
-          <Route path="knowledge" element={<UnderConstruction title="Wissenssuche" />} />
+
+          <Route path="knowledge" element={<KnowledgePage />} />
           <Route path="chat" element={<UnderConstruction title="Gespräche" />} />
           <Route path="sops" element={<SOPsPage />} />
-          
+
           <Route path="deviations" element={<UnderConstruction title="Abweichungen" />} />
           <Route path="capa" element={<UnderConstruction title="CAPA Maßnahmen" />} />
           <Route path="audits" element={<UnderConstruction title="Audit Findings" />} />
           <Route path="decisions" element={<UnderConstruction title="Entscheidungen" />} />
-          
+
           <Route path="settings" element={<UnderConstruction title="Einstellungen" />} />
           <Route path="help" element={<UnderConstruction title="Helfen" />} />
         </Route>

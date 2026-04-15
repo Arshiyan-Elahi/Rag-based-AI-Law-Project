@@ -258,3 +258,16 @@
     height: 32px;
   }
 }
+
+/* ── Tiny mobile: hide search bar entirely, keep hamburger + avatar ── */
+@media (max-width: 380px) {
+  .search-wrapper {
+    display: none;
+  }
+
+  .topbar-container {
+    padding: 0 10px;
+    gap: 4px;
+  }
+}
+

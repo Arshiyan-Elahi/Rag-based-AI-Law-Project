@@ -958,3 +958,139 @@
 .sops-section-title-row .sops-section-title {
   margin-bottom: 0;
 }
+
+/* ── Additional responsive overrides ─────────────────────────────────────── */
+
+/* Tablet (≤1024px) */
+@media (max-width: 1024px) {
+  .sops-hero-card {
+    padding: 20px;
+  }
+
+  .sops-controls-card {
+    padding: 16px 18px;
+    gap: 16px;
+  }
+
+  .page-title {
+    font-size: 22px;
+  }
+}
+
+/* Narrow tablet / large mobile (≤768px) */
+@media (max-width: 768px) {
+  /* Table view header: stack title block above action buttons */
+  .sops-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 12px;
+  }
+
+  .header-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
+
+  .page-title {
+    font-size: 20px;
+  }
+
+  /* Hero card */
+  .sops-hero-card {
+    padding: 16px;
+    gap: 12px;
+  }
+
+  .sops-hero-title {
+    font-size: 17px;
+  }
+
+  /* Query textarea + analyze button: stack vertically */
+  .sops-query-wrap {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .sops-analyze-btn {
+    align-self: stretch;
+    justify-content: center;
+  }
+
+  /* Action buttons row: wrap nicely */
+  .sops-action-row {
+    gap: 6px;
+  }
+
+  .sops-action-btn {
+    font-size: 12px;
+    padding: 7px 11px;
+  }
+
+  /* Filter group: allow wrapping */
+  .filter-group {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .sop-sort-select {
+    min-width: 120px;
+  }
+
+  /* Section title row: stack if very tight */
+  .sops-section-title-row {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  /* Export / new SOP buttons: shrink text on mobile */
+  .export-btn span,
+  .new-sop-btn span {
+    display: none;
+  }
+
+  .export-btn,
+  .new-sop-btn {
+    padding: 10px 12px;
+  }
+}
+
+/* Small mobile (≤480px) */
+@media (max-width: 480px) {
+  .sops-hero-card {
+    padding: 14px;
+  }
+
+  .sops-hero-title {
+    font-size: 15px;
+  }
+
+  .sops-hero-desc {
+    font-size: 12px;
+  }
+
+  .sops-controls-card {
+    padding: 12px;
+    gap: 10px;
+  }
+
+  .view-selector {
+    flex-wrap: wrap;
+  }
+
+  .view-tab {
+    font-size: 12px;
+    padding: 5px 10px;
+  }
+
+  .ki-subtitle {
+    display: none;
+  }
+
+  .sops-section-title {
+    font-size: 13px;
+  }
+
+  .sop-card-actions {
+    flex-wrap: wrap;
+  }
+}

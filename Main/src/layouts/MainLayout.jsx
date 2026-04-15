@@ -18,7 +18,7 @@ export default function MainLayout() {
   const location = useLocation()
   const [sidebarOpen, setSidebarOpen] = useState(false)
 
-  const showAIWidget = ['/', '/dashboard', '/sops'].includes(location.pathname)
+  const showAIWidget = ['/', '/dashboard', '/sops', '/knowledge'].includes(location.pathname)
 
   // Close drawer on route change
   useEffect(() => {

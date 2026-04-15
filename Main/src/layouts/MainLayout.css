@@ -82,11 +82,17 @@
 /* Small tablet / large mobile: sidebar as drawer, hide AI panel */
 @media (max-width: 1024px) {
   .main-layout-container {
-    grid-template-columns: 0 1fr 0;
+    display: flex;
+    flex-direction: column;
   }
 
   .ai-assistant-sidebar {
     display: none;
+  }
+
+  .main-content-area {
+    flex: 1;
+    width: 100%;
   }
 
   .page-outlet {
@@ -97,11 +103,6 @@
 
 /* Mobile */
 @media (max-width: 768px) {
-  .main-layout-container {
-    grid-template-columns: 1fr;
-    grid-template-rows: auto;
-  }
-
   .main-content-area {
     height: 100dvh;
   }
@@ -115,7 +116,8 @@
 /* Very small mobile */
 @media (max-width: 480px) {
   .page-outlet {
-    padding: 10px;
-    gap: 10px;
+    padding: 6px;
+    gap: 8px;
   }
 }
+
