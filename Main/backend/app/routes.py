@@ -30,9 +30,12 @@ from .schemas import (
     AuditFindingCreateUpdate,
     DecisionCreateUpdate,
     DatasetImportRequest,
+    LinkRequest,
 )
+from uuid import UUID
 import uuid
 import os
+from datetime import datetime
 
 # ==========================================
 # CONSTANTS
@@ -440,6 +443,23 @@ def create_version(
     # Point parent to new version
     sop.current_version_id = version.id
     
+    # Store justification in metadata if provided
+    if payload.change_justification:
+        meta_dict = dict(version.metadata_json) if version.metadata_json else {}
+        audit_trail = meta_dict.get("auditTrail", [])
+        if not isinstance(audit_trail, list):
+            audit_trail = []
+        audit_trail.append({
+            "action": "created_new_revision",
+            "note": payload.change_justification,
+            "version": next_version,
+            "createdAt": datetime.utcnow().isoformat(),
+            "actor": "System"
+        })
+        meta_dict["auditTrail"] = audit_trail
+        meta_dict["change_justification"] = payload.change_justification
+        version.metadata_json = meta_dict
+
     db.commit()
     db.refresh(version)
     db.refresh(sop)
@@ -638,7 +658,6 @@ def get_sop_related_context(id: str, db: Session = Depends(get_db)):
     # Linked Audit Findings (via capa → audit links)
     audit_links = db.query(CapaAuditLink).filter(CapaAuditLink.capa_id.in_(capa_ids)).all() if capa_ids else []
     audit_ids = [l.audit_finding_id for l in audit_links]
-    related_audits = db.query(AuditFinding).filter(AuditFinding.id.in_(audit_ids)).all() if audit_ids else []
 
     # Linked Decisions via audit chain
     decision_links_from_audit = (
@@ -652,13 +671,21 @@ def get_sop_related_context(id: str, db: Session = Depends(get_db)):
     for l in direct_decision_links:
         decision_ids.add(l.decision_id)
 
+    # Bidirectional traversal: include audits linked to ANY of these decisions
+    if decision_ids:
+        backwards_audit_links = db.query(AuditDecisionLink).filter(AuditDecisionLink.decision_id.in_(list(decision_ids))).all()
+        for al in backwards_audit_links:
+            if al.audit_finding_id not in audit_ids:
+                audit_ids.append(al.audit_finding_id)
+
+    related_audits = db.query(AuditFinding).filter(AuditFinding.id.in_(audit_ids)).all() if audit_ids else []
     related_decisions = db.query(Decision).filter(Decision.id.in_(list(decision_ids))).all() if decision_ids else []
 
     return {
         "sop": _build_sop_dict(sop, include_current_version=True, db=db),
         "related_deviations": related_deviations,
         "related_capas": related_capas,
-        "related_audits": related_audits,
+        "related_audit_findings": related_audits,
         "related_decisions": related_decisions,
     }
 
@@ -890,11 +917,20 @@ def import_dataset(payload: DatasetImportRequest, db: Session = Depends(get_db))
     """
     try:
         default_tenant = uuid.UUID("11111111-1111-1111-1111-111111111111")
-        counts = {"sops": 0, "deviations": 0, "capas": 0, "audits": 0, "decisions": 0, "links": 0}
+        counts = {"sops": 0, "deviations": 0, "capas": 0, "audits": 0, "decisions": 0, "links": 0, "failed_links": 0}
+
+        all_links = []
 
         for batch in payload.entities:
+            # Normalize batch keys
+            batch_sops = batch.get("sops", [])
+            batch_deviations = batch.get("deviations", [])
+            batch_capas = batch.get("capas", [])
+            batch_audits = batch.get("audit_findings", []) or batch.get("audits", [])
+            batch_decisions = batch.get("decisions", [])
+            
             # 1. SOPs
-            for s in batch.get("sops", []):
+            for s in batch_sops:
                 sop_id = uuid.UUID(s["id"]) if s.get("id") else uuid.uuid4()
                 sop = db.query(SOP).filter(SOP.id == sop_id).first()
                 if not sop:
@@ -928,12 +964,11 @@ def import_dataset(payload: DatasetImportRequest, db: Session = Depends(get_db))
                                 review_date=v.get("review_date")
                             )
                             db.add(new_v)
-                            # Link as current if asked or if first
                             if v.get("is_current") or not sop.current_version_id:
                                 sop.current_version_id = v_id
             
             # 2. Deviations
-            for d in batch.get("deviations", []):
+            for d in batch_deviations:
                 d_id = uuid.UUID(d["id"]) if d.get("id") else uuid.uuid4()
                 if not db.query(Deviation).filter(Deviation.id == d_id).first():
                     dev = Deviation(
@@ -954,7 +989,7 @@ def import_dataset(payload: DatasetImportRequest, db: Session = Depends(get_db))
                     counts["deviations"] += 1
 
             # 3. CAPAs
-            for c in batch.get("capas", []):
+            for c in batch_capas:
                 c_id = uuid.UUID(c["id"]) if c.get("id") else uuid.uuid4()
                 if not db.query(Capa).filter(Capa.id == c_id).first():
                     capa = Capa(
@@ -972,7 +1007,7 @@ def import_dataset(payload: DatasetImportRequest, db: Session = Depends(get_db))
                     counts["capas"] += 1
 
             # 4. Audit Findings
-            for a in batch.get("audit_findings", []):
+            for a in batch_audits:
                 a_id = uuid.UUID(a["id"]) if a.get("id") else uuid.uuid4()
                 if not db.query(AuditFinding).filter(AuditFinding.id == a_id).first():
                     audit = AuditFinding(
@@ -990,7 +1025,7 @@ def import_dataset(payload: DatasetImportRequest, db: Session = Depends(get_db))
                     counts["audits"] += 1
 
             # 5. Decisions
-            for dec in batch.get("decisions", []):
+            for dec in batch_decisions:
                 dec_id = uuid.UUID(dec["id"]) if dec.get("id") else uuid.uuid4()
                 if not db.query(Decision).filter(Decision.id == dec_id).first():
                     decision = Decision(
@@ -1004,24 +1039,59 @@ def import_dataset(payload: DatasetImportRequest, db: Session = Depends(get_db))
                     db.add(decision)
                     counts["decisions"] += 1
 
-            # 6. Links
-            links_list = batch.get("links", [])
-            for l in links_list:
-                l_type = l.get("type", "").lower()
+            # Accumulate Links for after flush
+            all_links.extend(batch.get("links", []))
+
+        # Flush entity creations to Database to establish valid primary keys
+        db.flush()
+
+        # 6. Process Links (with Validation)
+        for l in all_links:
+            l_type = (l.get("link_type") or l.get("type", "")).lower()
+            try:
                 source_id = uuid.UUID(l["source_id"])
                 target_id = uuid.UUID(l["target_id"])
-                
-                if l_type == "sop-deviation":
-                    db.add(SopDeviationLink(id=uuid.uuid4(), tenant_id=default_tenant, sop_id=source_id, deviation_id=target_id))
-                elif l_type == "deviation-capa":
-                    db.add(DeviationCapaLink(id=uuid.uuid4(), tenant_id=default_tenant, deviation_id=source_id, capa_id=target_id))
-                elif l_type == "capa-audit":
-                    db.add(CapaAuditLink(id=uuid.uuid4(), tenant_id=default_tenant, capa_id=source_id, audit_finding_id=target_id))
-                elif l_type == "audit-decision":
-                    db.add(AuditDecisionLink(id=uuid.uuid4(), tenant_id=default_tenant, audit_finding_id=source_id, decision_id=target_id))
-                elif l_type == "decision-sop":
-                    db.add(DecisionSopLink(id=uuid.uuid4(), tenant_id=default_tenant, decision_id=source_id, sop_id=target_id))
-                counts["links"] += 1
+            except Exception:
+                counts["failed_links"] += 1
+                continue
+            
+            if l_type == "sop-deviation":
+                if db.query(SOP).filter(SOP.id == source_id).first() and db.query(Deviation).filter(Deviation.id == target_id).first():
+                    if not db.query(SopDeviationLink).filter(SopDeviationLink.sop_id == source_id, SopDeviationLink.deviation_id == target_id).first():
+                        db.add(SopDeviationLink(id=uuid.uuid4(), tenant_id=default_tenant, sop_id=source_id, deviation_id=target_id))
+                        counts["links"] += 1
+                else:
+                    counts["failed_links"] += 1
+            elif l_type == "deviation-capa":
+                if db.query(Deviation).filter(Deviation.id == source_id).first() and db.query(Capa).filter(Capa.id == target_id).first():
+                    if not db.query(DeviationCapaLink).filter(DeviationCapaLink.deviation_id == source_id, DeviationCapaLink.capa_id == target_id).first():
+                        db.add(DeviationCapaLink(id=uuid.uuid4(), tenant_id=default_tenant, deviation_id=source_id, capa_id=target_id))
+                        counts["links"] += 1
+                else:
+                    counts["failed_links"] += 1
+            elif l_type == "capa-audit":
+                if db.query(Capa).filter(Capa.id == source_id).first() and db.query(AuditFinding).filter(AuditFinding.id == target_id).first():
+                    if not db.query(CapaAuditLink).filter(CapaAuditLink.capa_id == source_id, CapaAuditLink.audit_finding_id == target_id).first():
+                        db.add(CapaAuditLink(id=uuid.uuid4(), tenant_id=default_tenant, capa_id=source_id, audit_finding_id=target_id))
+                        counts["links"] += 1
+                else:
+                    counts["failed_links"] += 1
+            elif l_type == "audit-decision":
+                if db.query(AuditFinding).filter(AuditFinding.id == source_id).first() and db.query(Decision).filter(Decision.id == target_id).first():
+                    if not db.query(AuditDecisionLink).filter(AuditDecisionLink.audit_finding_id == source_id, AuditDecisionLink.decision_id == target_id).first():
+                        db.add(AuditDecisionLink(id=uuid.uuid4(), tenant_id=default_tenant, audit_finding_id=source_id, decision_id=target_id))
+                        counts["links"] += 1
+                else:
+                    counts["failed_links"] += 1
+            elif l_type == "decision-sop":
+                if db.query(Decision).filter(Decision.id == source_id).first() and db.query(SOP).filter(SOP.id == target_id).first():
+                    if not db.query(DecisionSopLink).filter(DecisionSopLink.decision_id == source_id, DecisionSopLink.sop_id == target_id).first():
+                        db.add(DecisionSopLink(id=uuid.uuid4(), tenant_id=default_tenant, decision_id=source_id, sop_id=target_id))
+                        counts["links"] += 1
+                else:
+                    counts["failed_links"] += 1
+            else:
+                counts["failed_links"] += 1
 
         db.commit()
         return {
@@ -1201,3 +1271,77 @@ def search_knowledge(q: str, db: Session = Depends(get_db)):
     results.sort(key=lambda x: x["matchPercent"], reverse=True)
     
     return results
+
+# ==========================================
+# MANUAL LINKING ROUTES
+# ==========================================
+
+@router.post("/api/links")
+def create_link(payload: LinkRequest, db: Session = Depends(get_db)):
+    """Create a manual link between two entities."""
+    l_type = payload.link_type.lower()
+    source_id = payload.source_id
+    target_id = payload.target_id
+    
+    link_obj = None
+    if l_type == "sop-deviation":
+        link_obj = SopDeviationLink(id=uuid.uuid4(), tenant_id=FIXED_TENANT_ID, sop_id=source_id, deviation_id=target_id, rationale_text=payload.rationale_text)
+    elif l_type == "deviation-capa":
+        link_obj = DeviationCapaLink(id=uuid.uuid4(), tenant_id=FIXED_TENANT_ID, deviation_id=source_id, capa_id=target_id, rationale_text=payload.rationale_text)
+    elif l_type == "capa-audit":
+        link_obj = CapaAuditLink(id=uuid.uuid4(), tenant_id=FIXED_TENANT_ID, capa_id=source_id, audit_finding_id=target_id, rationale_text=payload.rationale_text)
+    elif l_type == "audit-decision":
+        link_obj = AuditDecisionLink(id=uuid.uuid4(), tenant_id=FIXED_TENANT_ID, audit_finding_id=source_id, decision_id=target_id, rationale_text=payload.rationale_text)
+    elif l_type == "decision-sop":
+        link_obj = DecisionSopLink(id=uuid.uuid4(), tenant_id=FIXED_TENANT_ID, decision_id=source_id, sop_id=target_id, rationale_text=payload.rationale_text)
+    
+    if not link_obj:
+        raise HTTPException(status_code=400, detail=f"Unsupported link type: {l_type}")
+        
+    db.add(link_obj)
+    db.commit()
+    return {"status": "success", "link_id": str(link_obj.id)}
+
+@router.delete("/api/links/{link_type}/{link_id}")
+def delete_link(link_type: str, link_id: UUID, db: Session = Depends(get_db)):
+    """Delete a manual link."""
+    l_type = link_type.lower()
+    
+    model_map = {
+        "sop-deviation": SopDeviationLink,
+        "deviation-capa": DeviationCapaLink,
+        "capa-audit": CapaAuditLink,
+        "audit-decision": AuditDecisionLink,
+        "decision-sop": DecisionSopLink
+    }
+    
+    if l_type not in model_map:
+        raise HTTPException(status_code=400, detail=f"Unsupported link type: {l_type}")
+        
+    link = db.query(model_map[l_type]).filter(model_map[l_type].id == link_id).first()
+    if not link:
+        raise HTTPException(status_code=404, detail="Link not found")
+        
+    db.delete(link)
+    db.commit()
+    return {"status": "success"}
+
+# ==========================================
+# NORMALIZATION & BGE-M3 PREP (PLACEHOLDERS)
+# ==========================================
+
+@router.post("/api/normalization/unified-ingest")
+def unified_ingest(payload: dict, db: Session = Depends(get_db)):
+    """
+    Placeholder for the unified normalization flow.
+    Ensures all ingested content (Editor or Upload) follows one pipe.
+    """
+    return {"status": "stub", "message": "Normalization service ready for integration"}
+
+@router.post("/api/semantic/reindex")
+def semantic_reindex(entity_id: UUID, db: Session = Depends(get_db)):
+    """
+    Placeholder for BGE-M3 reindexing.
+    Will be called when a document becomes 'effective'.
+    """
+    return {"status": "stub", "message": "Semantic indexing placeholder"}

@@ -164,6 +164,40 @@ export async function queryAI(question) {
   return res.json()
 }
 
+export async function createLink(payload) {
+  const res = await fetch(`${API_BASE}/api/links`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  if (!res.ok) await throwApiError(res, 'Failed to create link')
+  return res.json()
+}
+
+export async function deleteLink(linkType, linkId) {
+  const res = await fetch(`${API_BASE}/api/links/${linkType}/${linkId}`, {
+    method: 'DELETE',
+  })
+  if (!res.ok) await throwApiError(res, 'Failed to delete link')
+  return res.json()
+}
+
+export async function getRelatedContext(sopId) {
+  const res = await fetch(`${API_BASE}/api/sops/${sopId}/related`)
+  if (!res.ok) await throwApiError(res, 'Failed to fetch related context')
+  return res.json()
+}
+
+export async function semanticReindex(entityId) {
+  const res = await fetch(`${API_BASE}/api/semantic/reindex`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ entity_id: entityId }),
+  })
+  if (!res.ok) await throwApiError(res, 'Failed to trigger reindexing')
+  return res.json()
+}
+
 export async function extractText(file) {
   const formData = new FormData()
   formData.append('file', file)

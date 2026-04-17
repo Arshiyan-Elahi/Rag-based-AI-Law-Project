@@ -21,6 +21,8 @@ import SOPReferencesPanel from '../components/Editor/SOP/SOPReferencesPanel'
 import SOPActions from '../components/Editor/SOP/SOPActions'
 import SOPTimeline from '../components/Editor/SOP/SOPTimeline'
 import SOPAuditTrail from '../components/Editor/SOP/SOPAuditTrail'
+import RelatedContextSidebar from '../components/Editor/SOP/RelatedContextSidebar'
+import LinkingModal from '../components/Common/LinkingModal'
 import {
   DEFAULT_SOP_VERSION_METADATA,
   SOP_STATES,
@@ -137,6 +139,8 @@ const EditorPage = ({ isEmbedded = false, initialDocId = undefined }) => {
   const [isClientReviewMode, setIsClientReviewMode] = useState(false)
   const [reviewLink, setReviewLink] = useState('')
   const [reviewToken, setReviewToken] = useState(null)
+  const [showRelatedContext, setShowRelatedContext] = useState(true)
+  const [isLinkingModalOpen, setIsLinkingModalOpen] = useState(false)
 
   // Toast notification state — { message, type }
   const [toast, setToast] = useState(null)
@@ -688,6 +692,9 @@ const EditorPage = ({ isEmbedded = false, initialDocId = undefined }) => {
   const createNewVersionHandler = useCallback(async () => {
     if (!editor || !canCreateNewVersion || !documentId) return
 
+    const justification = window.prompt('Bitte geben Sie eine Begründung für die neue Version an:', '')
+    if (justification === null) return // User cancelled
+
     const editorJson = editor.getJSON()
 
     // ── Empty-content detection ──────────────────────────────────────────────
@@ -724,6 +731,7 @@ const EditorPage = ({ isEmbedded = false, initialDocId = undefined }) => {
       const newVersion = await createVersion(documentId, {
         doc_json: finalJson,
         change_summary: 'New version created',
+        change_justification: justification,
         metadata_json: newMetadata,
       })
 
@@ -1300,6 +1308,8 @@ const EditorPage = ({ isEmbedded = false, initialDocId = undefined }) => {
                         onCreateNewDocument={createNewDocumentHandler}
                         onDuplicateAsNewDocument={duplicateAsNewDocumentHandler}
                         canCreateNewVersion={canCreateNewVersion}
+                        onToggleRelated={() => setShowRelatedContext(!showRelatedContext)}
+                        showRelatedContext={showRelatedContext}
                       />
                       <SOPTimeline sopStatus={currentSOPStatus} />
                       <SOPAuditTrail
@@ -1313,7 +1323,25 @@ const EditorPage = ({ isEmbedded = false, initialDocId = undefined }) => {
             </div>
           </div>
         </div>
+        {showRelatedContext && isSOPProfile && (
+          <RelatedContextSidebar 
+            sopId={documentId} 
+            onLinkClick={() => setIsLinkingModalOpen(true)}
+          />
+        )}
       </div>
+
+      <LinkingModal 
+        isOpen={isLinkingModalOpen}
+        onClose={() => setIsLinkingModalOpen(false)}
+        sourceId={documentId}
+        sourceType="sop"
+        onLinkCreated={() => {
+            // Trigger refresh - we can use a key or state toggle
+            setShowRelatedContext(false);
+            setTimeout(() => setShowRelatedContext(true), 10);
+        }}
+      />
 
       <StatusBar
         wordCount={wordCount}

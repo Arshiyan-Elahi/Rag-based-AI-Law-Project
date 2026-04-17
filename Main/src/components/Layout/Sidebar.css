@@ -215,8 +215,8 @@
    RESPONSIVE BREAKPOINTS
    ═══════════════════════════════════════════════════════════ */
 
-/* ─── Tablet: 80px icon-only mode (1024px < width ≤ 1200px) ─── */
-@media (max-width: 1200px) and (min-width: 1025px) {
+/* ─── Tablet: 80px icon-only mode (1024px ≤ width ≤ 1279px) ─── */
+@media (max-width: 1279px) and (min-width: 1024px) {
   .sidebar-container {
     padding: 20px 4px;
     align-items: center;
@@ -280,8 +280,8 @@
   }
 }
 
-/* ─── Mobile drawer (≤1024px) ─── */
-@media (max-width: 1024px) {
+/* ─── Mobile drawer (≤1023px) ─── */
+@media (max-width: 1023px) {
   .sidebar-container {
     /* Take it out of the grid — render as a fixed off-screen drawer */
     position: fixed;

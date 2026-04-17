@@ -20,7 +20,15 @@ class UpdateDocumentRequest(BaseModel):
 class CreateVersionRequest(BaseModel):
     doc_json: Any
     change_summary: Optional[str] = None
+    change_justification: Optional[str] = None # Enforced in later logic
     metadata_json: Optional[Any] = None
+
+class LinkRequest(BaseModel):
+    source_id: UUID
+    target_id: UUID
+    link_type: str # 'sop-deviation', 'deviation-capa', etc.
+    link_reason: Optional[str] = None
+    rationale_text: Optional[str] = None
 
 class UpdateVersionStatusRequest(BaseModel):
     status: str
@@ -281,7 +289,7 @@ class SopRelatedResponse(BaseModel):
     sop: SOPResponse
     related_deviations: List[DeviationResponse] = []
     related_capas: List[CapaResponse] = []
-    related_audits: List[AuditFindingResponse] = []
+    related_audit_findings: List[AuditFindingResponse] = []
     related_decisions: List[DecisionResponse] = []
 
     model_config = ConfigDict(from_attributes=True)

@@ -1,3 +1,5 @@
+/* FloatingAskAIButton.css — Floating toggle for AI widget drawer */
+
 .floating-ask-ai-btn {
   position: fixed;
   bottom: 24px;
@@ -32,4 +34,40 @@
 
 .floating-ask-ai-btn svg {
   stroke-width: 2.5px;
+}
+
+/* Active state (drawer open) */
+.floating-ask-ai-btn--active {
+  background-color: #b91c1c;
+}
+
+.floating-ask-ai-btn--active:hover {
+  background-color: #991b1b;
+}
+
+/* ─── Hide on desktop where AI widget is always visible in grid ─── */
+/* Only show on screens ≤1023px (md and below) */
+@media (min-width: 1024px) {
+  .floating-ask-ai-btn {
+    display: none;
+  }
+}
+
+/* ─── Mobile adjustments ─── */
+@media (max-width: 639px) {
+  .floating-ask-ai-btn {
+    bottom: 16px;
+    right: 16px;
+    padding: 10px 16px;
+    font-size: 13px;
+  }
+}
+
+@media (max-width: 479px) {
+  .floating-ask-ai-btn {
+    bottom: 12px;
+    right: 12px;
+    padding: 10px 14px;
+    font-size: 12px;
+  }
 }

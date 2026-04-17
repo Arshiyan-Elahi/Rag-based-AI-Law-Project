@@ -216,15 +216,15 @@
    RESPONSIVE BREAKPOINTS
    ═══════════════════════════════════════════════════════════ */
 
-/* Show hamburger on tablet/mobile */
-@media (max-width: 1024px) {
+/* Show hamburger on tablet/mobile (below lg breakpoint) */
+@media (max-width: 1023px) {
   .hamburger-btn {
     display: flex;
   }
 }
 
 /* Shrink topbar padding on small tablet */
-@media (max-width: 1024px) {
+@media (max-width: 1023px) {
   .topbar-container {
     padding: 0 16px;
   }

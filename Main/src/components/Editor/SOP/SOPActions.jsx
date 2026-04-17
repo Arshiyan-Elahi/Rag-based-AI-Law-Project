@@ -21,6 +21,8 @@ export default function SOPActions({
     onCreateNewDocument,
     onDuplicateAsNewDocument,
     canCreateNewVersion = false,
+    onToggleRelated,
+    showRelatedContext = true,
 }) {
     const { t } = useLanguage()
     const config = useSOPConfig()
@@ -144,6 +146,16 @@ export default function SOPActions({
                 </div>
             )}
 
+            {/* System Context Buttons */}
+            <div style={{ marginTop: 24, paddingTop: 16, borderTop: '1px solid #eee' }}>
+                 <button 
+                   onClick={onToggleRelated}
+                   className="secondary-btn"
+                   style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}
+                 >
+                   {showRelatedContext ? 'Verknüpfungen ausblenden' : 'Verknüpfungen anzeigen'}
+                 </button>
+            </div>
         </div>
     )
 }

@@ -4,7 +4,10 @@ import MainLayout from './layouts/MainLayout'
 import DashboardPage from './pages/DashboardPage'
 import SOPsPage from './pages/SOPsPage'
 import KnowledgePage from './pages/KnowledgePage'
+import ChatPage from './pages/ChatPage'
 import EditorPage from './pages/EditorPage'
+
+import EntitiesPage from './pages/EntitiesPage'
 
 // Placeholder for other pages
 const UnderConstruction = ({ title }) => (
@@ -30,13 +33,13 @@ function App() {
           <Route path="dashboard" element={<Navigate to="/" replace />} />
 
           <Route path="knowledge" element={<KnowledgePage />} />
-          <Route path="chat" element={<UnderConstruction title="Gespräche" />} />
+          <Route path="chat" element={<ChatPage />} />
           <Route path="sops" element={<SOPsPage />} />
 
-          <Route path="deviations" element={<UnderConstruction title="Abweichungen" />} />
-          <Route path="capa" element={<UnderConstruction title="CAPA Maßnahmen" />} />
-          <Route path="audits" element={<UnderConstruction title="Audit Findings" />} />
-          <Route path="decisions" element={<UnderConstruction title="Entscheidungen" />} />
+          <Route path="deviations" element={<EntitiesPage type="deviations" />} />
+          <Route path="capa" element={<EntitiesPage type="capas" />} />
+          <Route path="audits" element={<EntitiesPage type="audits" />} />
+          <Route path="decisions" element={<EntitiesPage type="decisions" />} />
 
           <Route path="settings" element={<UnderConstruction title="Einstellungen" />} />
           <Route path="help" element={<UnderConstruction title="Helfen" />} />
