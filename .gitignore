@@ -43,3 +43,6 @@ scripts/_rebuild.py
 
 # Test/Scratch scripts
 scratch/
+
+# Local model caches
+.hf-cache/
