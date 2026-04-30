@@ -31,7 +31,12 @@ export default function AIWidget() {
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
   const chatEndRef = useRef(null)
+  const messagesRef = useRef(messages)
   const suggestions = routeMeta.suggestions
+
+  useEffect(() => {
+    messagesRef.current = messages
+  }, [messages])
 
   // Auto-scroll to bottom when messages change or when loading indicator appears
   useEffect(() => {
@@ -84,7 +89,7 @@ export default function AIWidget() {
 
     try {
       const chatHistoryPayload = [
-        ...messages.map((msg) => ({
+        ...messagesRef.current.map((msg) => ({
           role: msg.role === 'ai' ? 'assistant' : 'user',
           content: msg.text,
         })),
@@ -116,7 +121,7 @@ export default function AIWidget() {
     } finally {
       setSending(false)
     }
-  }, [sending, messages, location.pathname])
+  }, [sending, location.pathname])
 
   const handleSend = () => sendMessage(input)
 

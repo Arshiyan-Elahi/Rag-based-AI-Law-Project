@@ -18,10 +18,8 @@ const RelatedContextSidebar = ({ sopId, onLinkClick, refreshToken = 0 }) => {
     setError('')
     try {
       const data = await getRelatedContext(sopId)
-      console.log('[RelatedContext] Fetched data for SOP:', sopId, data)
       setContext(data)
     } catch (err) {
-      console.error('[RelatedContext] Failed to load data. SOP ID:', sopId, 'Error:', err)
       setContext(null)
       setError(err.message || 'Failed to load related context.')
     } finally {
@@ -154,7 +152,6 @@ const RelatedContextSidebar = ({ sopId, onLinkClick, refreshToken = 0 }) => {
 }
 
 const ContextSection = ({ title, items, icon, tone, emptyText, getLabel, getStatus }) => {
-  console.log(`[RelatedContext] Section '${title}' has ${items.length} items:`, items)
   return (
     <div className="context-section" data-type={title}>
       <h4 className="context-section-header">
@@ -167,7 +164,10 @@ const ContextSection = ({ title, items, icon, tone, emptyText, getLabel, getStat
     ) : (
       <div className="context-items-list">
         {items.map((item, index) => (
-          <div key={item.id} className="context-item-card">
+          <div
+            key={item.id || item.sop_number || item.deviation_number || item.capa_number || item.finding_number || item.decision_number || `${title}-${index}`}
+            className="context-item-card"
+          >
             <div className="context-item-label">{getLabel(item, index)}</div>
             <div className="context-item-status">
               {String(getStatus(item)).toLowerCase()}
