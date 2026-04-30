@@ -3,6 +3,9 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, U
 from typing import List
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_, asc
+from concurrent.futures import ThreadPoolExecutor
+from qdrant_client.http import models as qmodels
+import hashlib
 from .database import get_db, SessionLocal
 from .models import (
     SOP, SOPVersion, Deviation, Capa, AuditFinding, Decision,
@@ -38,10 +41,21 @@ from .schemas import (
     LinkSuggestionResponse,
     SemanticStatusResponse,
 )
-from .services.semantic_pipeline import SemanticPipelineService, ENTITY_TYPES
+from .services.semantic_pipeline import (
+    SemanticPipelineService,
+    ENTITY_TYPES,
+    DEFAULT_COLLECTION,
+    LINK_RULES,
+    AUTO_ACCEPT_DELTA,
+    _get_embedder,
+    _get_qdrant,
+    _split_long_text,
+)
 from uuid import UUID
 import uuid
 import os
+import re
+import threading
 from datetime import datetime
 
 # ==========================================
@@ -50,6 +64,8 @@ from datetime import datetime
 
 # Fixed tenant for dev/seed environment
 FIXED_TENANT_ID = uuid.UUID("11111111-1111-1111-1111-111111111111")
+SEMANTIC_WORKER_THREADS = max(1, int(os.getenv("SEMANTIC_WORKER_THREADS", "2")))
+_semantic_job_executor = ThreadPoolExecutor(max_workers=SEMANTIC_WORKER_THREADS, thread_name_prefix="semantic-job")
 
 
 # ==========================================
@@ -180,22 +196,359 @@ def _resolve_current_version(db: Session, sop: SOP) -> SOPVersion | None:
 
 
 def _schedule_semantic_job(background_tasks: BackgroundTasks, entity_type: str, entity_id: uuid.UUID, version_id: uuid.UUID | None = None, job_type: str = "entity_reindex"):
-    if entity_type not in ENTITY_TYPES:
-        return
-    job_id = SemanticPipelineService.enqueue_reindex(
-        entity_type=entity_type,
-        entity_id=entity_id,
-        version_id=version_id,
-        job_type=job_type,
-    )
-    if background_tasks is not None and job_id:
-        def _run_one() -> None:
-            try:
-                SemanticPipelineService.process_job(job_id)
-            except Exception as exc:
-                print(f"[semantic-job] {job_id} failed: {exc}", flush=True)
+    try:
+        if entity_type not in ENTITY_TYPES:
+            return
+        
+        print(f"[semantic-job] Scheduling {job_type} for {entity_type} {entity_id}", flush=True)
+        job_id = SemanticPipelineService.enqueue_reindex(
+            entity_type=entity_type,
+            entity_id=entity_id,
+            version_id=version_id,
+            job_type=job_type,
+        )
+        if job_id:
+            # Fire-and-forget with bounded worker pool to avoid spawning unbounded
+            # per-request threads and exhausting DB connection pool.
+            def _run_one_async() -> None:
+                try:
+                    SemanticPipelineService.process_job(job_id)
+                except Exception as exc:
+                    print(f"[semantic-job] {job_id} failed: {exc}", flush=True)
+            _semantic_job_executor.submit(_run_one_async)
+    except Exception as exc:
+        print(f"[semantic-job] ERROR: Failed to schedule job for {entity_type} {entity_id}: {exc}", flush=True)
 
-        background_tasks.add_task(_run_one)
+def _extract_plain_text_from_tiptap(doc_json: dict | None) -> str:
+    if not isinstance(doc_json, dict):
+        return ""
+    out: list[str] = []
+
+    def walk(node: dict):
+        if not isinstance(node, dict):
+            return
+        if node.get("type") == "text" and node.get("text"):
+            out.append(str(node.get("text")))
+        for child in node.get("content", []) or []:
+            walk(child)
+
+    walk(doc_json)
+    return " ".join(out).strip()
+
+
+def _parse_uuid_or_400(value: str, field_name: str = "id") -> uuid.UUID:
+    try:
+        return uuid.UUID(str(value))
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Invalid {field_name} format")
+
+
+def _extract_entity_tokens(text: str, prefix: str) -> list[str]:
+    # Deterministic ID extraction, e.g. DEV-001 / CAPA-42 / AUD-7 / DEC-5
+    pattern = rf"\b{prefix}-[A-Z0-9][A-Z0-9\-]*\b"
+    found = re.findall(pattern, text.upper())
+    dedup: list[str] = []
+    seen = set()
+    for token in found:
+        if token not in seen:
+            seen.add(token)
+            dedup.append(token)
+    return dedup
+
+
+def _stable_embedded_ref(prefix: str, sop_id: uuid.UUID, section_text: str) -> str:
+    digest = hashlib.sha1(
+        f"{sop_id}:{prefix}:{section_text.strip()}".encode("utf-8", errors="ignore")
+    ).hexdigest()[:10].upper()
+    return f"{prefix}-EMB-{digest}"
+
+
+def _extract_embedded_sections(text: str, heading_pattern: str) -> list[str]:
+    if not text:
+        return []
+    regex = re.compile(
+        rf"(?ims)^\s*(?:\d+[\.\)]\s*)?(?:{heading_pattern})\s*[:\-]\s*(.+?)(?=^\s*(?:\d+[\.\)]\s*)?(?:deviation|capa|audit(?:\s+finding)?|decision|sop)\s*[:\-]|\Z)"
+    )
+    sections = []
+    for match in regex.finditer(text):
+        body = (match.group(1) or "").strip()
+        if len(body) >= 80:
+            sections.append(body[:3000])
+    return sections
+
+
+def _semantic_candidates_from_text(text: str, target_type: str, limit: int = 5) -> list[dict]:
+    if not text.strip():
+        return []
+    try:
+        embedder = _get_embedder()
+        client = _get_qdrant()
+    except Exception as exc:
+        print(f"[import-linking] Semantic runtime unavailable: {exc}", flush=True)
+        return []
+
+    scores: dict[str, dict] = {}
+    chunks = _split_long_text(text, size=900, overlap=150)[:8]
+    if not chunks:
+        chunks = [text[:900]]
+    for idx, chunk in enumerate(chunks):
+        try:
+            vec = embedder.encode([chunk], normalize_embeddings=True)[0].tolist()
+            filt = qmodels.Filter(
+                must=[qmodels.FieldCondition(key="entity_type", match=qmodels.MatchValue(value=target_type))]
+            )
+            if hasattr(client, "search"):
+                hits = client.search(
+                    collection_name=DEFAULT_COLLECTION,
+                    query_vector=vec,
+                    query_filter=filt,
+                    limit=limit * 2,
+                )
+            else:
+                result = client.query_points(
+                    collection_name=DEFAULT_COLLECTION,
+                    query=vec,
+                    query_filter=filt,
+                    limit=limit * 2,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                hits = result.points
+            for hit in hits:
+                target_id = str(hit.payload.get("entity_id") or "")
+                if not target_id:
+                    continue
+                score = float(hit.score)
+                prev = scores.get(target_id)
+                if prev is None or score > prev["score"]:
+                    scores[target_id] = {"score": score, "chunk_index": idx, "source_chunk": chunk[:300]}
+        except Exception as exc:
+            print(f"[import-linking] Semantic query failed for {target_type}: {exc}", flush=True)
+            continue
+    ranked = sorted(scores.items(), key=lambda kv: kv[1]["score"], reverse=True)[:limit]
+    return [{"target_id": tid, **payload} for tid, payload in ranked]
+
+
+def _upsert_semantic_suggestion(db: Session, source_type: str, source_id: uuid.UUID, target_type: str, target_id: uuid.UUID, link_type: str, score: float, reason: str) -> AILinkSuggestion:
+    target_exists = False
+    if target_type == "deviation":
+        target_exists = db.query(Deviation.id).filter(Deviation.id == target_id).first() is not None
+    elif target_type == "capa":
+        target_exists = db.query(Capa.id).filter(Capa.id == target_id).first() is not None
+    elif target_type == "audit_finding":
+        target_exists = db.query(AuditFinding.id).filter(AuditFinding.id == target_id).first() is not None
+    elif target_type == "decision":
+        target_exists = db.query(Decision.id).filter(Decision.id == target_id).first() is not None
+    elif target_type == "sop":
+        target_exists = db.query(SOP.id).filter(SOP.id == target_id).first() is not None
+    if not target_exists:
+        return None
+
+    suggestion = db.query(AILinkSuggestion).filter(
+        AILinkSuggestion.source_entity_type == source_type,
+        AILinkSuggestion.source_entity_id == source_id,
+        AILinkSuggestion.target_entity_type == target_type,
+        AILinkSuggestion.target_entity_id == target_id,
+        AILinkSuggestion.suggested_link_type == link_type,
+    ).order_by(AILinkSuggestion.created_at.desc()).first()
+    if suggestion is None:
+        suggestion = AILinkSuggestion(
+            source_entity_type=source_type,
+            source_entity_id=source_id,
+            target_entity_type=target_type,
+            target_entity_id=target_id,
+            suggested_link_type=link_type,
+            score=score,
+            reason=reason,
+            status="pending",
+        )
+        db.add(suggestion)
+        db.flush()
+    elif suggestion.status == "pending":
+        suggestion.score = max(float(suggestion.score or 0.0), score)
+        suggestion.reason = reason
+    return suggestion
+
+
+def _upsert_import_context_entities(
+    db: Session,
+    sop: SOP,
+    version: SOPVersion,
+    background_tasks: BackgroundTasks | None = None,
+) -> dict:
+    t0 = datetime.utcnow()
+    text = _extract_plain_text_from_tiptap(version.content_json)
+    if not text:
+        return {"deviations": 0, "capas": 0, "audits": 0, "decisions": 0, "links": 0, "semantic_suggestions": 0, "semantic_auto_accepted": 0}
+    context_hash = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+    version_meta = version.metadata_json if isinstance(version.metadata_json, dict) else {}
+    if version_meta.get("_import_context_hash") == context_hash:
+        return {"deviations": 0, "capas": 0, "audits": 0, "decisions": 0, "links": 0, "semantic_suggestions": 0, "semantic_auto_accepted": 0}
+
+    tenant_id = sop.tenant_id or FIXED_TENANT_ID
+    created = {"deviations": 0, "capas": 0, "audits": 0, "decisions": 0, "links": 0, "semantic_suggestions": 0, "semantic_auto_accepted": 0}
+
+    dev_tokens = _extract_entity_tokens(text, "DEV")
+    capa_tokens = _extract_entity_tokens(text, "CAPA")
+    aud_tokens = _extract_entity_tokens(text, "AUD")
+    dec_tokens = _extract_entity_tokens(text, "DEC")
+    sop_tokens = _extract_entity_tokens(text, "SOP")
+
+    embedded_dev_sections = _extract_embedded_sections(text, r"deviation")
+    embedded_capa_sections = _extract_embedded_sections(text, r"capa")
+    embedded_audit_sections = _extract_embedded_sections(text, r"audit(?:\s+finding)?")
+    embedded_decision_sections = _extract_embedded_sections(text, r"decision")
+
+    deviations: list[Deviation] = []
+    for token in dev_tokens:
+        dev = db.query(Deviation).filter(Deviation.deviation_number == token).first()
+        if not dev:
+            dev = Deviation(id=uuid.uuid4(), tenant_id=tenant_id, deviation_number=token, title=f"Imported {token}", description_text=f"Deterministically extracted from SOP {sop.sop_number}", source_system="pdf_text_import")
+            db.add(dev)
+            created["deviations"] += 1
+        deviations.append(dev)
+    if not dev_tokens:
+        for section in embedded_dev_sections[:2]:
+            stable_number = _stable_embedded_ref("DEV", sop.id, section)
+            dev = db.query(Deviation).filter(Deviation.deviation_number == stable_number).first()
+            if not dev:
+                dev = Deviation(id=uuid.uuid4(), tenant_id=tenant_id, deviation_number=stable_number, title=f"Embedded deviation from {sop.sop_number}", description_text=section, source_system="pdf_text_import")
+                db.add(dev)
+                created["deviations"] += 1
+            elif (dev.description_text or "").strip() != section.strip():
+                dev.description_text = section
+            deviations.append(dev)
+
+    capas: list[Capa] = []
+    for token in capa_tokens:
+        capa = db.query(Capa).filter(Capa.capa_number == token).first()
+        if not capa:
+            capa = Capa(id=uuid.uuid4(), tenant_id=tenant_id, capa_number=token, title=f"Imported {token}", action_text=f"Deterministically extracted from SOP {sop.sop_number}", source_system="pdf_text_import")
+            db.add(capa)
+            created["capas"] += 1
+        capas.append(capa)
+    if not capa_tokens:
+        for section in embedded_capa_sections[:2]:
+            stable_number = _stable_embedded_ref("CAPA", sop.id, section)
+            capa = db.query(Capa).filter(Capa.capa_number == stable_number).first()
+            if not capa:
+                capa = Capa(id=uuid.uuid4(), tenant_id=tenant_id, capa_number=stable_number, title=f"Embedded CAPA from {sop.sop_number}", action_text=section, source_system="pdf_text_import")
+                db.add(capa)
+                created["capas"] += 1
+            elif (capa.action_text or "").strip() != section.strip():
+                capa.action_text = section
+            capas.append(capa)
+
+    audits: list[AuditFinding] = []
+    for token in aud_tokens:
+        audit = db.query(AuditFinding).filter(AuditFinding.finding_number == token).first()
+        if not audit:
+            audit = AuditFinding(id=uuid.uuid4(), tenant_id=tenant_id, finding_number=token, finding_text=f"Deterministically extracted from SOP {sop.sop_number}", source_system="pdf_text_import")
+            db.add(audit)
+            created["audits"] += 1
+        audits.append(audit)
+    if not aud_tokens:
+        for section in embedded_audit_sections[:2]:
+            stable_number = _stable_embedded_ref("AUD", sop.id, section)
+            audit = db.query(AuditFinding).filter(AuditFinding.finding_number == stable_number).first()
+            if not audit:
+                audit = AuditFinding(id=uuid.uuid4(), tenant_id=tenant_id, finding_number=stable_number, finding_text=section, source_system="pdf_text_import")
+                db.add(audit)
+                created["audits"] += 1
+            elif (audit.finding_text or "").strip() != section.strip():
+                audit.finding_text = section
+            audits.append(audit)
+
+    decisions: list[Decision] = []
+    for token in dec_tokens:
+        dec = db.query(Decision).filter(Decision.decision_number == token).first()
+        if not dec:
+            dec = Decision(id=uuid.uuid4(), tenant_id=tenant_id, decision_number=token, title=f"Imported {token}", decision_statement=f"Deterministically extracted from SOP {sop.sop_number}", source_system="pdf_text_import")
+            db.add(dec)
+            created["decisions"] += 1
+        decisions.append(dec)
+    if not dec_tokens:
+        for section in embedded_decision_sections[:2]:
+            stable_number = _stable_embedded_ref("DEC", sop.id, section)
+            dec = db.query(Decision).filter(Decision.decision_number == stable_number).first()
+            if not dec:
+                dec = Decision(id=uuid.uuid4(), tenant_id=tenant_id, decision_number=stable_number, title=f"Embedded decision from {sop.sop_number}", decision_statement=section[:3000], source_system="pdf_text_import")
+                db.add(dec)
+                created["decisions"] += 1
+            elif (dec.decision_statement or "").strip() != section[:3000].strip():
+                dec.decision_statement = section[:3000]
+            decisions.append(dec)
+
+    db.flush()
+    t_structured = datetime.utcnow()
+
+    for dev in deviations:
+        if not db.query(SopDeviationLink).filter(SopDeviationLink.sop_id == sop.id, SopDeviationLink.deviation_id == dev.id).first():
+            db.add(SopDeviationLink(tenant_id=tenant_id, sop_id=sop.id, deviation_id=dev.id, link_reason="import_deterministic"))
+            created["links"] += 1
+    for dev in deviations:
+        for capa in capas:
+            if not db.query(DeviationCapaLink).filter(DeviationCapaLink.deviation_id == dev.id, DeviationCapaLink.capa_id == capa.id).first():
+                db.add(DeviationCapaLink(tenant_id=tenant_id, deviation_id=dev.id, capa_id=capa.id, link_reason="import_deterministic"))
+                created["links"] += 1
+    for capa in capas:
+        for audit in audits:
+            if not db.query(CapaAuditLink).filter(CapaAuditLink.capa_id == capa.id, CapaAuditLink.audit_finding_id == audit.id).first():
+                db.add(CapaAuditLink(tenant_id=tenant_id, capa_id=capa.id, audit_finding_id=audit.id, link_reason="import_deterministic"))
+                created["links"] += 1
+    for audit in audits:
+        for dec in decisions:
+            if not db.query(AuditDecisionLink).filter(AuditDecisionLink.audit_finding_id == audit.id, AuditDecisionLink.decision_id == dec.id).first():
+                db.add(AuditDecisionLink(tenant_id=tenant_id, audit_finding_id=audit.id, decision_id=dec.id, link_reason="import_deterministic"))
+                created["links"] += 1
+    for dec in decisions:
+        if not db.query(DecisionSopLink).filter(DecisionSopLink.decision_id == dec.id, DecisionSopLink.sop_id == sop.id).first():
+            db.add(DecisionSopLink(tenant_id=tenant_id, decision_id=dec.id, sop_id=sop.id, sop_version_id=version.id, link_reason="import_deterministic"))
+            created["links"] += 1
+
+    db.commit()
+    t_links = datetime.utcnow()
+
+    for dev in deviations:
+        _schedule_semantic_job(background_tasks, "deviation", dev.id)
+    for capa in capas:
+        _schedule_semantic_job(background_tasks, "capa", capa.id)
+    for audit in audits:
+        _schedule_semantic_job(background_tasks, "audit_finding", audit.id)
+    for dec in decisions:
+        _schedule_semantic_job(background_tasks, "decision", dec.id)
+    _schedule_semantic_job(background_tasks, "sop", sop.id, version.id, job_type="import_reindex")
+    t_jobs = datetime.utcnow()
+
+    # Deterministic sibling SOP linking when explicit SOP references exist and decisions are present.
+    linked_decisions = [d.id for d in decisions]
+    for token in sop_tokens:
+        if token == (sop.sop_number or "").upper():
+            continue
+        sibling = db.query(SOP).filter(SOP.sop_number == token).first()
+        if not sibling:
+            continue
+        for decision_id in linked_decisions:
+            if not db.query(DecisionSopLink).filter(DecisionSopLink.decision_id == decision_id, DecisionSopLink.sop_id == sibling.id).first():
+                db.add(DecisionSopLink(tenant_id=tenant_id, decision_id=decision_id, sop_id=sibling.id, sop_version_id=sibling.current_version_id, link_reason="import_deterministic_ref"))
+                created["links"] += 1
+
+    db.commit()
+    version_meta["_import_context_hash"] = context_hash
+    version.metadata_json = version_meta
+    db.commit()
+    t_end = datetime.utcnow()
+    print(
+        "[import-linking] "
+        f"sop={sop.id} "
+        f"extract+entity={int((t_structured - t0).total_seconds()*1000)}ms "
+        f"deterministic_links={int((t_links - t_structured).total_seconds()*1000)}ms "
+        f"job_enqueue={int((t_jobs - t_links).total_seconds()*1000)}ms "
+        f"finalize={int((t_end - t_jobs).total_seconds()*1000)}ms "
+        f"created={created}",
+        flush=True,
+    )
+    return created
 
 
 def _normalize_sop_metadata(sop_number: str, title: str, department: str = None, raw_meta: dict = None) -> dict:
@@ -355,25 +708,48 @@ async def extract_text_from_upload(file: UploadFile = File(...)):
     """
     Extract plain text from a small text file or PDF (editor import / OCR path).
     """
-    raw = await file.read()
-    if not raw:
-        raise HTTPException(status_code=400, detail="Empty file")
+    from .services.pdf_extractor import extract_structured_blocks
+    
     name = (file.filename or "").lower()
     try:
         if name.endswith(".pdf"):
-            from pypdf import PdfReader
-
-            reader = PdfReader(io.BytesIO(raw))
-            parts: list[str] = []
-            for page in reader.pages:
-                t = page.extract_text()
-                if t:
-                    parts.append(t)
-            text = "\n".join(parts)
+            # Single-pass structured extraction to keep import latency low.
+            blocks = extract_structured_blocks(file.file)
+            text_parts = []
+            for block in blocks:
+                btype = str(block.get("type", "")).lower()
+                if btype in {"section_heading", "heading", "paragraph", "note", "line"}:
+                    value = str(block.get("text", "")).strip()
+                    if value:
+                        text_parts.append(value)
+                elif btype in {"bullet_list", "numbered_list", "list", "ordered_list"}:
+                    for item in block.get("items", []) or []:
+                        value = str(item).strip()
+                        if value:
+                            text_parts.append(value)
+                elif btype == "table":
+                    for row in block.get("rows", []) or []:
+                        for cell in row or []:
+                            value = str(cell).strip()
+                            if value:
+                                text_parts.append(value)
+            text = "\n\n".join(text_parts)
+            return {
+                "text": (text or "").strip(),
+                "blocks": blocks,
+            }
         elif name.endswith((".txt", ".md", ".csv", ".json")):
+            raw = await file.read()
             text = raw.decode("utf-8", errors="replace")
+            paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+            blocks = [{"type": "paragraph", "text": p} for p in paras]
+            return {
+                "text": (text or "").strip(),
+                "blocks": blocks,
+            }
         else:
             # Best-effort UTF-8 for unknown extensions
+            raw = await file.read()
             try:
                 text = raw.decode("utf-8")
             except Exception:
@@ -381,11 +757,17 @@ async def extract_text_from_upload(file: UploadFile = File(...)):
                     status_code=400,
                     detail="Unsupported or binary file; use .pdf or .txt",
                 ) from None
-        return {"text": (text or "").strip()}
+            paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+            blocks = [{"type": "paragraph", "text": p} for p in paras]
+            return {
+                "text": (text or "").strip(),
+                "blocks": blocks,
+            }
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Extraction failed: {e!s}") from e
+
 
 
 # ==========================================
@@ -443,9 +825,10 @@ def create_document(
     db.add(initial_version)
     db.commit()
     db.refresh(sop)
+    db.refresh(initial_version)
 
-    if background_tasks:
-        _schedule_semantic_job(background_tasks, "sop", sop.id, initial_version.id)
+    _upsert_import_context_entities(db, sop, initial_version, background_tasks)
+
     return _build_editor_doc_response(sop, initial_version)
 
 
@@ -501,17 +884,158 @@ def update_document(
     if not current_version:
         raise HTTPException(status_code=404, detail="Current version not found")
 
+    # Keep SOP header/title in sync with editor metadata or explicit payload title.
+    incoming_title = payload.title
+    if not incoming_title and isinstance(payload.metadata_json, dict):
+        incoming_title = payload.metadata_json.get("sopMetadata", {}).get("title")
+    if incoming_title:
+        sop.title = incoming_title.strip() or sop.title
+
     # doc_json from frontend → stored as content_json in DB
     current_version.content_json = payload.doc_json
     if payload.metadata_json is not None:
-        current_version.metadata_json = payload.metadata_json
+        current_version.metadata_json = _normalize_sop_metadata(
+            sop_number=sop.sop_number,
+            title=sop.title,
+            department=sop.department,
+            raw_meta=payload.metadata_json,
+        )
 
     db.commit()
+    db.refresh(sop)
     db.refresh(current_version)
 
-    if background_tasks:
-        _schedule_semantic_job(background_tasks, "sop", sop.id, current_version.id)
+    _upsert_import_context_entities(db, sop, current_version, background_tasks)
+
     return _build_editor_doc_response(sop, current_version)
+
+
+@router.delete("/api/editor/docs/{doc_id}")
+def delete_document(
+    doc_id: str,
+    db: Session = Depends(get_db),
+    _=Depends(check_mock_mode),
+):
+    """
+    Permanently delete a SOP and all its versions/links.
+    """
+    # Handle lookup by either UUID (id) or SOP Number
+    sop = None
+    try:
+        id_val = uuid.UUID(doc_id)
+        sop = db.query(SOP).filter(SOP.id == id_val).first()
+    except ValueError:
+        sop = db.query(SOP).filter(SOP.sop_number == doc_id).first()
+
+    if not sop:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    # Collect directly linked entities before removing link rows.
+    linked_deviation_ids = [
+        row[0]
+        for row in db.query(SopDeviationLink.deviation_id)
+        .filter(SopDeviationLink.sop_id == sop.id)
+        .all()
+    ]
+    linked_decision_ids = [
+        row[0]
+        for row in db.query(DecisionSopLink.decision_id)
+        .filter(DecisionSopLink.sop_id == sop.id)
+        .all()
+    ]
+
+    # Remove SOP link edges first (FK constraints are not consistently CASCADE).
+    db.query(SopDeviationLink).filter(SopDeviationLink.sop_id == sop.id).delete(synchronize_session=False)
+    db.query(DecisionSopLink).filter(DecisionSopLink.sop_id == sop.id).delete(synchronize_session=False)
+
+    # Versions are deleted by SQLAlchemy cascade (all, delete-orphan).
+    db.delete(sop)
+    db.flush()
+
+    # Delete orphan deviations (only those no longer linked to any SOP).
+    orphan_deviation_ids = [
+        dev_id for dev_id in set(linked_deviation_ids)
+        if not db.query(SopDeviationLink.id).filter(SopDeviationLink.deviation_id == dev_id).first()
+    ]
+
+    linked_capa_ids = []
+    if orphan_deviation_ids:
+        linked_capa_ids = [
+            row[0]
+            for row in db.query(DeviationCapaLink.capa_id)
+            .filter(DeviationCapaLink.deviation_id.in_(orphan_deviation_ids))
+            .all()
+        ]
+        db.query(DeviationCapaLink).filter(
+            DeviationCapaLink.deviation_id.in_(orphan_deviation_ids)
+        ).delete(synchronize_session=False)
+        db.query(Deviation).filter(Deviation.id.in_(orphan_deviation_ids)).delete(synchronize_session=False)
+
+    # Delete orphan CAPAs (no remaining Deviation->CAPA links).
+    orphan_capa_ids = [
+        capa_id for capa_id in set(linked_capa_ids)
+        if not db.query(DeviationCapaLink.id).filter(DeviationCapaLink.capa_id == capa_id).first()
+    ]
+
+    linked_audit_ids = []
+    if orphan_capa_ids:
+        linked_audit_ids = [
+            row[0]
+            for row in db.query(CapaAuditLink.audit_finding_id)
+            .filter(CapaAuditLink.capa_id.in_(orphan_capa_ids))
+            .all()
+        ]
+        db.query(CapaAuditLink).filter(
+            CapaAuditLink.capa_id.in_(orphan_capa_ids)
+        ).delete(synchronize_session=False)
+        db.query(Capa).filter(Capa.id.in_(orphan_capa_ids)).delete(synchronize_session=False)
+
+    # Delete orphan Audits (no remaining CAPA->Audit links).
+    orphan_audit_ids = [
+        audit_id for audit_id in set(linked_audit_ids)
+        if not db.query(CapaAuditLink.id).filter(CapaAuditLink.audit_finding_id == audit_id).first()
+    ]
+
+    audit_decision_ids = []
+    if orphan_audit_ids:
+        audit_decision_ids = [
+            row[0]
+            for row in db.query(AuditDecisionLink.decision_id)
+            .filter(AuditDecisionLink.audit_finding_id.in_(orphan_audit_ids))
+            .all()
+        ]
+        db.query(AuditDecisionLink).filter(
+            AuditDecisionLink.audit_finding_id.in_(orphan_audit_ids)
+        ).delete(synchronize_session=False)
+        db.query(AuditFinding).filter(
+            AuditFinding.id.in_(orphan_audit_ids)
+        ).delete(synchronize_session=False)
+
+    # Delete orphan Decisions (no remaining SOP/Audit links).
+    decision_candidates = set(linked_decision_ids + audit_decision_ids)
+    orphan_decision_ids = [
+        decision_id for decision_id in decision_candidates
+        if not db.query(DecisionSopLink.id).filter(DecisionSopLink.decision_id == decision_id).first()
+        and not db.query(AuditDecisionLink.id).filter(AuditDecisionLink.decision_id == decision_id).first()
+    ]
+
+    if orphan_decision_ids:
+        db.query(Decision).filter(Decision.id.in_(orphan_decision_ids)).delete(synchronize_session=False)
+
+    db.commit()
+
+    # Keep semantic index in sync with relational source-of-truth after hard deletes.
+    SemanticPipelineService.purge_entity_artifacts("sop", sop.id)
+    for dev_id in orphan_deviation_ids:
+        SemanticPipelineService.purge_entity_artifacts("deviation", dev_id)
+    for capa_id in orphan_capa_ids:
+        SemanticPipelineService.purge_entity_artifacts("capa", capa_id)
+    for audit_id in orphan_audit_ids:
+        SemanticPipelineService.purge_entity_artifacts("audit_finding", audit_id)
+    for decision_id in orphan_decision_ids:
+        SemanticPipelineService.purge_entity_artifacts("decision", decision_id)
+
+    return {"status": "deleted", "id": doc_id}
 
 
 @router.get("/api/editor/docs/{doc_id}/versions", response_model=List[EditorVersionResponse])
@@ -726,7 +1250,41 @@ def get_all_sops(db: Session = Depends(get_db)):
     Each entry includes current_version embedded summary for convenience.
     """
     sops = _tenant_scoped_query(db, SOP).all()
-    return [_build_sop_dict(sop, include_current_version=True, db=db) for sop in sops]
+    if not sops:
+        return []
+
+    version_ids = [s.current_version_id for s in sops if s.current_version_id]
+    version_map = {}
+    if version_ids:
+        for version in db.query(SOPVersion).filter(SOPVersion.id.in_(version_ids)).all():
+            version_map[version.id] = version
+
+    out = []
+    for sop in sops:
+        result = _build_sop_dict(sop, include_current_version=False, db=db)
+        cv = version_map.get(sop.current_version_id) if sop.current_version_id else None
+        if cv:
+            normalized_meta = _normalize_sop_metadata(
+                sop_number=sop.sop_number,
+                title=sop.title,
+                department=sop.department,
+                raw_meta=cv.metadata_json,
+            )
+            result["current_version"] = {
+                "id": cv.id,
+                "sop_id": cv.sop_id,
+                "external_version_id": cv.external_version_id,
+                "version_number": cv.version_number,
+                "external_status": cv.external_status,
+                "content_json": cv.content_json,
+                "metadata_json": normalized_meta,
+                "effective_date": cv.effective_date,
+                "review_date": cv.review_date,
+                "created_at": cv.created_at,
+                "updated_at": cv.updated_at,
+            }
+        out.append(result)
+    return out
 
 
 @router.get("/api/sops/{id}", response_model=SOPResponse)
@@ -776,65 +1334,94 @@ def get_sop_related_context(id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="SOP not found")
 
     # 1. Deviations linked to SOP
-    dev_links = db.query(SopDeviationLink).filter(SopDeviationLink.sop_id == sop.id).all()
-    dev_ids = {l.deviation_id for l in dev_links}
+    dev_ids = {
+        row[0] for row in db.query(SopDeviationLink.deviation_id).filter(SopDeviationLink.sop_id == sop.id).all()
+    }
 
     # 2. Decisions directly linked to SOP
-    direct_decision_links = db.query(DecisionSopLink).filter(DecisionSopLink.sop_id == sop.id).all()
-    decision_ids = {l.decision_id for l in direct_decision_links}
+    decision_ids = {
+        row[0] for row in db.query(DecisionSopLink.decision_id).filter(DecisionSopLink.sop_id == sop.id).all()
+    }
 
     # 3. Traversal: expand from decisions (Decision → Audit → CAPA → Deviation)
     audit_ids = set()
     if decision_ids:
-        audit_links = db.query(AuditDecisionLink).filter(AuditDecisionLink.decision_id.in_(list(decision_ids))).all()
-        audit_ids = {l.audit_finding_id for l in audit_links}
+        audit_ids = {
+            row[0]
+            for row in db.query(AuditDecisionLink.audit_finding_id)
+            .filter(AuditDecisionLink.decision_id.in_(list(decision_ids)))
+            .all()
+        }
 
     # 4. Traversal: expand from deviations (Deviation → CAPA → Audit → Decision)
     capa_ids = set()
     if dev_ids:
-        capa_links = db.query(DeviationCapaLink).filter(DeviationCapaLink.deviation_id.in_(list(dev_ids))).all()
-        capa_ids = {l.capa_id for l in capa_links}
+        capa_ids = {
+            row[0]
+            for row in db.query(DeviationCapaLink.capa_id)
+            .filter(DeviationCapaLink.deviation_id.in_(list(dev_ids)))
+            .all()
+        }
 
     # 5. Connect CAPAs and Audits (Bidirectional)
     if capa_ids:
-        ca_links = db.query(CapaAuditLink).filter(CapaAuditLink.capa_id.in_(list(capa_ids))).all()
-        for l in ca_links:
-            audit_ids.add(l.audit_finding_id)
+        audit_ids.update(
+            row[0]
+            for row in db.query(CapaAuditLink.audit_finding_id)
+            .filter(CapaAuditLink.capa_id.in_(list(capa_ids)))
+            .all()
+        )
             
     if audit_ids:
-        ac_links = db.query(CapaAuditLink).filter(CapaAuditLink.audit_finding_id.in_(list(audit_ids))).all()
-        for l in ac_links:
-            capa_ids.add(l.capa_id)
+        capa_ids.update(
+            row[0]
+            for row in db.query(CapaAuditLink.capa_id)
+            .filter(CapaAuditLink.audit_finding_id.in_(list(audit_ids)))
+            .all()
+        )
 
     # 6. Re-expand from CAPAs to Deviations (Reverse)
     if capa_ids:
-        cd_links = db.query(DeviationCapaLink).filter(DeviationCapaLink.capa_id.in_(list(capa_ids))).all()
-        for l in cd_links:
-            dev_ids.add(l.deviation_id)
+        dev_ids.update(
+            row[0]
+            for row in db.query(DeviationCapaLink.deviation_id)
+            .filter(DeviationCapaLink.capa_id.in_(list(capa_ids)))
+            .all()
+        )
 
     # 7. Final expansion for Decisions from Audits
     if audit_ids:
-        ad_links = db.query(AuditDecisionLink).filter(AuditDecisionLink.audit_finding_id.in_(list(audit_ids))).all()
-        for l in ad_links:
-            decision_ids.add(l.decision_id)
+        decision_ids.update(
+            row[0]
+            for row in db.query(AuditDecisionLink.decision_id)
+            .filter(AuditDecisionLink.audit_finding_id.in_(list(audit_ids)))
+            .all()
+        )
 
     # 8. SOP-to-SOP chaining via shared decisions:
     # gather all SOPs connected to the expanded decision set
     related_sop_ids = set()
     if decision_ids:
-        decision_sop_links = db.query(DecisionSopLink).filter(DecisionSopLink.decision_id.in_(list(decision_ids))).all()
-        for link in decision_sop_links:
-            if link.sop_id != sop.id:
-                related_sop_ids.add(link.sop_id)
+        related_sop_ids.update(
+            row[0]
+            for row in db.query(DecisionSopLink.sop_id)
+            .filter(DecisionSopLink.decision_id.in_(list(decision_ids)))
+            .all()
+            if row[0] != sop.id
+        )
 
     # include incoming reverse links to this SOP as additional chaining evidence
-    incoming_links = db.query(DecisionSopLink).filter(DecisionSopLink.sop_id == sop.id).all()
-    incoming_decision_ids = {l.decision_id for l in incoming_links}
+    incoming_decision_ids = {
+        row[0] for row in db.query(DecisionSopLink.decision_id).filter(DecisionSopLink.sop_id == sop.id).all()
+    }
     if incoming_decision_ids:
-        sibling_sop_links = db.query(DecisionSopLink).filter(DecisionSopLink.decision_id.in_(list(incoming_decision_ids))).all()
-        for link in sibling_sop_links:
-            if link.sop_id != sop.id:
-                related_sop_ids.add(link.sop_id)
+        related_sop_ids.update(
+            row[0]
+            for row in db.query(DecisionSopLink.sop_id)
+            .filter(DecisionSopLink.decision_id.in_(list(incoming_decision_ids)))
+            .all()
+            if row[0] != sop.id
+        )
 
     related_sops_raw = _tenant_scoped_query(db, SOP).filter(SOP.id.in_(list(related_sop_ids))).all() if related_sop_ids else []
     related_sops = [_build_sop_dict(item, include_current_version=True, db=db) for item in related_sops_raw]
@@ -1017,7 +1604,8 @@ def create_audit(payload: AuditFindingCreateUpdate, db: Session = Depends(get_db
 @router.get("/api/audits/{id}", response_model=AuditFindingResponse)
 def get_audit(id: str, db: Session = Depends(get_db)):
     """Return a single Audit Finding record."""
-    audit = db.query(AuditFinding).filter(AuditFinding.id == id, AuditFinding.tenant_id == FIXED_TENANT_ID).first()
+    parsed_id = _parse_uuid_or_400(id)
+    audit = db.query(AuditFinding).filter(AuditFinding.id == parsed_id, AuditFinding.tenant_id == FIXED_TENANT_ID).first()
     if not audit:
         raise HTTPException(status_code=404, detail="Audit Finding not found")
     return audit
@@ -1025,7 +1613,8 @@ def get_audit(id: str, db: Session = Depends(get_db)):
 @router.put("/api/audits/{id}", response_model=AuditFindingResponse)
 def update_audit(id: str, payload: AuditFindingCreateUpdate, db: Session = Depends(get_db), background_tasks: BackgroundTasks = None):
     """Update an existing Audit Finding record."""
-    audit = db.query(AuditFinding).filter(AuditFinding.id == id, AuditFinding.tenant_id == FIXED_TENANT_ID).first()
+    parsed_id = _parse_uuid_or_400(id)
+    audit = db.query(AuditFinding).filter(AuditFinding.id == parsed_id, AuditFinding.tenant_id == FIXED_TENANT_ID).first()
     if not audit:
         raise HTTPException(status_code=404, detail="Audit Finding not found")
     
@@ -1064,7 +1653,8 @@ def create_decision(payload: DecisionCreateUpdate, db: Session = Depends(get_db)
 @router.get("/api/decisions/{id}", response_model=DecisionResponse)
 def get_decision(id: str, db: Session = Depends(get_db)):
     """Return a single Decision record."""
-    decision = db.query(Decision).filter(Decision.id == id, Decision.tenant_id == FIXED_TENANT_ID).first()
+    parsed_id = _parse_uuid_or_400(id)
+    decision = db.query(Decision).filter(Decision.id == parsed_id, Decision.tenant_id == FIXED_TENANT_ID).first()
     if not decision:
         raise HTTPException(status_code=404, detail="Decision not found")
     return decision
@@ -1072,7 +1662,8 @@ def get_decision(id: str, db: Session = Depends(get_db)):
 @router.put("/api/decisions/{id}", response_model=DecisionResponse)
 def update_decision(id: str, payload: DecisionCreateUpdate, db: Session = Depends(get_db), background_tasks: BackgroundTasks = None):
     """Update an existing Decision record."""
-    decision = db.query(Decision).filter(Decision.id == id, Decision.tenant_id == FIXED_TENANT_ID).first()
+    parsed_id = _parse_uuid_or_400(id)
+    decision = db.query(Decision).filter(Decision.id == parsed_id, Decision.tenant_id == FIXED_TENANT_ID).first()
     if not decision:
         raise HTTPException(status_code=404, detail="Decision not found")
     

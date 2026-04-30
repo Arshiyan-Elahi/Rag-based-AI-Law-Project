@@ -14,6 +14,7 @@ class CreateDocumentRequest(BaseModel):
     metadata_json: Optional[Any] = None
 
 class UpdateDocumentRequest(BaseModel):
+    title: Optional[str] = None
     doc_json: Any
     metadata_json: Optional[Any] = None
 
@@ -347,3 +348,72 @@ class SemanticStatusResponse(BaseModel):
     pending_suggestions: int = 0
     accepted_suggestions: int = 0
     rejected_suggestions: int = 0
+
+# ==========================================
+# QA-COMPLIANT PROFILE DETECTION SCHEMAS
+# ==========================================
+
+class EvidenceItem(BaseModel):
+    text: str
+    page: Optional[int] = None
+    section: Optional[str] = None
+    paragraph_index: Optional[int] = None
+    traceability_id: Optional[str] = None
+
+class ProfileSuggestionBase(BaseModel):
+    suggestion_type: str
+    suggested_rule: str
+    evidence: Optional[List[EvidenceItem]] = None
+    confidence: Optional[float] = None
+
+class ProfileDetectionOutput(BaseModel):
+    summary: str
+    detected_domain: Optional[str] = None
+    suggestions: List[ProfileSuggestionBase]
+    overall_confidence_score: float
+
+class ClientProfileCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    domain: Optional[str] = None
+
+class ProfileVersionResponse(BaseModel):
+    id: UUID
+    profile_id: UUID
+    version_number: int
+    rules_json: Any
+    is_locked: bool
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+class ClientProfileResponse(BaseModel):
+    id: UUID
+    tenant_id: UUID
+    name: str
+    description: Optional[str] = None
+    domain: Optional[str] = None
+    current_version_id: Optional[UUID] = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+class ProfileSuggestionResponse(BaseModel):
+    id: UUID
+    profile_id: Optional[UUID] = None
+    sop_id: Optional[UUID] = None
+    suggestion_type: str
+    suggested_rule: str
+    evidence_json: Optional[Any] = None
+    confidence: Optional[float] = None
+    status: str
+    rejection_reason: Optional[str] = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+class AcceptRejectSuggestionRequest(BaseModel):
+    status: str # 'accepted' or 'rejected'
+    rejection_reason: Optional[str] = None
+

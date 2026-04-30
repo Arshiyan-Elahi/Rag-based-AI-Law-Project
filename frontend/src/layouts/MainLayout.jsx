@@ -19,7 +19,7 @@ export default function MainLayout() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [aiWidgetOpen, setAiWidgetOpen] = useState(false)
 
-  const showAIWidget = ['/', '/dashboard', '/sops', '/knowledge'].includes(location.pathname)
+  const showAIWidget = location.pathname !== '/chat'
 
   // Close drawers on route change
   useEffect(() => {
@@ -82,7 +82,9 @@ export default function MainLayout() {
         />
       )}
 
-      <FloatingAskAIButton onClick={handleToggleAiWidget} isOpen={aiWidgetOpen} />
+      {showAIWidget ? (
+        <FloatingAskAIButton onClick={handleToggleAiWidget} isOpen={aiWidgetOpen} />
+      ) : null}
     </div>
   )
 }

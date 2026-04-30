@@ -5,6 +5,43 @@ import { performAIAction } from '../../api/editorApi'
 import AIComparisonModal from './AIComparisonModal'
 import './AIAssistantUI.css'
 
+const buildStructuredSelectionText = (editor, from, to) =>
+  editor.state.doc.textBetween(from, to, '\n').trim()
+
+const stripHtml = (value) =>
+  String(value || '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<\/div>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+
+const buildAcceptedContent = (aiResult, selectionMeta) => {
+  const action = String(aiResult?.action || '').toLowerCase()
+  const structured = aiResult?.structured_data || {}
+  const selectedFraction = Number(selectionMeta?.selectedFraction || 0)
+  const isPartialSelection = selectedFraction > 0 && selectedFraction < 0.6
+
+  // Partial-range edits should stay text-safe to avoid accidental document-wide
+  // structural rewrites when only a small snippet is selected.
+  if (isPartialSelection && (action === 'rewrite' || action === 'improve' || action === 'gap_check')) {
+    if (action === 'rewrite') {
+      return stripHtml(structured.rewritten_text || aiResult?.suggested_text)
+    }
+    if (action === 'improve') {
+      return stripHtml(structured.improved_text || structured.improved_version || aiResult?.suggested_text)
+    }
+    return stripHtml(structured.analysis || aiResult?.suggested_text)
+  }
+
+  // Full/large selections can preserve richer formatting output.
+  return aiResult?.suggested_text || ''
+}
+
+const isEditorViewReady = (editor) =>
+  Boolean(editor && editor.view && editor.view.dom && !editor.isDestroyed)
+
 const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true }) => {
   const [isAILoading, setIsAILoading] = useState(false)
   const [aiResult, setAIResult] = useState(null)
@@ -12,11 +49,35 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true }) => {
   const [menuPosition, setMenuPosition] = useState(null)
   const selectionRef = useRef(null)
   const menuRef = useRef(null)
+  const isPointerSelectingRef = useRef(false)
+  const [isEditorReady, setIsEditorReady] = useState(false)
 
   useEffect(() => {
     if (!editor || !isEditable) return undefined
 
+    const updateReadyState = () => {
+      setIsEditorReady(isEditorViewReady(editor))
+    }
+
+    updateReadyState()
+    editor.on('create', updateReadyState)
+
+    return () => {
+      editor.off('create', updateReadyState)
+      setIsEditorReady(false)
+    }
+  }, [editor, isEditable])
+
+  useEffect(() => {
+    if (!editor || !isEditable || !isEditorReady) return undefined
+
     const updatePosition = () => {
+      if (!isEditorViewReady(editor)) {
+        selectionRef.current = null
+        setMenuPosition(null)
+        return
+      }
+      if (isPointerSelectingRef.current) return
       const { selection } = editor.state
 
       if (selection.empty) {
@@ -30,8 +91,6 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true }) => {
 
       try {
         const { from, to } = selection
-        const start = editor.view.coordsAtPos(from)
-        const end = editor.view.coordsAtPos(to)
         const selectedText = editor.state.doc.textBetween(from, to, ' ').trim()
 
         if (!selectedText) {
@@ -40,11 +99,53 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true }) => {
           return
         }
 
-        selectionRef.current = { from, to, selectedText }
-        // position: fixed uses viewport coordinates; coordsAtPos is already viewport-relative
+        const structuredText = buildStructuredSelectionText(editor, from, to)
+        // Anchor to current head position so reverse selection and Ctrl+A remain stable.
+        const headPos = selection.$head?.pos || to
+        const head = editor.view.coordsAtPos(headPos)
+        const editorRect = editor.view.dom.getBoundingClientRect()
+        const visibleRect = {
+          left: Math.max(editorRect.left, 8),
+          right: Math.min(editorRect.right, window.innerWidth - 8),
+          top: Math.max(editorRect.top, 8),
+          bottom: Math.min(editorRect.bottom, window.innerHeight - 8),
+        }
+
+        const menuWidth = menuRef.current?.offsetWidth || 360
+        const menuHeight = menuRef.current?.offsetHeight || 70
+        const margin = 8
+        const offset = 12
+        const selectionRatio = Math.abs(to - from) / Math.max(1, editor.state.doc.content.size)
+        const isLargeSelection = selectedText.length > 900 || selectionRatio > 0.6
+
+        let left = isLargeSelection
+          ? visibleRect.right - margin - menuWidth / 2
+          : head.left
+        const leftMin = Math.max(margin + menuWidth / 2, visibleRect.left + margin + menuWidth / 2)
+        const leftMax = Math.min(
+          window.innerWidth - margin - menuWidth / 2,
+          visibleRect.right - margin - menuWidth / 2,
+        )
+        left = Math.max(leftMin, Math.min(leftMax, left))
+
+        const preferredTop = isLargeSelection
+          ? visibleRect.bottom - margin - menuHeight - offset
+          : head.top
+        const spaceAbove = preferredTop - visibleRect.top
+        const spaceBelow = visibleRect.bottom - head.bottom
+        const placement = spaceAbove >= (menuHeight + offset + margin) || spaceAbove >= spaceBelow ? 'above' : 'below'
+
+        let top = placement === 'above' ? preferredTop : head.bottom
+        const topMin = visibleRect.top + margin + (placement === 'below' ? 0 : menuHeight + offset)
+        const topMax = visibleRect.bottom - margin - (placement === 'below' ? menuHeight + offset : 0)
+        top = Math.max(topMin, Math.min(topMax, top))
+
+        const selectedFraction = Math.abs(to - from) / Math.max(1, editor.state.doc.content.size)
+        selectionRef.current = { from, to, selectedText, structuredText, selectedFraction }
         setMenuPosition({
-          top: Math.min(start.top, end.top) - 10,
-          left: (start.left + end.left) / 2,
+          top,
+          left,
+          placement,
         })
       } catch {
         selectionRef.current = null
@@ -53,14 +154,54 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true }) => {
     }
 
     editor.on('selectionUpdate', updatePosition)
+    editor.on('transaction', updatePosition)
+    const delayedUpdate = () => window.requestAnimationFrame(updatePosition)
+    const startPointerSelection = () => {
+      isPointerSelectingRef.current = true
+      setMenuPosition(null)
+    }
+    const endPointerSelection = () => {
+      if (!isPointerSelectingRef.current) return
+      isPointerSelectingRef.current = false
+      delayedUpdate()
+    }
+    const handleGlobalKeyDown = (event) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') {
+        // Wait for browser/editor to finish applying select-all before positioning.
+        window.requestAnimationFrame(() => window.requestAnimationFrame(updatePosition))
+      }
+    }
+
+    const dom = editor.view?.dom
+    if (!dom) return undefined
+
+    dom.addEventListener('mousedown', startPointerSelection)
+    window.addEventListener('mouseup', delayedUpdate)
+    window.addEventListener('keyup', delayedUpdate)
+    window.addEventListener('mouseup', endPointerSelection)
+    window.addEventListener('scroll', delayedUpdate, true)
+    window.addEventListener('resize', delayedUpdate)
+    document.addEventListener('selectionchange', delayedUpdate)
+    window.addEventListener('keydown', handleGlobalKeyDown)
     updatePosition()
 
     return () => {
       editor.off('selectionUpdate', updatePosition)
+      editor.off('transaction', updatePosition)
+      if (dom) {
+        dom.removeEventListener('mousedown', startPointerSelection)
+      }
+      window.removeEventListener('mouseup', delayedUpdate)
+      window.removeEventListener('keyup', delayedUpdate)
+      window.removeEventListener('mouseup', endPointerSelection)
+      window.removeEventListener('scroll', delayedUpdate, true)
+      window.removeEventListener('resize', delayedUpdate)
+      document.removeEventListener('selectionchange', delayedUpdate)
+      window.removeEventListener('keydown', handleGlobalKeyDown)
     }
-  }, [editor, isEditable])
+  }, [editor, isEditable, isEditorReady])
 
-  if (!editor || !isEditable) return null
+  if (!editor || !isEditable || !isEditorReady) return null
 
   const handleAction = async (action) => {
     const savedSelection = selectionRef.current
@@ -96,7 +237,7 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true }) => {
     try {
       const result = await performAIAction({
         action,
-        text: selectedText,
+        text: savedSelection.structuredText || selectedText,
         document_id: sopMetadata?.documentId || null,
         section_id: `${savedSelection.from}-${savedSelection.to}`,
         sop_title: sopMetadata?.title || 'Untitled SOP',
@@ -122,12 +263,9 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true }) => {
     if (!aiResult || !selectionRef.current) return
 
     const { from, to } = selectionRef.current
-    editor
-      .chain()
-      .focus()
-      .deleteRange({ from, to })
-      .insertContent(aiResult.suggested_text)
-      .run()
+    const acceptedContent = buildAcceptedContent(aiResult, selectionRef.current)
+    if (!acceptedContent) return
+    editor.chain().focus().insertContentAt({ from, to }, acceptedContent).run()
 
     setIsModalOpen(false)
     setAIResult(null)
@@ -140,6 +278,7 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true }) => {
         <div
           ref={menuRef}
           className="ai-action-menu"
+          data-placement={menuPosition.placement || 'above'}
           style={{
             top: menuPosition.top,
             left: menuPosition.left,

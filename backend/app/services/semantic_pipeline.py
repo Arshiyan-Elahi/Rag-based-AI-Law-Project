@@ -1,5 +1,8 @@
 import os
 import uuid
+import time
+import hashlib
+import threading
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -24,14 +27,18 @@ from ..models import (
     DeviationCapaLink,
     EmbeddingJob,
     KnowledgeChunk,
+    SourceReference,
     SOP,
     SOPVersion,
     SopDeviationLink,
 )
+from retrieval.hybrid_retriever import invalidate_bm25_cache
 
 BGE_M3_MODEL = "BAAI/bge-m3"
 DEFAULT_COLLECTION = os.getenv("SEMANTIC_QDRANT_COLLECTION", "qa_semantic_chunks")
 ENTITY_TYPES = {"sop", "deviation", "capa", "audit_finding", "decision"}
+# Auto-accept only very strong suggestions; weaker (but valid) ones remain pending.
+AUTO_ACCEPT_DELTA = float(os.getenv("SEMANTIC_AUTO_ACCEPT_DELTA", "0.05"))
 LINK_RULES = {
     "sop": ("deviation", "sop-deviation", 0.63),
     "deviation": ("capa", "deviation-capa", 0.62),
@@ -42,6 +49,7 @@ LINK_RULES = {
 
 _embedder: SentenceTransformer | None = None
 _qdrant: QdrantClient | None = None
+_embedder_lock = threading.Lock()
 
 
 def _resolve_hf_cache_dir() -> str:
@@ -68,15 +76,17 @@ def _is_model_cached(cache_dir: str, model_name: str) -> bool:
 def _get_embedder() -> SentenceTransformer:
     global _embedder
     if _embedder is None:
-        cache_dir = _resolve_hf_cache_dir()
-        local_only = _is_model_cached(cache_dir, BGE_M3_MODEL)
-        _embedder = SentenceTransformer(
-            BGE_M3_MODEL,
-            device=os.getenv("EMBEDDING_DEVICE", "cpu"),
-            cache_folder=cache_dir,
-            local_files_only=local_only,
-        )
-        print(f"[semantic-pipeline] BGE-M3 initialized once (cache={cache_dir}, local_only={local_only})")
+        with _embedder_lock:
+            if _embedder is None:
+                cache_dir = _resolve_hf_cache_dir()
+                local_only = _is_model_cached(cache_dir, BGE_M3_MODEL)
+                _embedder = SentenceTransformer(
+                    BGE_M3_MODEL,
+                    device=os.getenv("EMBEDDING_DEVICE", "cpu"),
+                    cache_folder=cache_dir,
+                    local_files_only=local_only,
+                )
+                print(f"[semantic-pipeline] BGE-M3 initialized once (cache={cache_dir}, local_only={local_only})")
     return _embedder
 
 
@@ -142,9 +152,80 @@ def _extract_tiptap_sections(content_json: dict[str, Any] | None) -> list[tuple[
 
 class SemanticPipelineService:
     @staticmethod
+    def purge_entity_artifacts(entity_type: str, entity_id: uuid.UUID) -> None:
+        """
+        Remove stale semantic artifacts for an entity from both Postgres chunks
+        and Qdrant vectors. Safe to call after hard deletes.
+        """
+        db = SessionLocal()
+        try:
+            db.query(KnowledgeChunk).filter(
+                KnowledgeChunk.entity_type == entity_type,
+                KnowledgeChunk.entity_id == entity_id,
+            ).delete(synchronize_session=False)
+            db.query(SourceReference).filter(
+                SourceReference.entity_type == entity_type,
+                SourceReference.entity_id == entity_id,
+            ).delete(synchronize_session=False)
+            db.commit()
+        finally:
+            db.close()
+
+        try:
+            client = _get_qdrant()
+            client.delete(
+                collection_name=DEFAULT_COLLECTION,
+                wait=True,
+                points_selector=qmodels.FilterSelector(
+                    filter=qmodels.Filter(
+                        must=[
+                            qmodels.FieldCondition(
+                                key="entity_id",
+                                match=qmodels.MatchValue(value=str(entity_id)),
+                            ),
+                            qmodels.FieldCondition(
+                                key="entity_type",
+                                match=qmodels.MatchValue(value=entity_type),
+                            ),
+                        ]
+                    )
+                ),
+            )
+            invalidate_bm25_cache(DEFAULT_COLLECTION)
+        except Exception as ex:
+            print(f"[semantic-pipeline] purge warning for {entity_type} {entity_id}: {ex}", flush=True)
+
+    @staticmethod
+    def _entity_exists(db: Session, entity_type: str, entity_id: uuid.UUID) -> bool:
+        if entity_type == "sop":
+            return db.query(SOP.id).filter(SOP.id == entity_id).first() is not None
+        if entity_type == "deviation":
+            return db.query(Deviation.id).filter(Deviation.id == entity_id).first() is not None
+        if entity_type == "capa":
+            return db.query(Capa.id).filter(Capa.id == entity_id).first() is not None
+        if entity_type == "audit_finding":
+            return db.query(AuditFinding.id).filter(AuditFinding.id == entity_id).first() is not None
+        if entity_type == "decision":
+            return db.query(Decision.id).filter(Decision.id == entity_id).first() is not None
+        return False
+
+    @staticmethod
     def enqueue_reindex(entity_type: str, entity_id: uuid.UUID, version_id: uuid.UUID | None = None, job_type: str = "entity_reindex") -> uuid.UUID:
         db = SessionLocal()
         try:
+            existing = (
+                db.query(EmbeddingJob)
+                .filter(
+                    EmbeddingJob.entity_type == entity_type,
+                    EmbeddingJob.entity_id == entity_id,
+                    EmbeddingJob.version_id == version_id,
+                    EmbeddingJob.status.in_(("pending", "running")),
+                )
+                .order_by(EmbeddingJob.created_at.desc())
+                .first()
+            )
+            if existing:
+                return existing.id
             job = EmbeddingJob(
                 entity_type=entity_type,
                 entity_id=entity_id,
@@ -166,17 +247,27 @@ class SemanticPipelineService:
             job = db.query(EmbeddingJob).filter(EmbeddingJob.id == job_id).first()
             if not job:
                 return
-            job.status = "running"
-            job.started_at = datetime.utcnow()
-            db.commit()
+            if job.status not in ("pending", "running"):
+                return
+            if job.status == "pending":
+                job.status = "running"
+                job.started_at = datetime.utcnow()
+                db.commit()
 
-            SemanticPipelineService._index_entity(db, job.entity_type, job.entity_id, job.version_id)
-            SemanticPipelineService._generate_suggestions(db, job.entity_type, job.entity_id)
+            print(f"[semantic-job] Starting job {job_id} for {job.entity_type} {job.entity_id}", flush=True)
+            did_reindex = SemanticPipelineService._index_entity(
+                db, job.entity_type, job.entity_id, job.version_id
+            )
+            if did_reindex:
+                SemanticPipelineService._generate_suggestions(
+                    db, job.entity_type, job.entity_id
+                )
 
             job.status = "completed"
             job.finished_at = datetime.utcnow()
             job.error_message = None
             db.commit()
+            print(f"[semantic-job] Successfully completed job {job_id}", flush=True)
         except Exception as exc:
             if "job" in locals() and job:
                 job.status = "failed"
@@ -372,10 +463,59 @@ class SemanticPipelineService:
         return {}
 
     @staticmethod
-    def _index_entity(db: Session, entity_type: str, entity_id: uuid.UUID, version_id: uuid.UUID | None = None):
+    def _index_entity(
+        db: Session,
+        entity_type: str,
+        entity_id: uuid.UUID,
+        version_id: uuid.UUID | None = None,
+    ) -> bool:
+        t0 = time.perf_counter()
         sections, resolved_version = SemanticPipelineService._normalize_entity(db, entity_type, entity_id, version_id)
         if not sections:
-            return
+            return False
+        t_norm = time.perf_counter()
+
+        content_fingerprint = hashlib.sha256(
+            "\n\n".join([f"{name}\n{text}" for name, text in sections]).encode("utf-8", errors="ignore")
+        ).hexdigest()
+        chunk_scope = db.query(KnowledgeChunk).filter(
+            KnowledgeChunk.entity_type == entity_type,
+            KnowledgeChunk.entity_id == entity_id,
+        )
+        if resolved_version:
+            chunk_scope = chunk_scope.filter(KnowledgeChunk.entity_version_id == resolved_version)
+        chunk_exists = chunk_scope.with_entities(KnowledgeChunk.id).first() is not None
+
+        # SOP keeps a version-level semantic hash marker.
+        if entity_type == "sop" and resolved_version:
+            version = db.query(SOPVersion).filter(SOPVersion.id == resolved_version).first()
+            if version:
+                meta = version.metadata_json if isinstance(version.metadata_json, dict) else {}
+                if chunk_exists and meta.get("_semantic_hash") == content_fingerprint:
+                    print(
+                        f"[semantic-pipeline] Skip unchanged SOP {entity_id} v={resolved_version} "
+                        f"(normalize={int((t_norm - t0)*1000)}ms)",
+                        flush=True,
+                    )
+                    return False
+
+        # Non-SOP entities use chunk metadata hash for idempotent reindexing.
+        if entity_type != "sop" and chunk_exists:
+            latest_chunk = (
+                chunk_scope.order_by(KnowledgeChunk.created_at.desc())
+                .with_entities(KnowledgeChunk.metadata_json)
+                .first()
+            )
+            latest_hash = None
+            if latest_chunk and isinstance(latest_chunk[0], dict):
+                latest_hash = latest_chunk[0].get("content_hash")
+            if latest_hash == content_fingerprint:
+                print(
+                    f"[semantic-pipeline] Skip unchanged {entity_type} {entity_id} "
+                    f"(normalize={int((t_norm - t0)*1000)}ms)",
+                    flush=True,
+                )
+                return False
 
         delete_query = db.query(KnowledgeChunk).filter(
             KnowledgeChunk.entity_type == entity_type,
@@ -384,7 +524,12 @@ class SemanticPipelineService:
         if resolved_version:
             delete_query = delete_query.filter(KnowledgeChunk.entity_version_id == resolved_version)
         delete_query.delete(synchronize_session=False)
+        db.query(SourceReference).filter(
+            SourceReference.entity_type == entity_type,
+            SourceReference.entity_id == entity_id,
+        ).delete(synchronize_session=False)
         db.commit()
+        t_delete = time.perf_counter()
 
         embedder = _get_embedder()
         example_vec = embedder.encode(["dimension_probe"], normalize_embeddings=True)[0]
@@ -410,6 +555,7 @@ class SemanticPipelineService:
                     )
                 ),
             )
+            invalidate_bm25_cache(DEFAULT_COLLECTION)
         except Exception as ex:
             print(f"[semantic-pipeline] Qdrant delete (entity scope) non-fatal: {ex}")
 
@@ -431,61 +577,97 @@ class SemanticPipelineService:
 
         points = []
         chunk_order = 0
+        chunk_rows: list[tuple[str, str, int]] = []
         for section_name, section_text in sections:
             for text in _split_long_text(section_text):
-                emb = embedder.encode([text], normalize_embeddings=True)[0].tolist()
-                chunk = KnowledgeChunk(
-                    tenant_id=uuid.UUID("11111111-1111-1111-1111-111111111111"),
-                    entity_type=entity_type,
-                    entity_id=entity_id,
-                    entity_version_id=resolved_version,
-                    chunk_type="semantic_section",
-                    chunk_text=text,
-                    chunk_order=chunk_order,
-                    metadata_json={
-                        "entity_type": entity_type,
-                        "entity_id": str(entity_id),
-                        "version_id": str(resolved_version) if resolved_version else None,
-                        "section_name": section_name,
-                        "chunk_index": chunk_order,
-                        "embedding_model": BGE_M3_MODEL,
-                        **{k: v for k, v in rag_meta.items() if v is not None and v != ""},
-                    },
-                )
-                db.add(chunk)
-                qid = str(uuid.uuid4())
-                pl = {
+                chunk_rows.append((section_name, text, chunk_order))
+                chunk_order += 1
+
+        embedding_vectors = embedder.encode(
+            [row[1] for row in chunk_rows],
+            normalize_embeddings=True,
+            batch_size=min(16, max(1, len(chunk_rows))),
+        )
+        t_embed = time.perf_counter()
+
+        for (section_name, text, order), emb_arr in zip(chunk_rows, embedding_vectors):
+            emb = emb_arr.tolist()
+            chunk = KnowledgeChunk(
+                tenant_id=uuid.UUID("11111111-1111-1111-1111-111111111111"),
+                entity_type=entity_type,
+                entity_id=entity_id,
+                entity_version_id=resolved_version,
+                chunk_type="semantic_section",
+                chunk_text=text,
+                chunk_order=order,
+                metadata_json={
                     "entity_type": entity_type,
                     "entity_id": str(entity_id),
                     "version_id": str(resolved_version) if resolved_version else None,
                     "section_name": section_name,
-                    "chunk_index": chunk_order,
+                    "chunk_index": order,
                     "embedding_model": BGE_M3_MODEL,
-                    "page_content": text,
-                    "chunk_text": text,
-                    "ref_number": ref,
-                    "title": title,
-                    "department": rag_meta.get("department", ""),
-                    "status": rag_meta.get("status", ""),
-                    "metadata": rag_meta,
-                }
-                points.append(
-                    qmodels.PointStruct(
-                        id=qid,
-                        vector=emb,
-                        payload=pl,
-                    )
+                    "content_hash": content_fingerprint,
+                    **{k: v for k, v in rag_meta.items() if v is not None and v != ""},
+                },
+            )
+            db.add(chunk)
+            qid = str(uuid.uuid4())
+            pl = {
+                "entity_type": entity_type,
+                "entity_id": str(entity_id),
+                "version_id": str(resolved_version) if resolved_version else None,
+                "section_name": section_name,
+                "chunk_index": order,
+                "embedding_model": BGE_M3_MODEL,
+                "page_content": text,
+                "chunk_text": text,
+                "ref_number": ref,
+                "title": title,
+                "department": rag_meta.get("department", ""),
+                "status": rag_meta.get("status", ""),
+                "metadata": rag_meta,
+            }
+            points.append(
+                qmodels.PointStruct(
+                    id=qid,
+                    vector=emb,
+                    payload=pl,
                 )
-                chunk_order += 1
+            )
+        print(
+            f"[semantic-pipeline] Created {len(points)} chunks for {entity_type} {entity_id} "
+            f"(normalize={int((t_norm-t0)*1000)}ms, delete={int((t_delete-t_norm)*1000)}ms, embed={int((t_embed-t_delete)*1000)}ms)",
+            flush=True,
+        )
         db.commit()
+        t_db = time.perf_counter()
         if points:
+            print(f"[semantic-pipeline] Upserting {len(points)} points to Qdrant ({DEFAULT_COLLECTION})", flush=True)
             client.upsert(collection_name=DEFAULT_COLLECTION, points=points, wait=True)
+            invalidate_bm25_cache(DEFAULT_COLLECTION)
+            t_upsert = time.perf_counter()
+            if entity_type == "sop" and resolved_version:
+                version = db.query(SOPVersion).filter(SOPVersion.id == resolved_version).first()
+                if version:
+                    meta = version.metadata_json if isinstance(version.metadata_json, dict) else {}
+                    meta["_semantic_hash"] = content_fingerprint
+                    version.metadata_json = meta
+                    db.commit()
+            print(
+                f"[semantic-pipeline] Qdrant upsert complete for {entity_type} {entity_id} "
+                f"(db={int((t_db-t_embed)*1000)}ms, upsert={int((t_upsert-t_db)*1000)}ms, total={int((t_upsert-t0)*1000)}ms)",
+                flush=True,
+            )
+        return True
 
     @staticmethod
     def _generate_suggestions(db: Session, entity_type: str, entity_id: uuid.UUID):
+        t0 = time.perf_counter()
         if entity_type not in LINK_RULES:
             return
         target_type, link_type, threshold = LINK_RULES[entity_type]
+        auto_accept_threshold = min(0.99, threshold + max(0.0, AUTO_ACCEPT_DELTA))
         source_chunks = db.query(KnowledgeChunk).filter(
             KnowledgeChunk.entity_type == entity_type,
             KnowledgeChunk.entity_id == entity_id,
@@ -496,30 +678,40 @@ class SemanticPipelineService:
         embedder = _get_embedder()
         client = _get_qdrant()
         entity_scores: dict[str, float] = {}
-        for chunk in source_chunks[:8]:
-            vec = embedder.encode([chunk.chunk_text], normalize_embeddings=True)[0].tolist()
+        source_texts = [c.chunk_text for c in source_chunks[:6]]
+        source_vectors = embedder.encode(
+            source_texts,
+            normalize_embeddings=True,
+            batch_size=min(16, max(1, len(source_texts))),
+        )
+        for vec_arr in source_vectors:
+            vec = vec_arr.tolist()
             filt = qmodels.Filter(
                 must=[
                     qmodels.FieldCondition(key="entity_type", match=qmodels.MatchValue(value=target_type)),
                 ]
             )
-            if hasattr(client, "search"):
-                hits = client.search(
-                    collection_name=DEFAULT_COLLECTION,
-                    query_vector=vec,
-                    query_filter=filt,
-                    limit=20,
-                )
-            else:
-                result = client.query_points(
-                    collection_name=DEFAULT_COLLECTION,
-                    query=vec,
-                    query_filter=filt,
-                    limit=20,
-                    with_payload=True,
-                    with_vectors=False,
-                )
-                hits = result.points
+            try:
+                if hasattr(client, "search"):
+                    hits = client.search(
+                        collection_name=DEFAULT_COLLECTION,
+                        query_vector=vec,
+                        query_filter=filt,
+                        limit=8,
+                    )
+                else:
+                    result = client.query_points(
+                        collection_name=DEFAULT_COLLECTION,
+                        query=vec,
+                        query_filter=filt,
+                        limit=8,
+                        with_payload=True,
+                        with_vectors=False,
+                    )
+                    hits = result.points
+            except Exception as ex:
+                print(f"[semantic-pipeline] Suggestion search failed for {entity_type} {entity_id}: {ex}", flush=True)
+                continue
             for hit in hits:
                 target_id = str(hit.payload.get("entity_id"))
                 if not target_id:
@@ -531,31 +723,58 @@ class SemanticPipelineService:
         for target_id, score in top:
             if score < threshold:
                 continue
-            target_uuid = uuid.UUID(target_id)
-            if SemanticPipelineService._already_linked(db, link_type, entity_id, target_uuid):
-                continue
-            exists = db.query(AILinkSuggestion).filter(
-                AILinkSuggestion.source_entity_type == entity_type,
-                AILinkSuggestion.source_entity_id == entity_id,
-                AILinkSuggestion.target_entity_type == target_type,
-                AILinkSuggestion.target_entity_id == target_uuid,
-                AILinkSuggestion.suggested_link_type == link_type,
-                AILinkSuggestion.status == "pending",
-            ).first()
-            if exists:
-                continue
-            db.add(
-                AILinkSuggestion(
-                    source_entity_type=entity_type,
-                    source_entity_id=entity_id,
-                    target_entity_type=target_type,
-                    target_entity_id=target_uuid,
-                    suggested_link_type=link_type,
-                    score=score,
-                    reason=f"Semantic similarity ({BGE_M3_MODEL}) score {score:.3f} exceeded threshold {threshold:.2f}.",
-                    status="pending",
-                )
-            )
+            try:
+                target_uuid = uuid.UUID(target_id)
+                if not SemanticPipelineService._entity_exists(db, target_type, target_uuid):
+                    continue
+                if SemanticPipelineService._already_linked(db, link_type, entity_id, target_uuid):
+                    continue
+                suggestion = db.query(AILinkSuggestion).filter(
+                    AILinkSuggestion.source_entity_type == entity_type,
+                    AILinkSuggestion.source_entity_id == entity_id,
+                    AILinkSuggestion.target_entity_type == target_type,
+                    AILinkSuggestion.target_entity_id == target_uuid,
+                    AILinkSuggestion.suggested_link_type == link_type,
+                ).order_by(AILinkSuggestion.created_at.desc()).first()
+
+                if suggestion is None:
+                    suggestion = AILinkSuggestion(
+                        source_entity_type=entity_type,
+                        source_entity_id=entity_id,
+                        target_entity_type=target_type,
+                        target_entity_id=target_uuid,
+                        suggested_link_type=link_type,
+                        score=score,
+                        reason=f"Semantic similarity ({BGE_M3_MODEL}) score {score:.3f} exceeded threshold {threshold:.2f}.",
+                        status="pending",
+                    )
+                    db.add(suggestion)
+                    db.flush()
+                elif suggestion.status == "pending":
+                    # Keep pending suggestion metadata fresh with the latest score.
+                    suggestion.score = max(float(suggestion.score or 0.0), score)
+                    suggestion.reason = (
+                        f"Semantic similarity ({BGE_M3_MODEL}) score {float(suggestion.score):.3f} "
+                        f"exceeded threshold {threshold:.2f}."
+                    )
+
+                # Auto-bridge high-confidence suggestions into real link tables.
+                # Lower-confidence suggestions remain pending for manual review.
+                if suggestion.status == "pending" and score >= auto_accept_threshold:
+                    SemanticPipelineService.accept_suggestion(
+                        db,
+                        suggestion,
+                        approved_by="semantic-auto-accept",
+                    )
+            except Exception as ex:
+                db.rollback()
+                print(f"[semantic-pipeline] Suggestion upsert failed for {entity_type} {entity_id}: {ex}", flush=True)
+        elapsed = int((time.perf_counter() - t0) * 1000)
+        print(
+            f"[semantic-pipeline] Generated {len(top)} potential suggestions for {entity_type} {entity_id} "
+            f"(search+linking={elapsed}ms)",
+            flush=True,
+        )
         db.commit()
 
     @staticmethod
@@ -595,6 +814,7 @@ class SemanticPipelineService:
         suggestion.approved_by = approved_by
         suggestion.approved_at = datetime.utcnow()
         db.commit()
+        print(f"[semantic-pipeline] AUTO-ACCEPTED suggestion {suggestion.id} ({link_type}) from {sid} to {tid}", flush=True)
 
     @staticmethod
     def reject_suggestion(db: Session, suggestion: AILinkSuggestion, approved_by: str | None = None):

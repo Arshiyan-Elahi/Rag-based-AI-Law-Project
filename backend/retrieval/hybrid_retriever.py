@@ -6,13 +6,15 @@ from langchain_core.documents import Document
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
-from qdrant_client.models import Filter, FieldCondition, MatchValue
+from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchAny
 from rank_bm25 import BM25Okapi
 from typing import Optional, List
 
 # Module-level cache to store BM25 index and documents per collection, avoiding RAM leaks.
 # Schema: { collection_name: {"docs": [...], "bm25": BM25Okapi, "time": float} }
 _GLOBAL_BM25_CACHE = {}
+RAG_DEBUG_RETRIEVAL = os.getenv("RAG_DEBUG_RETRIEVAL", "true").strip().lower() == "true"
+BM25_CACHE_TTL_SECONDS = int(os.getenv("RAG_BM25_CACHE_TTL_SECONDS", "60"))
 
 # Federated "section" (router) -> payload entity_type in qa_semantic_chunks (semantic index).
 SECTION_TO_ENTITY_TYPE = {
@@ -30,6 +32,18 @@ def rag_unified_enabled() -> bool:
 
 def unified_semantic_collection() -> str:
     return os.getenv("SEMANTIC_QDRANT_COLLECTION", "qa_semantic_chunks")
+
+
+def invalidate_bm25_cache(collection_name: str | None = None) -> None:
+    """
+    Clear stale BM25 corpus cache after semantic upserts/deletes so retrieval always
+    sees the latest indexed chunks.
+    """
+    global _GLOBAL_BM25_CACHE
+    if collection_name:
+        _GLOBAL_BM25_CACHE.pop(collection_name, None)
+        return
+    _GLOBAL_BM25_CACHE = {}
 
 class HybridRetriever(BaseRetriever):
     vectorstore: QdrantVectorStore
@@ -95,6 +109,27 @@ class HybridRetriever(BaseRetriever):
             for key, val in self.metadata_filters.items():
                 if not val:
                     continue
+                if str(key) == "allowed_entity_ids" and isinstance(val, list) and self._uses_unified_semantic_collection():
+                    must_list.append(
+                        FieldCondition(
+                            key="entity_id",
+                            match=MatchAny(any=[str(v) for v in val[:5000]]),
+                        )
+                    )
+                    continue
+                if str(key) == "allowed_entity_ids" and isinstance(val, list):
+                    allow = [str(v) for v in val[:5000]]
+                    must_list.append(
+                        Filter(
+                            should=[
+                                FieldCondition(key="entity_id", match=MatchAny(any=allow)),
+                                FieldCondition(key="source_id", match=MatchAny(any=allow)),
+                                FieldCondition(key="metadata.entity_id", match=MatchAny(any=allow)),
+                                FieldCondition(key="metadata.source_id", match=MatchAny(any=allow)),
+                            ]
+                        )
+                    )
+                    continue
                 if str(key) == "ref_number":
                     must_list.append(
                         Filter(
@@ -131,9 +166,9 @@ class HybridRetriever(BaseRetriever):
 
     def _get_bm25_corpus(self) -> tuple[List[Document], BM25Okapi]:
         now = time.time()
-        # Check cache: Only fetch from Qdrant if more than 5 minutes has passed (TTL: 300s)
+        # Check cache: refresh frequently enough to avoid stale counts/context.
         cache_entry = _GLOBAL_BM25_CACHE.get(self.collection_name)
-        if cache_entry and (now - cache_entry["time"] < 300.0):
+        if cache_entry and (now - cache_entry["time"] < max(1, BM25_CACHE_TTL_SECONDS)):
             return cache_entry["docs"], cache_entry["bm25"]
 
         points, _ = self.client.scroll(
@@ -188,6 +223,11 @@ class HybridRetriever(BaseRetriever):
         run_manager: CallbackManagerForRetrieverRun,
     ) -> List[Document]:
         filt = self._build_filter()
+        if RAG_DEBUG_RETRIEVAL:
+            print(
+                f"[rag-debug] retrieval_start collection={self.collection_name} filter={bool(filt)}",
+                flush=True,
+            )
         try:
             dense_results = self.vectorstore.similarity_search_with_score(
                 query=query,

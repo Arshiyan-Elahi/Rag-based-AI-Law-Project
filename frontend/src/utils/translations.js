@@ -169,7 +169,7 @@ export const translations = {
 
         // MenuBar OCR
         extracting: 'Extracting...',
-        importPdfDocx: 'Import PDF/DOCX',
+        importPdfDocx: 'Import SOP',
         importOcrTooltip: 'Import OCR text from PDF or DOCX',
 
 
@@ -356,7 +356,7 @@ export const translations = {
 
         // MenuBar OCR
         extracting: 'Extrahieren...',
-        importPdfDocx: 'PDF/DOCX importieren',
+        importPdfDocx: 'SOP importieren',
         importOcrTooltip: 'OCR-Text aus PDF oder DOCX importieren',
 
 

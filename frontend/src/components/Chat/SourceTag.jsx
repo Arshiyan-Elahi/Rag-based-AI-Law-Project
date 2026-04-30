@@ -15,7 +15,7 @@ export default function SourceTag({ label, type = 'generic', size = '', showDot 
   return (
     <span className={className} title={label}>
       {showDot && <span className="source-tag__dot" />}
-      {label}
+      <span className="source-tag__label">{label}</span>
     </span>
   )
 }

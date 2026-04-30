@@ -4,6 +4,7 @@ import { debounce } from 'lodash'
 import { useEditor, EditorContent } from '@tiptap/react'
 import { Extension } from '@tiptap/core'
 import StarterKit from '@tiptap/starter-kit'
+import HardBreak from '@tiptap/extension-hard-break'
 import Link from '@tiptap/extension-link'
 import Underline from '@tiptap/extension-underline'
 import { Table } from '@tiptap/extension-table'
@@ -12,6 +13,7 @@ import { TableCell } from '@tiptap/extension-table-cell'
 import { TableHeader } from '@tiptap/extension-table-header'
 import {
   Bold,
+  CheckCircle2,
   ChevronLeft,
   ChevronRight,
   ChevronDown,
@@ -20,6 +22,7 @@ import {
   Italic,
   List,
   ListOrdered,
+  Loader2,
   Maximize2,
   Table2,
   Underline as UnderlineIcon,
@@ -34,6 +37,8 @@ import PreviewModal from '../components/Common/PreviewModal'
 import AIAssistantBubbleMenu from '../components/Editor/AIAssistantBubbleMenu'
 import SideBySideViewer from '../components/Editor/Diff/SideBySideViewer'
 import StatusBar from '../components/Editor/StatusBar'
+import AIWidget from '../components/Dashboard/AIWidget'
+import FloatingAskAIButton from '../components/Common/FloatingAskAIButton'
 import { useLanguage } from '../context/LanguageContext'
 import {
   createDocument,
@@ -50,6 +55,28 @@ import { formatOCRText } from '../utils/formatOCRText'
 import { mapOCRBlocksToHTML } from '../utils/mapOCRBlocksToHTML'
 import '../assets/styles/global.css'
 
+class EditorSurfaceErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props)
+    this.state = { hasError: false }
+  }
+
+  static getDerivedStateFromError() {
+    return { hasError: true }
+  }
+
+  componentDidCatch(error) {
+    console.error('Editor surface crashed:', error)
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return <div className="editor-loading">Editor failed to load. Please refresh.</div>
+    }
+    return this.props.children
+  }
+}
+
 const EMPTY_DOC = {
   type: 'doc',
   content: [],
@@ -60,10 +87,32 @@ const STORAGE_KEY = 'current_document_id'
 const EditorShortcuts = Extension.create({
   name: 'editorShortcuts',
   addKeyboardShortcuts() {
+    const handleEmptyBlockBackspace = () => {
+      const { state } = this.editor
+      const { selection } = state
+      if (!selection.empty) return false
+      const { $from } = selection
+      const parent = $from.parent
+      if (!parent?.isTextblock || parent.content.size > 0) return false
+      return this.editor.commands.joinBackward() || this.editor.commands.liftEmptyBlock()
+    }
+
+    const handleEmptyBlockDelete = () => {
+      const { state } = this.editor
+      const { selection } = state
+      if (!selection.empty) return false
+      const { $from } = selection
+      const parent = $from.parent
+      if (!parent?.isTextblock || parent.content.size > 0) return false
+      return this.editor.commands.joinForward() || this.editor.commands.liftEmptyBlock()
+    }
+
     return {
       'Mod-b': () => this.editor.chain().focus().toggleBold().run(),
       'Mod-i': () => this.editor.chain().focus().toggleItalic().run(),
       'Mod-u': () => this.editor.chain().focus().toggleUnderline().run(),
+      Enter: () => this.editor.chain().focus().splitBlock().run(),
+      'Shift-Enter': () => this.editor.chain().focus().setHardBreak().run(),
       'Mod-Shift-1': () => this.editor.chain().focus().toggleHeading({ level: 1 }).run(),
       'Mod-Shift-2': () => this.editor.chain().focus().toggleHeading({ level: 2 }).run(),
       'Mod-Shift-3': () => this.editor.chain().focus().toggleHeading({ level: 3 }).run(),
@@ -71,6 +120,8 @@ const EditorShortcuts = Extension.create({
       'Mod-Alt-2': () => this.editor.chain().focus().toggleHeading({ level: 2 }).run(),
       'Mod-Alt-3': () => this.editor.chain().focus().toggleHeading({ level: 3 }).run(),
       'Mod-Alt-t': () => this.editor.chain().focus().insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run(),
+      Backspace: handleEmptyBlockBackspace,
+      Delete: handleEmptyBlockDelete,
     }
   },
 })
@@ -189,31 +240,43 @@ const EditorPage = ({ isEmbedded = false, initialDocId = null }) => {
   const [linkModalInitialUrl, setLinkModalInitialUrl] = useState('')
   const [isPreviewOpen, setIsPreviewOpen] = useState(false)
   const [isImporting, setIsImporting] = useState(false)
+  const [importNotice, setImportNotice] = useState('')
   const [isLoadingDocument, setIsLoadingDocument] = useState(false)
   const [isSidebarOpen, setIsSidebarOpen] = useState(false)
+  const [aiWidgetOpen, setAiWidgetOpen] = useState(false)
   const [compareBaseVersionId, setCompareBaseVersionId] = useState('')
   const [compareTargetVersionId, setCompareTargetVersionId] = useState('')
   const [diffVersions, setDiffVersions] = useState({ oldVersion: null, newVersion: null })
   const [relatedContextRefreshToken, setRelatedContextRefreshToken] = useState(0)
   const hydrationRef = useRef(false)
   const saveInFlightRef = useRef(false)
+  const [isEditorMounted, setIsEditorMounted] = useState(false)
+  const editorExtensions = useMemo(() => ([
+    StarterKit.configure({
+      hardBreak: false,
+      link: false,
+      underline: false,
+    }),
+    HardBreak,
+    Underline,
+    Link.configure({
+      openOnClick: true,
+      autolink: true,
+      linkOnPaste: true,
+    }),
+    Table.configure({ resizable: true }),
+    TableRow,
+    TableHeader,
+    TableCell,
+    EditorShortcuts,
+  ]), [])
 
   const editor = useEditor({
-    extensions: [
-      StarterKit,
-      Underline,
-      Link.configure({
-        openOnClick: true,
-        autolink: true,
-        linkOnPaste: true,
-      }),
-      Table.configure({ resizable: true }),
-      TableRow,
-      TableHeader,
-      TableCell,
-      EditorShortcuts,
-    ],
+    extensions: editorExtensions,
     content: EMPTY_DOC,
+    immediatelyRender: false,
+    onCreate: () => setIsEditorMounted(true),
+    onDestroy: () => setIsEditorMounted(false),
     editorProps: {
       attributes: {
         class: 'tiptap tiptap-sop',
@@ -226,7 +289,7 @@ const EditorPage = ({ isEmbedded = false, initialDocId = null }) => {
   const currentVersionLabel = buildVersionLabel(currentVersion)
 
   const applyVersionState = useCallback((versionRecord, fallbackTitle = '') => {
-    if (!editor || !versionRecord) return
+    if (!editor || !versionRecord || !isEditorMounted || editor.isDestroyed) return
 
     hydrationRef.current = true
     const normalized = {
@@ -247,10 +310,10 @@ const EditorPage = ({ isEmbedded = false, initialDocId = null }) => {
     window.setTimeout(() => {
       hydrationRef.current = false
     }, 0)
-  }, [editor])
+  }, [editor, isEditorMounted])
 
   const hydrateFromDocument = useCallback(async (docId) => {
-    if (!docId || !editor) return
+    if (!docId || !editor || !isEditorMounted || editor.isDestroyed) return
 
     setIsLoadingDocument(true)
 
@@ -289,10 +352,10 @@ const EditorPage = ({ isEmbedded = false, initialDocId = null }) => {
     } finally {
       setIsLoadingDocument(false)
     }
-  }, [editor, applyVersionState])
+  }, [editor, applyVersionState, isEditorMounted])
 
   useEffect(() => {
-    if (!editor) return
+    if (!editor || !isEditorMounted || editor.isDestroyed) return
 
     const storedId = localStorage.getItem(STORAGE_KEY)
     const targetId = initialDocId || urlDocId || storedId
@@ -311,10 +374,10 @@ const EditorPage = ({ isEmbedded = false, initialDocId = null }) => {
       .catch((error) => {
         console.error('Failed to load editor document:', error)
       })
-  }, [editor, initialDocId, urlDocId, hydrateFromDocument])
+  }, [editor, isEditorMounted, initialDocId, urlDocId, hydrateFromDocument])
 
   const persistDocument = useCallback(async ({ showSavingIndicator = true } = {}) => {
-    if (!editor || isHistoricalView || hydrationRef.current) return
+    if (!editor || !isEditorMounted || editor.isDestroyed || isHistoricalView || hydrationRef.current) return
     if (saveInFlightRef.current) return
 
     const currentJson = editor.getJSON()
@@ -366,7 +429,7 @@ const EditorPage = ({ isEmbedded = false, initialDocId = null }) => {
         setIsSaving(false)
       }
     }
-  }, [editor, metadata, sopStatus, auditTrail, versionNote, documentId, hydrateFromDocument, isHistoricalView])
+  }, [editor, isEditorMounted, metadata, sopStatus, auditTrail, versionNote, documentId, hydrateFromDocument, isHistoricalView])
 
   const debouncedSave = useMemo(
     () => debounce(() => {
@@ -376,7 +439,7 @@ const EditorPage = ({ isEmbedded = false, initialDocId = null }) => {
   )
 
   useEffect(() => {
-    if (!editor) return
+    if (!editor || !isEditorMounted || editor.isDestroyed) return
 
     const handleUpdate = () => {
       if (hydrationRef.current || isHistoricalView) return
@@ -389,7 +452,7 @@ const EditorPage = ({ isEmbedded = false, initialDocId = null }) => {
       editor.off('update', handleUpdate)
       debouncedSave.cancel()
     }
-  }, [editor, debouncedSave, isHistoricalView])
+  }, [editor, isEditorMounted, debouncedSave, isHistoricalView])
 
   useEffect(() => {
     if (hydrationRef.current || isHistoricalView) return
@@ -397,9 +460,9 @@ const EditorPage = ({ isEmbedded = false, initialDocId = null }) => {
   }, [metadata, sopStatus, auditTrail, versionNote, debouncedSave, isHistoricalView])
 
   useEffect(() => {
-    if (!editor) return
+    if (!editor || !isEditorMounted || editor.isDestroyed) return
     editor.setEditable(!isHistoricalView)
-  }, [editor, isHistoricalView])
+  }, [editor, isEditorMounted, isHistoricalView])
 
   useEffect(() => {
     const onKeyDown = (event) => {
@@ -413,6 +476,11 @@ const EditorPage = ({ isEmbedded = false, initialDocId = null }) => {
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [debouncedSave, persistDocument, isHistoricalView])
+
+  useEffect(() => {
+    document.body.style.overflow = aiWidgetOpen ? 'hidden' : ''
+    return () => { document.body.style.overflow = '' }
+  }, [aiWidgetOpen])
 
   const handleMetadataChange = (key, value) => {
     setMetadata((prev) => ({
@@ -463,7 +531,7 @@ const EditorPage = ({ isEmbedded = false, initialDocId = null }) => {
   }
 
   const createNewVersionHandler = async () => {
-    if (!editor) return
+    if (!editor || !isEditorMounted || editor.isDestroyed) return
 
     if (!documentId) {
       await persistDocument()
@@ -522,14 +590,20 @@ const EditorPage = ({ isEmbedded = false, initialDocId = null }) => {
     }
   }, [documentId, applyVersionState, metadata.title])
 
+  const aiSopContext = useMemo(() => ({
+    ...metadata,
+    title: metadata?.title?.trim() || 'Untitled SOP',
+    documentId: metadata?.documentId || documentId || 'SOP-NEW',
+  }), [metadata, documentId])
+
   const openLinkModal = () => {
-    if (!editor) return
+    if (!editor || !isEditorMounted || editor.isDestroyed) return
     setLinkModalInitialUrl(editor.getAttributes('link')?.href || '')
     setIsLinkModalOpen(true)
   }
 
   const handleLinkSave = (url) => {
-    if (!editor) return
+    if (!editor || !isEditorMounted || editor.isDestroyed) return
 
     if (url) {
       editor.chain().focus().extendMarkRange('link').setLink({ href: url }).run()
@@ -542,17 +616,36 @@ const EditorPage = ({ isEmbedded = false, initialDocId = null }) => {
 
   const triggerImport = async (event) => {
     const file = event.target.files?.[0]
-    if (!file || !editor) return
+    if (!file || !editor || !isEditorMounted || editor.isDestroyed) return
 
+    const previousDoc = editor.getJSON()
     setIsImporting(true)
+    setImportNotice('')
     try {
+      // Let loading state render before extraction/mapping work starts.
+      await new Promise((resolve) => window.requestAnimationFrame(resolve))
       const data = await extractText(file)
       const html = Array.isArray(data?.blocks) && data.blocks.length
         ? mapOCRBlocksToHTML(data.blocks, 'sop')
         : formatOCRText(data?.text || '')
-      editor.commands.setContent(html || EMPTY_DOC, false)
+      // Yield one frame so UI can paint loading state before heavy content insert.
+      await new Promise((resolve) => window.requestAnimationFrame(resolve))
+      if (!html || !String(html).trim()) {
+        throw new Error('No structured content extracted from file.')
+      }
+      editor.commands.setContent(html, false)
+      setImportNotice('SOP imported successfully')
+      window.setTimeout(() => setImportNotice(''), 2600)
     } catch (error) {
       console.error('Import failed:', error)
+      setImportNotice(`Import failed: ${error?.message || 'Unknown error'}`)
+      // Never leave editor in a broken visual state after failed import.
+      // Restore previous content first; if that fails, fallback to empty doc.
+      try {
+        editor.commands.setContent(previousDoc || EMPTY_DOC, false)
+      } catch {
+        editor.commands.setContent(EMPTY_DOC, false)
+      }
     } finally {
       setIsImporting(false)
       event.target.value = ''
@@ -560,7 +653,7 @@ const EditorPage = ({ isEmbedded = false, initialDocId = null }) => {
   }
 
   const insertPlaceholder = () => {
-    if (!editor || isHistoricalView) return
+    if (!editor || !isEditorMounted || editor.isDestroyed || isHistoricalView) return
     const key = window.prompt('Enter placeholder name', 'DocumentOwner')
     if (!key?.trim()) return
     editor.chain().focus().insertContent(`{{${key.trim()}}}`).run()
@@ -590,7 +683,7 @@ const EditorPage = ({ isEmbedded = false, initialDocId = null }) => {
     }
   }, [documentId, compareBaseVersionId, compareTargetVersionId])
 
-  if (!editor) {
+  if (!editor || !isEditorMounted || editor.isDestroyed) {
     return <div className="editor-loading">Loading editor...</div>
   }
 
@@ -599,11 +692,6 @@ const EditorPage = ({ isEmbedded = false, initialDocId = null }) => {
   const versionSelectValue = currentVersionId || (versions[0]?.id ?? '')
   const compareBaseValue = compareBaseVersionId || currentVersionId || (versions[0]?.id ?? '')
   const compareTargetValue = compareTargetVersionId || currentVersionId || (versions[0]?.id ?? '')
-  const aiSopContext = useMemo(() => ({
-    ...metadata,
-    title: metadata?.title?.trim() || 'Untitled SOP',
-    documentId: metadata?.documentId || documentId || 'SOP-NEW',
-  }), [metadata, documentId])
   const plainText = editor?.getText() || ''
   const wordCount = plainText.split(/\s+/).filter(Boolean).length
   const charCount = plainText.length
@@ -669,18 +757,30 @@ const EditorPage = ({ isEmbedded = false, initialDocId = null }) => {
                     <div className="figma-compare-select"><select value={compareTargetValue} onChange={(event) => setCompareTargetVersionId(event.target.value)} disabled={versions.length === 0}>{versions.length === 0 ? <option value="">{t.target}: v1</option> : null}{versions.map((item) => <option key={`target-${item.id}`} value={item.id}>{t.target}: v{item.versionNumber || 1}</option>)}</select></div>
                   </div>
                   <button type="button" className="figma-btn figma-btn-primary" onClick={openCompareViewer} disabled={!documentId || !compareBaseVersionId || !compareTargetVersionId}>{t.compare}</button>
-                  <label className={`figma-btn figma-btn-small${isHistoricalView ? ' disabled' : ''}`}><Import size={15} />{t.importPdfDocx}<input type="file" accept=".pdf,.txt,.md,.doc,.docx" hidden onChange={triggerImport} disabled={isHistoricalView} /></label>
+                  <label className={`figma-btn figma-btn-small${isHistoricalView || isImporting ? ' disabled' : ''}`}>
+                    {isImporting ? <Loader2 size={15} className="figma-spin" /> : <Import size={15} />}
+                    {isImporting ? 'Importing SOP...' : 'Import SOP'}
+                    <input type="file" accept=".pdf,.txt,.md,.doc,.docx" hidden onChange={triggerImport} disabled={isHistoricalView || isImporting} />
+                  </label>
                   <button type="button" className="figma-btn figma-btn-small" onClick={insertPlaceholder} disabled={isHistoricalView}>{t.insertPlaceholder}</button>
                   <div className="figma-language-select"><select value={language} onChange={(event) => setLanguage(event.target.value)}><option value="de">{t.german}</option><option value="en">{t.english}</option></select><ChevronDown size={14} /></div>
                 </div>
               </section>
+              {importNotice ? (
+                <section className="figma-import-notice" role="status" aria-live="polite">
+                  <CheckCircle2 size={15} />
+                  <span>{importNotice}</span>
+                </section>
+              ) : null}
               <section className="figma-editor-canvas">
                 {isHistoricalView ? <span className="editor-stage-hint">{t.historicalVersionLoaded}</span> : null}
                 {isLoadingDocument ? <span className="editor-stage-hint">{t.loading}</span> : null}
-                <div className="figma-paper">
-                  <EditorContent editor={editor} />
-                  <AIAssistantBubbleMenu editor={editor} sopMetadata={aiSopContext} isEditable={!isHistoricalView} />
-                </div>
+                <EditorSurfaceErrorBoundary>
+                  <div className="figma-paper">
+                    <EditorContent editor={editor} />
+                    <AIAssistantBubbleMenu editor={editor} sopMetadata={aiSopContext} isEditable={!isHistoricalView && isEditorMounted} />
+                  </div>
+                </EditorSurfaceErrorBoundary>
               </section>
             </main>
             <aside id="sop-metadata-sidebar" className={`sop-sidebar figma-sidebar${isSidebarOpen ? '' : ' collapsed'}`} aria-hidden={!isSidebarOpen}>
@@ -817,6 +917,20 @@ const EditorPage = ({ isEmbedded = false, initialDocId = null }) => {
           onClose={() => setDiffVersions({ oldVersion: null, newVersion: null })}
         />
       ) : null}
+
+      <aside className={`ai-assistant-sidebar editor-ai-assistant-sidebar${aiWidgetOpen ? ' ai-sidebar-open' : ''}`}>
+        <AIWidget />
+      </aside>
+
+      {aiWidgetOpen ? (
+        <div
+          className="ai-widget-overlay"
+          onClick={() => setAiWidgetOpen(false)}
+          aria-hidden="true"
+        />
+      ) : null}
+
+      <FloatingAskAIButton onClick={() => setAiWidgetOpen((prev) => !prev)} isOpen={aiWidgetOpen} />
     </div>
   )
 }

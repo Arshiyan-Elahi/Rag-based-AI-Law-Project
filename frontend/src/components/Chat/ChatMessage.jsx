@@ -6,7 +6,7 @@ import './ChatMessage.css'
 /**
  * ChatMessage — Single chat message bubble for AI or user.
  */
-export default function ChatMessage({ message, userInitials = 'HK' }) {
+export default function ChatMessage({ message, userInitials = 'HK', onAction }) {
   const isAI = message.sender === 'ai'
 
   return (
@@ -38,9 +38,27 @@ export default function ChatMessage({ message, userInitials = 'HK' }) {
 
         {message.showActions && (
           <div className="chat-msg__actions">
-            <button className="chat-msg__action-btn" title="Nachricht kopieren">Kopieren</button>
-            <button className="chat-msg__action-btn" title="Exportieren">Exportieren</button>
-            <button className="chat-msg__action-btn" title="SOP öffnen">SOP öffnen</button>
+            <button
+              className="chat-msg__action-btn"
+              title="Nachricht kopieren"
+              onClick={() => onAction?.('copy', message)}
+            >
+              Kopieren
+            </button>
+            <button
+              className="chat-msg__action-btn"
+              title="Exportieren"
+              onClick={() => onAction?.('export', message)}
+            >
+              Exportieren
+            </button>
+            <button
+              className="chat-msg__action-btn"
+              title="SOP öffnen"
+              onClick={() => onAction?.('open_sop', message)}
+            >
+              SOP öffnen
+            </button>
           </div>
         )}
 

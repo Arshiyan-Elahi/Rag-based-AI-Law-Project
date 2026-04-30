@@ -324,3 +324,61 @@ class LifecycleConfig(Base):
     
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+# ==========================================
+# QA-COMPLIANT PROFILE DETECTION MODELS
+# ==========================================
+
+class ClientProfile(Base):
+    __tablename__ = "client_profiles"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), nullable=False)
+    name = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    domain = Column(String(100), nullable=True)
+    current_version_id = Column(UUID(as_uuid=True), nullable=True)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    versions = relationship("ProfileVersion", back_populates="profile", cascade="all, delete-orphan")
+
+class ProfileVersion(Base):
+    __tablename__ = "profile_versions"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    profile_id = Column(UUID(as_uuid=True), ForeignKey("client_profiles.id", ondelete="CASCADE"), nullable=False)
+    version_number = Column(Integer, nullable=False, default=1)
+    rules_json = Column(JSONB, nullable=False) # Stores the actual style/terminology rules
+    is_locked = Column(Boolean, default=False)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    profile = relationship("ClientProfile", back_populates="versions")
+
+class ProfileSuggestion(Base):
+    __tablename__ = "profile_suggestions"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), nullable=False)
+    profile_id = Column(UUID(as_uuid=True), ForeignKey("client_profiles.id", ondelete="SET NULL"), nullable=True)
+    sop_id = Column(UUID(as_uuid=True), ForeignKey("sops.id", ondelete="SET NULL"), nullable=True)
+    suggestion_type = Column(String(100), nullable=False) # terminology, preferred_wording, modal_verb, etc.
+    suggested_rule = Column(Text, nullable=False)
+    evidence_json = Column(JSONB, nullable=True) # Traceable snippets
+    confidence = Column(Float, nullable=True)
+    status = Column(String(30), default="pending", index=True) # pending, accepted, rejected
+    reviewed_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    rejection_reason = Column(Text, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+class ProfileAuditLog(Base):
+    __tablename__ = "profile_audit_logs"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), nullable=False)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    action = Column(String(100), nullable=False) # e.g., 'created_profile', 'accepted_suggestion', 'locked_version'
+    sop_id = Column(UUID(as_uuid=True), nullable=True)
+    profile_id = Column(UUID(as_uuid=True), nullable=True)
+    profile_version_id = Column(UUID(as_uuid=True), nullable=True)
+    details_json = Column(JSONB, nullable=True)
+    timestamp = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+

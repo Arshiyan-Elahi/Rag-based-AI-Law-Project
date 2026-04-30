@@ -11,6 +11,7 @@ import time
 import re
 import json
 import math
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Literal
 
@@ -29,6 +30,8 @@ from retrieval.query_router import route_query, describe_route
 from retrieval.llm_router import LLMRouter
 import os
 from dotenv import load_dotenv
+from app.database import SessionLocal
+from app.models import SOP, Deviation, Capa, AuditFinding, Decision
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
 
@@ -37,6 +40,8 @@ MAX_QUERY_CHARS = int(os.getenv("GEMINI_MAX_QUERY_CHARS", "4000"))
 MAX_CONTEXT_CHARS = int(os.getenv("GEMINI_MAX_CONTEXT_CHARS", "12000"))
 MAX_HISTORY_MESSAGE_CHARS = int(os.getenv("GEMINI_MAX_HISTORY_MESSAGE_CHARS", "800"))
 MAX_HISTORY_MESSAGES = int(os.getenv("GEMINI_MAX_HISTORY_MESSAGES", "8"))
+RAG_DEBUG_RETRIEVAL = os.getenv("RAG_DEBUG_RETRIEVAL", "true").strip().lower() == "true"
+RAG_DEBUG_MAX_CHUNKS = int(os.getenv("RAG_DEBUG_MAX_CHUNKS", "8"))
 
 
 def _json_safe_float(v, default: float = 0.0) -> float:
@@ -66,6 +71,38 @@ def _truncate_text(text: str, limit: int) -> str:
     if limit <= 0 or len(text) <= limit:
         return text
     return text[: max(limit - 1, 0)].rstrip() + "…"
+
+
+def _debug_chunk_summary(doc: Document, idx: int) -> str:
+    meta = doc.metadata or {}
+    ref = str(meta.get("ref_number") or meta.get("source_id") or f"chunk-{idx}")
+    title = str(meta.get("title") or "")
+    section = str(meta.get("_section") or meta.get("entity_type") or "unknown")
+    score = _json_safe_float(meta.get("rerank_score", 0.0))
+    snippet = _truncate_text((doc.page_content or "").replace("\n", " ").strip(), 220)
+    return (
+        f"[rag-debug] chunk#{idx} section={section} ref={ref} "
+        f"title=\"{title}\" score={score:.4f} text=\"{snippet}\""
+    )
+
+
+def _build_retrieval_debug_rows(docs: List[Document], limit: int = 20) -> List[dict]:
+    rows: List[dict] = []
+    for i, doc in enumerate(docs[:max(0, limit)], 1):
+        meta = doc.metadata or {}
+        rows.append(
+            {
+                "rank": i,
+                "section": str(meta.get("_section") or meta.get("entity_type") or ""),
+                "source_id": str(meta.get("source_id") or meta.get("entity_id") or ""),
+                "ref": str(meta.get("ref_number") or ""),
+                "title": str(meta.get("title") or ""),
+                "score": round(_json_safe_float(meta.get("rerank_score", 0.0)), 4),
+                "status": str(meta.get("status") or ""),
+                "snippet": _truncate_text((doc.page_content or "").replace("\n", " ").strip(), 280),
+            }
+        )
+    return rows
 
 
 # ─────────────────────────────────────────────
@@ -131,36 +168,36 @@ class HybridRAGChain:
 
 SMART_SYSTEM = """\
 You are a precise, bilingual QMS/IT Compliance AI Assistant integrated with a
-production Hybrid RAG system (dense + BM25 retrieval, cross-encoder reranking).
+production Hybrid RAG system.
 
-The vector store is organized by entity type. Retrieved chunks are tagged in
-context with their record metadata (ref, title, type, status). When the system
-routes to "sops", "deviations", etc., treat that as the search scope for the
-user's question. Do not mix unrelated record types unless the user asks for
-comparison or cross-reference.
-
-You have access to structured knowledge aligned to these logical collections.
-You MUST respect which collection (or combination) the retrieval step targeted.
+You have access to a structured Qdrant vector database with the following SEPARATE
+collections. You MUST search the correct collection based on the user's intent:
 
 ================================================================
 COLLECTION MAP
 ================================================================
 
 Collection: "sops"
-  Contains: Standard Operating Procedures (SOPs)
-  Fields: sop_number, title, department, SOP body text, version info when
-    present, effective_date, review_date, status
-  Triggers: "SOP", "procedure", "standard", "policy", "how to",
-    "zugriffsmanagement", "patch", "firewall", "notfall", "KI-Systeme", "governance"
-  Note: questions about a specific SOP "version" or "what the SOP says" are
-    still served from the SOP retrieval scope (chunks may include version detail).
+  → Contains : Standard Operating Procedures (SOPs)
+  → Fields   : sop_number, title, department, sop_content,
+                version_number, effective_date, review_date, status
+  → Trigger keywords: "SOP", "procedure", "standard", "policy",
+    "how to", "zugriffsmanagement", "patch", "firewall", "notfall",
+    "KI-Systeme", "governance"
 
 Collection: "deviations"
-  Contains: Deviation records and incidents
-  Fields: deviation_number, title, description_text, root_cause_text,
-    impact_level, external_status, event_date
-  Triggers: "deviation", "incident", "issue", "problem", "DEV-",
-    "breach", "excursion", "fehler", "abweichung", "kritisch"
+  → Contains : Deviation records and incidents
+  → Fields   : deviation_number, title, description_text,
+                root_cause_text, impact_level, external_status, event_date
+  → Trigger keywords: "deviation", "incident", "issue", "problem",
+    "DEV-", "breach", "excursion", "fehler", "abweichung", "kritisch"
+
+Collection: "sop_versions"
+  → Contains : Specific version content of SOPs
+  → Fields   : version_number, content_json, effective_date,
+                review_date, external_version_id, external_status
+  → Trigger keywords: "version", "current version", "v4", "effective",
+    "latest revision", "content of", "what does SOP say"
 
 Collection: "capas"
   Contains: Corrective and Preventive Actions
@@ -182,61 +219,68 @@ RULES YOU MUST ALWAYS FOLLOW
 ================================================================
 
 RULE 1 — COLLECTION ROUTING
-Before answering, state which collection(s) the retrieved context came from.
-Never merge data across collections unless the user explicitly asks for a
-cross-reference or comparison.
+Before answering, explicitly identify which collection(s) to search.
+Never merge data from deviations into SOPs or vice versa unless the user
+explicitly asks for a cross-reference.
 
 RULE 2 — EXACT POINT MATCHING
-When the user names a specific ID (e.g. SOP-IT-001, DEV-IT-401, CAPA-…,
-AUDIT-…, DEC-…), treat that as the primary anchor. Prefer facts from the
-retrieved chunk(s) for that record over pure semantic guesswork.
-(The retrieval layer may use metadata such as ref_number; your job is to
-answer from the provided context.)
+When the user mentions a specific identifier (e.g., "SOP-IT-001",
+"DEV-IT-401", "DEV-2026-103"), you MUST filter on that exact field value.
+Do not rely on semantic similarity alone.
+Use metadata filter: { "sop_number": "SOP-IT-001" }
+                  or { "deviation_number": "DEV-IT-401" }
 
 RULE 3 — CHAIN OF THOUGHT
-Before the final answer you MUST output a [REASONING] block. In it, briefly:
-  (a) what the user is asking
-  (b) which collection(s) the retrieved context represents
-  (c) any exact identifiers or conversation-memory references to apply
-  (d) how you will structure the [ANSWER]
-Then output [ANSWER], then [CONFIDENCE], then the required machine blocks.
+Before generating your final answer, you MUST perform and show a brief
+reasoning block tagged as [REASONING]. In this block:
+  (a) identify what the user is asking
+  (b) decide which collection to search
+  (c) identify any exact identifiers to filter on
+  (d) plan your answer structure
+Then produce your [ANSWER].
 
 RULE 4 — CITATIONS
-Every factual claim MUST cite a source using bracket tags, e.g.
-[SOP-IT-001], [DEV-IT-401], [CAPA-22], [AUDIT-7], [DEC-15].
-If you cannot cite it from the retrieved context, do not state it.
+Every factual claim in your answer MUST be linked to its source record
+using this format: [SOP-IT-001], [DEV-IT-401], [SOP-QA-010 v4.0]
+Never state a fact without a citation tag.
+If you cannot cite it, do not state it.
 
 RULE 5 — CONVERSATION MEMORY
-Resolve references like "that deviation", "the same SOP", "the previous
-answer" using the conversation history. Do not ask the user to repeat
-what is already established in the thread.
+You have access to the full conversation history. When the user says
+"that deviation", "the one we just discussed", "same SOP", "previous answer"
+— you MUST resolve the reference from earlier in the conversation history.
+Never ask the user to repeat what they already told you.
 
 RULE 6 — IMPACT LEVEL AWARENESS
-For deviations, always mention impact_level when the data provides it.
-Priority: Critical > Major > Moderate > Minor.
-For Critical and Major, prefix the line with a warning marker (use the warning emoji).
-Flag Critical and Major explicitly.
+When discussing deviations, always surface the impact_level in your answer.
+Priority order: Critical > Major > Moderate > Minor
+Flag Critical and Major deviations explicitly with a ⚠️ marker.
 
 RULE 7 — BILINGUAL HANDLING
-Documents may be German and/or English. Match the user language in your reply
-unless they ask for a translation.
+This system contains both German and English documents.
+If the user asks in English about a German SOP title, translate the intent
+correctly and search both languages.
+Return the answer in the same language the user asked in.
 
 RULE 8 — STATUS AWARENESS
-Report current status when the context includes it (e.g. open / closed for
-deviations; effective / draft for SOP-related status when shown). Never
-present a closed record or obsolete version as active if the context says otherwise.
+Always report the current status of records:
+  - Deviations  : open | under_investigation | closed
+  - SOP versions: effective | draft | obsolete
+Never present a closed deviation or obsolete SOP version as currently active.
 
 RULE 9 — CROSS-REFERENCE DETECTION
-If the context links a deviation, CAPA, audit, or decision to a governing SOP
-or related record, surface it as:
-[RELATED SOP: SOP-XX-XXX — short title]
-when supported by the retrieved text.
+If the user asks about a deviation, check if a related SOP exists that
+governs that area.
+Example: DEV-IT-101 → SOP-IT-001 (OT access management)
+Proactively surface this link as: [RELATED SOP: SOP-IT-001]
 
 RULE 10 — REFUSAL RULE
-If the retrieved context is insufficient, say:
+If the retrieved context does not contain enough information to answer
+confidently, say:
 "The available records do not contain sufficient detail to answer this
-question. Please check the relevant collection or provide more context."
-Never invent null fields, dates, or root causes.
+question. Please check [collection name] or provide more context."
+Never hallucinate fields, dates, or root causes that are null or missing
+in the data.
 """
 
 SMART_USER = """\
@@ -448,6 +492,58 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.prompts import HumanMessagePromptTemplate, MessagesPlaceholder
 
 
+def _looks_like_sop_generation_query(query: str) -> bool:
+    q = (query or "").strip().lower()
+    if not q:
+        return False
+    sop_terms = r"\b(sop|standard operating procedure|procedure document|work instruction)\b"
+    intent_terms = (
+        r"\b(generate|create|draft|write|prepare|convert|format|structure|"
+        r"make this|turn this|build)\b"
+    )
+    # Treat rich free-form notes as generation requests when SOP intent is explicit.
+    has_multiline_notes = ("\n" in q and len(q) > 180) or len(q) > 420
+    return bool(re.search(sop_terms, q)) and (bool(re.search(intent_terms, q)) or has_multiline_notes)
+
+
+def _build_sop_generation_prompt(raw_input: str) -> str:
+    return f"""You are a senior SOP technical writer for regulated environments.
+
+TASK
+Transform the raw user input into a complete, production-ready SOP document.
+
+RAW INPUT
+{raw_input}
+
+OUTPUT REQUIREMENTS
+1) Output ONLY the SOP body in clean plain text (no markdown headings, no code fences).
+2) Use professional, concise, domain-appropriate language.
+3) Build a logical, complete hierarchy with numbered sections and subsections.
+4) Numbering style must be consistent (e.g., 1.0, 1.1, 1.2 ... 2.0 ...).
+5) Include these core sections when relevant:
+   - Title
+   - Purpose
+   - Scope
+   - Responsibilities
+   - Procedure
+6) Add additional sections when context requires them, for example:
+   - Definitions
+   - Safety / Precautions
+   - Compliance / Regulatory References
+   - Records / Documentation
+   - Deviations / Exceptions
+   - Revision History
+7) Do NOT force irrelevant sections. If a section is not relevant, omit it.
+8) In Procedure, provide clear ordered steps and substeps with role ownership where possible.
+9) Resolve fragmented/raw notes into polished paragraphs and structured bullets.
+10) Keep terminology and tone consistent throughout.
+
+QUALITY BAR
+- The SOP must be ready to paste directly into an editor with minimal/no formatting edits.
+- Avoid placeholders like TBD unless absolutely necessary.
+"""
+
+
 def _classify_sop_inventory_query(query: str) -> Optional[Literal["count", "list"]]:
     """
     Detects SOP inventory questions so we can return a deterministic count/list
@@ -519,11 +615,23 @@ def _strict_sop_inventory_response(
 ) -> dict:
     """Build deterministic SOP inventory from the SOP section corpus (deduped by SOP id)."""
     inventory_docs: List[Document] = list(docs or [])
+    allowed_ids: set[str] = set()
+    if retriever is not None:
+        mf = getattr(retriever, "metadata_filters", {}) or {}
+        raw_ids = mf.get("allowed_entity_ids") if isinstance(mf, dict) else None
+        if isinstance(raw_ids, list):
+            allowed_ids = {str(v) for v in raw_ids}
     if retriever is not None:
         try:
             corpus_docs, _ = retriever._get_bm25_corpus()
             if corpus_docs:
-                inventory_docs = corpus_docs
+                if allowed_ids:
+                    inventory_docs = [
+                        d for d in corpus_docs
+                        if str((d.metadata or {}).get("entity_id", "")) in allowed_ids
+                    ]
+                else:
+                    inventory_docs = corpus_docs
         except Exception:
             pass
 
@@ -564,7 +672,8 @@ def _strict_sop_inventory_response(
         rows.append((display_ref, title, status))
 
     rows = sorted(rows, key=lambda x: (x[0] or "").lower())
-    total = len(rows)
+    # Use live PostgreSQL scoped IDs when available for authoritative SOP count.
+    total = len(allowed_ids) if allowed_ids else len(rows)
     list_cap = int(os.getenv("SOP_INVENTORY_LIST_MAX", "50"))
 
     if mode == "count":
@@ -668,11 +777,39 @@ class SmartRAGChain:
         self.federated = federated_retriever
         self.llm = get_llm()
         self.router = LLMRouter(llm=self.llm)
+        self._active_ids_cache: dict[str, tuple[datetime, list[str]]] = {}
         self.prompt = ChatPromptTemplate.from_messages([
             SystemMessage(content=SMART_SYSTEM),
             MessagesPlaceholder(variable_name="chat_history_messages"),
             HumanMessagePromptTemplate.from_template(SMART_USER),
         ])
+
+    def _get_active_entity_ids(self, section: str) -> list[str]:
+        cache_ttl = int(os.getenv("RAG_ACTIVE_IDS_CACHE_SECONDS", "30"))
+        now = datetime.utcnow()
+        cached = self._active_ids_cache.get(section)
+        if cached and (now - cached[0]) < timedelta(seconds=cache_ttl):
+            return cached[1]
+
+        db = SessionLocal()
+        try:
+            if section == "sops":
+                ids = [str(row[0]) for row in db.query(SOP.id).filter(SOP.is_active == True).all()]  # noqa: E712
+            elif section == "deviations":
+                ids = [str(row[0]) for row in db.query(Deviation.id).all()]
+            elif section == "capas":
+                ids = [str(row[0]) for row in db.query(Capa.id).all()]
+            elif section == "audits":
+                ids = [str(row[0]) for row in db.query(AuditFinding.id).all()]
+            elif section == "decisions":
+                ids = [str(row[0]) for row in db.query(Decision.id).all()]
+            else:
+                ids = []
+        finally:
+            db.close()
+
+        self._active_ids_cache[section] = (now, ids)
+        return ids
 
 
     def _extract_metadata_filters(self, query: str) -> dict:
@@ -710,8 +847,49 @@ class SmartRAGChain:
                 return match.group(0).upper()
         return ""
 
+    def _generate_structured_sop(self, user_input: str) -> str:
+        prompt = _build_sop_generation_prompt(_truncate_text(user_input, MAX_QUERY_CHARS))
+        parser = StrOutputParser()
+        try:
+            return (self.llm | parser).invoke(prompt).strip()
+        except Exception:
+            fallback_llm = get_fallback_llm()
+            return (fallback_llm | parser).invoke(prompt).strip()
+
     def invoke(self, query: str, category: str = None, chat_history: List[Dict] = None) -> dict:
         t0 = time.time()
+        if _looks_like_sop_generation_query(query):
+            sop_text = self._generate_structured_sop(query)
+            return {
+                "answer": sop_text,
+                "reasoning": "",
+                "confidence": "HIGH — direct SOP authoring mode from user-provided notes.",
+                "citations": [],
+                "retrieval_debug": [],
+                "suggestions": [
+                    "Review role assignments for each procedure step",
+                    "Add organization-specific compliance references",
+                    "Request a shorter version for training use",
+                ],
+                "retrieval_stats": {
+                    "searched": [],
+                    "per_section": {},
+                    "total_docs": 0,
+                    "latency_ms": round((time.time() - t0) * 1000, 1),
+                    "authoring_mode": "sop_generation",
+                },
+                "routed_to": "sop-generation",
+                "cached": False,
+                "metadata_snapshot": [],
+                "audit_log_snapshot": [],
+                "action_metadata": {
+                    "query": _truncate_text(query, MAX_QUERY_CHARS),
+                    "routing": ["sop-generation"],
+                    "latency_ms": round((time.time() - t0) * 1000, 1),
+                    "timestamp": time.time(),
+                    "model": os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
+                },
+            }
 
         cat_norm = (category or "").strip().lower()
         sop_inventory_mode: Optional[Literal["count", "list"]] = None
@@ -757,6 +935,30 @@ class SmartRAGChain:
 
         routed_label = describe_route(target_sections)
         print(f"  [router] '{query[:60]}' -> {target_sections} | filters: {metadata_filters}")
+
+        if sop_inventory_mode:
+            sop_retriever = self.federated.retrievers.get("sops")
+            if sop_retriever:
+                section_filters = dict(metadata_filters or {})
+                section_filters["allowed_entity_ids"] = self._get_active_entity_ids("sops")
+                sop_retriever.metadata_filters = section_filters
+                if rag_unified_enabled():
+                    sop_retriever.category_filter = "sops"
+                strict_resp = _strict_sop_inventory_response(
+                    [],
+                    query,
+                    sop_retriever,
+                    mode=sop_inventory_mode,
+                )
+                strict_resp["retrieval_stats"] = {
+                    "searched": ["sops"],
+                    "per_section": {"sops": 0},
+                    "total_docs": 0,
+                    "latency_ms": round((time.time() - t0) * 1000, 1),
+                    "strict_mode": True,
+                }
+                return strict_resp
+
         # ── Step 2: Hybrid search on targeted collections only ──
         all_docs: List[Document] = []
         per_section_counts: Dict[str, int] = {}
@@ -767,13 +969,38 @@ class SmartRAGChain:
                 continue
             try:
                 # Apply metadata filters (if any)
-                retriever.metadata_filters = metadata_filters
+                section_filters = dict(metadata_filters or {})
+                # Strictly constrain vector hits to currently existing entities in PostgreSQL
+                # so stale Qdrant points cannot leak into chatbot responses.
+                section_filters["allowed_entity_ids"] = self._get_active_entity_ids(section)
+                retriever.metadata_filters = section_filters
                 if rag_unified_enabled():
                     retriever.category_filter = section
                 else:
                     retriever.category_filter = None
                 # Deep retrieval: fetch 30 to allow for deduplication/diversification
                 docs = retriever.invoke(query)
+                allowed_ids = set(section_filters.get("allowed_entity_ids") or [])
+                if allowed_ids:
+                    qdrant_ids = [
+                        str((d.metadata or {}).get("entity_id") or (d.metadata or {}).get("source_id") or "")
+                        for d in docs
+                    ]
+                    docs = [
+                        d
+                        for d in docs
+                        if str((d.metadata or {}).get("entity_id") or (d.metadata or {}).get("source_id") or "") in allowed_ids
+                    ]
+                    if RAG_DEBUG_RETRIEVAL:
+                        print(
+                            f"[rag-debug] section='{section}' db_ids={len(allowed_ids)} qdrant_ids={qdrant_ids[:RAG_DEBUG_MAX_CHUNKS]} kept={len(docs)}",
+                            flush=True,
+                        )
+                if RAG_DEBUG_RETRIEVAL:
+                    print(
+                        f"[rag-debug] query='{query[:120]}' section='{section}' raw_hits={len(docs)}",
+                        flush=True,
+                    )
                 
                 # Rerank within this section
                 top_n = 20 if len(target_sections) == 1 else 10
@@ -791,6 +1018,9 @@ class SmartRAGChain:
                     d.metadata["_section"] = section
                 all_docs.extend(ranked)
                 per_section_counts[section] = len(ranked)
+                if RAG_DEBUG_RETRIEVAL and ranked:
+                    for i, doc in enumerate(ranked[:RAG_DEBUG_MAX_CHUNKS], 1):
+                        print(_debug_chunk_summary(doc, i), flush=True)
             except Exception as e:
                 print(f"  [router] Warning: retrieval failed for '{section}': {e}")
                 per_section_counts[section] = 0
@@ -913,6 +1143,12 @@ class SmartRAGChain:
         if not final_citations:
             final_citations = raw_cits
         final_citations = _sanitize_citation_list(final_citations)
+        if RAG_DEBUG_RETRIEVAL:
+            cited_refs = [str(c.get("ref", "")).strip() for c in final_citations if isinstance(c, dict)]
+            print(
+                f"[rag-debug] final_citations={len(cited_refs)} refs={cited_refs[:RAG_DEBUG_MAX_CHUNKS]}",
+                flush=True,
+            )
 
         # ── Step 6: Assemble full Audit Vault snapshots ──
 
@@ -934,6 +1170,7 @@ class SmartRAGChain:
             "reasoning":   reasoning,
             "confidence":  confidence,
             "citations":   final_citations,
+            "retrieval_debug": _build_retrieval_debug_rows(all_docs),
             "suggestions": suggestions,
             "retrieval_stats": {
                 "searched":     target_sections,

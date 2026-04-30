@@ -1,4 +1,10 @@
 const API_BASE = import.meta.env.VITE_API_BASE || ''
+const SIDEBAR_COUNTS_REFRESH_EVENT = 'sidebar-counts-refresh'
+
+function notifySidebarCountsRefresh() {
+  if (typeof window === 'undefined') return
+  window.dispatchEvent(new CustomEvent(SIDEBAR_COUNTS_REFRESH_EVENT))
+}
 
 // ─────────────────────────────────────────────────────
 // Helper: parse error body and throw with backend message
@@ -28,7 +34,9 @@ export async function createDocument(payload) {
     body: JSON.stringify(payload),
   })
   if (!res.ok) await throwApiError(res, 'Failed to create document')
-  return res.json()
+  const data = await res.json()
+  notifySidebarCountsRefresh()
+  return data
 }
 
 export async function getDocuments() {
@@ -62,6 +70,16 @@ export async function duplicateDocument(docId, payload) {
   })
   if (!res.ok) await throwApiError(res, 'Failed to duplicate document')
   return res.json()
+}
+
+export async function deleteDocument(docId) {
+  const res = await fetch(`${API_BASE}/api/editor/docs/${docId}`, {
+    method: 'DELETE',
+  })
+  if (!res.ok) await throwApiError(res, 'Failed to delete document')
+  const data = await res.json()
+  notifySidebarCountsRefresh()
+  return data
 }
 
 // ─────────────────────────────────────────────────────

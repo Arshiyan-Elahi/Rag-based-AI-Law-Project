@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { getSOPs, getDeviations } from '../api/editorApi'
 
 /**
@@ -9,11 +9,26 @@ import { getSOPs, getDeviations } from '../api/editorApi'
 export function useSidebarCounts() {
   const [sopCount, setSopCount] = useState(null)
   const [deviationCount, setDeviationCount] = useState(null)
+  const refreshEventName = 'sidebar-counts-refresh'
+
+  const fetchCounts = useCallback(async () => {
+    try {
+      const [sops, devs] = await Promise.all([
+        getSOPs().catch(() => []),
+        getDeviations().catch(() => []),
+      ])
+      setSopCount(Array.isArray(sops) ? sops.length : 0)
+      setDeviationCount(Array.isArray(devs) ? devs.length : 0)
+    } catch {
+      setSopCount(0)
+      setDeviationCount(0)
+    }
+  }, [])
 
   useEffect(() => {
     let cancelled = false
 
-    async function fetchCounts() {
+    async function fetchCountsSafe() {
       try {
         const [sops, devs] = await Promise.all([
           getSOPs().catch(() => []),
@@ -30,15 +45,21 @@ export function useSidebarCounts() {
       }
     }
 
-    fetchCounts()
+    fetchCountsSafe()
+
+    const handleRefresh = () => {
+      if (!cancelled) fetchCounts()
+    }
+    window.addEventListener(refreshEventName, handleRefresh)
 
     // Refresh every 60 seconds so the badges stay current
-    const interval = setInterval(fetchCounts, 60_000)
+    const interval = setInterval(fetchCountsSafe, 60_000)
     return () => {
       cancelled = true
       clearInterval(interval)
+      window.removeEventListener(refreshEventName, handleRefresh)
     }
-  }, [])
+  }, [fetchCounts, refreshEventName])
 
   return { sopCount, deviationCount }
 }

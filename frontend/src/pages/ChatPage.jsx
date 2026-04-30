@@ -1,32 +1,21 @@
 import React, { useCallback, useMemo, useState } from 'react'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { ArrowLeft } from 'lucide-react'
 import ConversationList from '../components/Chat/ConversationList'
 import ChatPanel from '../components/Chat/ChatPanel'
-import { queryAI } from '../api/editorApi'
+import { createDocument } from '../api/editorApi'
+import {
+  getAssistantRouteMeta,
+  nowTime,
+  runUnifiedAssistantQuery,
+  stripHtml,
+  toHtml,
+} from '../utils/chatAssistant'
+import { deriveSopTitleFromText, htmlToPlainText, plainTextToTiptapDoc } from '../utils/chatSopSave'
 import './ChatPage.css'
 
-const CHAT_STORAGE_KEY = 'chat_page_conversations_v1'
-const CHAT_ACTIVE_STORAGE_KEY = 'chat_page_active_conversation_v1'
-
-function toHtml(text) {
-  if (!text) return '<p></p>'
-  const escaped = String(text)
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-  return `<p>${escaped.replaceAll('\n', '<br/>')}</p>`
-}
-
-function stripHtml(html) {
-  return String(html || '')
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<[^>]+>/g, '')
-    .trim()
-}
-
-function nowTime() {
-  return new Date().toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })
-}
+const CHAT_STORAGE_KEY = 'chat_page_conversations_v2_reset'
+const CHAT_ACTIVE_STORAGE_KEY = 'chat_page_active_conversation_v2_reset'
 
 function createInitialConversation() {
   return {
@@ -56,6 +45,9 @@ function createInitialConversation() {
  * ChatPage — integrated chatbot UI backed by real /api/ai/query endpoint.
  */
 export default function ChatPage() {
+  const location = useLocation()
+  const navigate = useNavigate()
+  const routeMeta = useMemo(() => getAssistantRouteMeta(location.pathname), [location.pathname])
   const [conversations, setConversations] = useState(() => {
     try {
       const raw = localStorage.getItem(CHAT_STORAGE_KEY)
@@ -156,7 +148,11 @@ export default function ChatPage() {
           { role: 'user', content: text.trim() },
         ].filter((item) => item.content)
 
-        const result = await queryAI(text.trim(), { chat_history: chatHistoryPayload })
+        const result = await runUnifiedAssistantQuery({
+          question: text.trim(),
+          pathname: location.pathname,
+          chatHistory: chatHistoryPayload,
+        })
         const sourceTags = (result.sources || []).slice(0, 5).map((s, idx) => ({
           id: `src-${Date.now()}-${idx}`,
           label: s.label || s.id || `Quelle ${idx + 1}`,
@@ -203,8 +199,71 @@ export default function ChatPage() {
         setIsSending(false)
       }
     },
-    [activeConvId, activeConversation?.messages, isSending],
+    [activeConvId, activeConversation?.messages, isSending, location.pathname],
   )
+
+  const handleMessageAction = useCallback(async (action, message) => {
+    try {
+      if (!message) return
+      const text = stripHtml(message.content || '')
+      if (!text) return
+
+      if (action === 'copy') {
+        await navigator.clipboard.writeText(text)
+        return
+      }
+
+      if (action === 'export') {
+        const blob = new Blob([text], { type: 'text/plain;charset=utf-8' })
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = `chat-response-${Date.now()}.txt`
+        a.click()
+        URL.revokeObjectURL(url)
+        return
+      }
+
+      if (action === 'open_sop') {
+        const plain = htmlToPlainText(message.content || '')
+        const title = deriveSopTitleFromText(plain)
+        const docJson = plainTextToTiptapDoc(plain)
+        const created = await createDocument({
+          title,
+          doc_type: 'sop',
+          doc_json: docJson,
+          metadata_json: {
+            sopStatus: 'draft',
+            sopMetadata: {
+              title,
+              author: 'AI Assistant',
+              reviewer: '',
+              riskLevel: 'Medium',
+              department: 'Quality',
+              documentId: '',
+              references: [],
+              reviewDate: '',
+              effectiveDate: '',
+              regulatoryReferences: [],
+            },
+            auditTrail: [
+              {
+                action: 'generated_from_chatbot',
+                note: 'SOP created from chatbot-generated content.',
+                actor: 'AI Assistant',
+                createdAt: new Date().toISOString(),
+              },
+            ],
+          },
+        })
+        if (created?.id) {
+          navigate(`/editor/${created.id}`)
+        }
+      }
+    } catch (err) {
+      console.error('Chat action failed:', err)
+    }
+  }, [navigate])
 
   const mobileClass = showChat ? 'chat-page--show-chat' : 'chat-page--show-list'
 
@@ -234,6 +293,7 @@ export default function ChatPage() {
                       ? `${activeConversation.messages.length} Nachrichten`
                       : 'Noch keine Nachrichten',
                     isSending ? 'Antwort wird generiert…' : 'Live verbunden',
+                    routeMeta.contextLabel,
                   ],
                   dateDivider: 'Heute',
                 }
@@ -241,6 +301,7 @@ export default function ChatPage() {
           }
           onSendMessage={handleSendMessage}
           isAwaitingResponse={isSending}
+          onMessageAction={handleMessageAction}
         />
       </div>
     </div>

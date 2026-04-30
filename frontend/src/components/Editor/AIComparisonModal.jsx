@@ -8,7 +8,7 @@ const TITLES = {
   improve: 'Improvement Preview',
 }
 
-const StructuredDetails = ({ action, structuredData }) => {
+const StructuredDetails = ({ action, structuredData, suggestedText }) => {
   if (!structuredData) return null
 
   if (action === 'gap_check') {
@@ -152,7 +152,7 @@ const AIComparisonModal = ({
             </div>
           )}
 
-          <StructuredDetails action={action} structuredData={structuredData} />
+          <StructuredDetails action={action} structuredData={structuredData} suggestedText={suggestedText} />
 
           <div className="ai-diff-grid">
             <div className="ai-diff-card">

@@ -1,47 +1,76 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { useLocation } from 'react-router-dom'
 import { Send, Zap } from 'lucide-react'
-import { queryAI } from '../../api/editorApi'
+import { nowTime, runUnifiedAssistantQuery, getAssistantRouteMeta } from '../../utils/chatAssistant'
 import './DashboardComponents.css'
 
-// Context-aware quick suggestions based on current route
-const SUGGESTIONS_BY_ROUTE = {
-  '/sops': [
-    'Welche SOP ist besonders relevant?',
-    'Gab es Audit-Bezug?',
-    'Was war die letzte Abweichung?',
-    'Zusammenfassung letzter Woche',
-  ],
-  default: [
-    'Welche SOP ist besonders relevant?',
-    'Gab es Audit-Bezug?',
-    'Was war die letzte Abweichung?',
-    'Zusammenfassung letzter Woche',
-  ],
-}
-
-// Initial greeting from AI (loaded on first render)
-const GREETING_MESSAGE = {
-  id: 'greeting',
-  role: 'ai',
-  text: 'Guten Morgen, Martina. Heute haben Sie 3 dringende Aufgaben und 3 neue Abweichungen. Soll ich mit den kritischsten beginnen?',
-  tags: ['DEV-2025-031', 'CAPA-2025-03'],
-}
+const STORAGE_KEY_BY_PATH = 'ai_widget_messages_by_path_v2_reset'
 
 export default function AIWidget() {
   const location = useLocation()
-  const [messages, setMessages] = useState([GREETING_MESSAGE])
+  const routeMeta = getAssistantRouteMeta(location.pathname)
+  const [messages, setMessages] = useState(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY_BY_PATH)
+      const parsed = raw ? JSON.parse(raw) : {}
+      const byPath = parsed?.[location.pathname]
+      if (Array.isArray(byPath) && byPath.length > 0) return byPath
+    } catch {
+      // no-op
+    }
+    return [
+      {
+        id: `greeting-${Date.now()}`,
+        role: 'ai',
+        text: 'Chatbot ist verbunden. Stelle eine Frage zu SOPs, Abweichungen, CAPAs, Audits oder Entscheidungen.',
+        tags: [],
+        time: nowTime(),
+      },
+    ]
+  })
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
   const chatEndRef = useRef(null)
-
-  const suggestions =
-    SUGGESTIONS_BY_ROUTE[location.pathname] ?? SUGGESTIONS_BY_ROUTE.default
+  const suggestions = routeMeta.suggestions
 
   // Auto-scroll to bottom when messages change or when loading indicator appears
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, sending])
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY_BY_PATH)
+      const parsed = raw ? JSON.parse(raw) : {}
+      parsed[location.pathname] = messages
+      localStorage.setItem(STORAGE_KEY_BY_PATH, JSON.stringify(parsed))
+    } catch {
+      // ignore storage failures
+    }
+  }, [location.pathname, messages])
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY_BY_PATH)
+      const parsed = raw ? JSON.parse(raw) : {}
+      const byPath = parsed?.[location.pathname]
+      if (Array.isArray(byPath) && byPath.length > 0) {
+        setMessages(byPath)
+        return
+      }
+    } catch {
+      // no-op
+    }
+    setMessages([
+      {
+        id: `greeting-${Date.now()}`,
+        role: 'ai',
+        text: 'Chatbot ist verbunden. Stelle eine Frage zu SOPs, Abweichungen, CAPAs, Audits oder Entscheidungen.',
+        tags: [],
+        time: nowTime(),
+      },
+    ])
+  }, [location.pathname])
 
   const sendMessage = useCallback(async (text) => {
     const trimmed = text.trim()
@@ -54,13 +83,24 @@ export default function AIWidget() {
     setSending(true)
 
     try {
-      // TODO: POST /api/ai/query — connect when backend AI endpoint is ready
-      const result = await queryAI(trimmed)
+      const chatHistoryPayload = [
+        ...messages.map((msg) => ({
+          role: msg.role === 'ai' ? 'assistant' : 'user',
+          content: msg.text,
+        })),
+        { role: 'user', content: trimmed },
+      ]
+      const result = await runUnifiedAssistantQuery({
+        question: trimmed,
+        pathname: location.pathname,
+        chatHistory: chatHistoryPayload,
+      })
       const aiMsg = {
         id: Date.now() + 1,
         role: 'ai',
         text: result.answer || result.text || result.response || '—',
         tags: result.sources?.map(s => s.label) ?? [],
+        time: nowTime(),
       }
       setMessages(prev => [...prev, aiMsg])
     } catch (err) {
@@ -68,25 +108,22 @@ export default function AIWidget() {
       const errMsg = {
         id: Date.now() + 1,
         role: 'ai',
-        text: err.status === 404 || err.message?.includes('not yet implemented')
-          ? 'Das KI-Backend ist noch nicht verbunden. (TODO: /api/ai/query)'
-          : `Fehler: ${err.message}`,
+        text: `Fehler: ${err.message || 'Unbekannter Fehler'}`,
         isError: true,
+        time: nowTime(),
       }
       setMessages(prev => [...prev, errMsg])
     } finally {
       setSending(false)
     }
-  }, [sending])
+  }, [sending, messages, location.pathname])
 
   const handleSend = () => sendMessage(input)
 
   // Clicking a suggestion triggers the actual query immediately
   const handleSuggestionClick = (text) => sendMessage(text)
 
-  const contextLabel = location.pathname === '/sops'
-    ? 'Kontext: SOP-Ansicht'
-    : 'Kontext: Keine Analyse, Startscreen'
+  const contextLabel = routeMeta.contextLabel
 
   return (
     <div className="ai-widget-container">

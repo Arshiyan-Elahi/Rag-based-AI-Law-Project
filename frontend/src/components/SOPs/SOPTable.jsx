@@ -1,8 +1,7 @@
-import React from 'react'
-import { MoreVertical, FileText, ChevronRight, ExternalLink } from 'lucide-react'
+import { MoreVertical, FileText, ChevronRight, ExternalLink, Trash2 } from 'lucide-react'
 import StatusBadge from '../Common/StatusBadge'
 
-export default function SOPTable({ data, onRowClick, onOpenNewTab }) {
+export default function SOPTable({ data, onRowClick, onOpenNewTab, onDelete }) {
   return (
     <table className="sop-data-table">
       <thead>
@@ -52,6 +51,17 @@ export default function SOPTable({ data, onRowClick, onOpenNewTab }) {
                 title="In neuem Tab öffnen"
               >
                 <ExternalLink size={16} />
+              </button>
+              <button 
+                className="row-action-btn-ghost"
+                style={{ marginRight: '8px', border: 'none', background: 'transparent', cursor: 'pointer', color: 'var(--status-urgent)' }}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onDelete?.(sop);
+                }}
+                title="SOP löschen"
+              >
+                <Trash2 size={16} />
               </button>
               <button className="row-action-btn">
                 <ChevronRight size={18} />

@@ -448,13 +448,20 @@ select {
   padding: 48px 48px 72px;
   outline: none;
   font-size: 16px;
-  line-height: 1.75;
+  line-height: 1.6;
   color: #17202f;
   overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  caret-color: #17202f;
 }
 
 .tiptap.tiptap-sop p {
-  margin: 0 0 18px;
+  margin: 0;
+  min-height: 1.35em;
+}
+
+.tiptap.tiptap-sop p + p {
+  margin-top: 10px;
 }
 
 .tiptap.tiptap-sop h1,
@@ -480,7 +487,7 @@ select {
 
 .tiptap.tiptap-sop ul,
 .tiptap.tiptap-sop ol {
-  margin: 0 0 18px 24px;
+  margin: 10px 0 10px 24px;
   padding-left: 18px;
 }
 
@@ -516,7 +523,7 @@ select {
 }
 
 .tiptap.tiptap-sop li {
-  margin: 0 0 8px;
+  margin: 0 0 6px;
 }
 
 .tiptap.tiptap-sop ul ul {
@@ -1259,6 +1266,25 @@ select {
   overflow: hidden;
 }
 
+/* Standalone /editor route: allow natural page/editor scrolling in new tabs. */
+.figma-editor-page:not(.editor-embedded) {
+  min-height: 100dvh;
+  overflow-y: auto;
+}
+
+.figma-editor-page:not(.editor-embedded) .figma-workspace {
+  overflow: visible;
+}
+
+.figma-editor-page:not(.editor-embedded) .figma-layout {
+  min-height: calc(100dvh - 60px);
+}
+
+.figma-editor-page:not(.editor-embedded) .figma-main-column,
+.figma-editor-page:not(.editor-embedded) .figma-editor-canvas {
+  overflow: visible;
+}
+
 .figma-header-strip {
   height: 60px;
   display: flex;
@@ -1410,11 +1436,30 @@ select {
   font-size: 13px;
 }
 
+.figma-spin {
+  animation: figma-spin 0.9s linear infinite;
+}
+
 .figma-toolbar-card {
   padding: 6px;
   display: flex;
   flex-direction: column;
   gap: 2px;
+}
+
+.figma-import-notice {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  margin: 2px 0 2px 2px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: #ecfdf3;
+  border: 1px solid #b7e4c8;
+  color: #0f5132;
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .figma-toolbar-row {
@@ -1502,6 +1547,11 @@ select {
   color: #6b7280;
 }
 
+@keyframes figma-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
 .figma-editor-canvas {
   flex: 1;
   min-height: 0;
@@ -1509,6 +1559,11 @@ select {
   overflow-y: auto;
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
+}
+
+/* Embedded editor keeps its own internal scroll container. */
+.figma-editor-page.editor-embedded .figma-editor-canvas {
+  overflow-y: auto;
 }
 
 .figma-paper {
@@ -1601,5 +1656,31 @@ select {
   .figma-compare-select select {
     position: relative;
     top: 0;
+  }
+}
+
+/* Standalone editor route: reuse global AI assistant sidebar */
+.editor-page-container {
+  position: relative;
+}
+
+@media (min-width: 1024px) {
+  .editor-page-container {
+    padding-right: 340px;
+  }
+
+  .editor-ai-assistant-sidebar {
+    position: fixed;
+    top: 0;
+    right: 0;
+    width: 340px;
+    height: 100dvh;
+    z-index: 220;
+    border-left: 1px solid rgba(0, 0, 0, 0.1);
+    background: #fff;
+  }
+
+  .editor-page-container .floating-ask-ai-btn {
+    display: none;
   }
 }

@@ -8,7 +8,7 @@ import './ChatPanel.css'
 /**
  * ChatPanel — Main chat detail view with header, messages & input.
  */
-export default function ChatPanel({ conversation, onSendMessage, isAwaitingResponse = false }) {
+export default function ChatPanel({ conversation, onSendMessage, isAwaitingResponse = false, onMessageAction }) {
   const [inputValue, setInputValue] = useState('')
   const messagesEndRef = useRef(null)
   const prevMsgCount = useRef(conversation?.messages?.length || 0)
@@ -104,7 +104,7 @@ export default function ChatPanel({ conversation, onSendMessage, isAwaitingRespo
         )}
 
         {conversation.messages.map(msg => (
-          <ChatMessage key={msg.id} message={msg} />
+          <ChatMessage key={msg.id} message={msg} onAction={onMessageAction} />
         ))}
         {isAwaitingResponse ? <ChatTypingIndicator /> : null}
         <div ref={messagesEndRef} />

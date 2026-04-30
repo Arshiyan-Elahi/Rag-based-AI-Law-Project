@@ -34,8 +34,8 @@
 .chat-msg--ai .chat-msg__bubble {
   background: #eaf4ee;
   border: 1px solid #d7e6dd;
-  border-radius: 2px;
-  padding: 10px 12px;
+  border-radius: 6px;
+  padding: 12px 14px;
   color: var(--text-primary);
   max-width: min(680px, 85%);
   min-width: 0;
@@ -65,20 +65,22 @@
 .chat-msg--user .chat-msg__bubble {
   background: #3d6b50;
   color: #fff;
-  border-radius: 2px;
-  padding: 9px 12px;
+  border-radius: 6px;
+  padding: 10px 12px;
   max-width: min(560px, 75%);
   min-width: 0;
 }
 
 /* ─── Message content ─── */
 .chat-msg__content {
-  font-size: 10px;
-  line-height: 1.55;
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .chat-msg__content p {
-  margin: 0 0 8px;
+  margin: 0 0 10px;
 }
 
 .chat-msg__content p:last-child {
@@ -86,7 +88,7 @@
 }
 
 .chat-msg__content ul {
-  margin: 8px 0;
+  margin: 8px 0 12px;
   padding-left: 20px;
   list-style: disc;
 }
@@ -100,12 +102,21 @@
   font-weight: 600;
 }
 
+.chat-msg__content h4 {
+  margin: 6px 0 8px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #1c4330;
+  font-weight: 700;
+}
+
 /* ─── Tags inside message ─── */
 .chat-msg__tags {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 8px;
   margin-top: 12px;
+  align-items: center;
 }
 
 /* ─── Timestamp ─── */

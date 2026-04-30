@@ -10,9 +10,16 @@
   font-weight: 600;
   line-height: 1.4;
   white-space: nowrap;
+  max-width: 100%;
+  min-width: 0;
   border: 1px solid transparent;
   transition: opacity var(--transition-fast);
   cursor: default;
+}
+
+.source-tag__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .source-tag:hover {

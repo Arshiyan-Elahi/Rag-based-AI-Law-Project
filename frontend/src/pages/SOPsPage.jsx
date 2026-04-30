@@ -1,15 +1,14 @@
-import React, { useState, useEffect, useCallback } from 'react'
+import React, { useState, useEffect, useCallback, useMemo, lazy, Suspense } from 'react'
 import {
   Search, Plus, ChevronDown, ChevronUp, ArrowLeft,
   Sparkles, ExternalLink, Edit3, Filter, Download,
-  AlertCircle, FileText, X, FileEdit, List, Loader
+  AlertCircle, FileText, X, FileEdit, List, Loader, Upload, Trash2
 } from 'lucide-react'
-import { useNavigate } from 'react-router-dom'
-import { getSOPs, queryAI } from '../api/editorApi'
+import { getSOPs, queryAI, extractText, createDocument, deleteDocument } from '../api/editorApi'
 import SOPTable from '../components/SOPs/SOPTable'
 import StatusBadge from '../components/Common/StatusBadge'
-import EditorPage from './EditorPage'
 import './SOPsPage.css'
+const EditorPage = lazy(() => import('./EditorPage'))
 
 // ── Quick filter suggestions (UI labels only — not mock data) ──────────────
 const quickFilters = [
@@ -25,7 +24,7 @@ function CategoryBadge({ category }) {
   return <span className="sop-cat-badge sop-cat-blue">{category || 'Quality'}</span>
 }
 
-function SOPCard({ sop, onOpen, onOpenNewTab, onEdit }) {
+function SOPCard({ sop, onOpen, onOpenNewTab, onEdit, onDelete }) {
   return (
     <div className="sop-context-card">
       <div className="sop-card-header">
@@ -59,6 +58,17 @@ function SOPCard({ sop, onOpen, onOpenNewTab, onEdit }) {
         </button>
         <button className="sop-card-btn sop-card-btn-ghost" onClick={() => onEdit(sop)}>
           <Edit3 size={13} /> Bearbeiten
+        </button>
+        <button 
+          className="sop-card-btn sop-card-btn-ghost" 
+          onClick={(e) => {
+            e.stopPropagation();
+            onDelete(sop);
+          }}
+          title="SOP löschen"
+          style={{ color: 'var(--status-urgent)' }}
+        >
+          <Trash2 size={13} />
         </button>
       </div>
     </div>
@@ -133,7 +143,9 @@ function mapSOP(s) {
 // ── Main Page ──────────────────────────────────────────────────────────────
 
 export default function SOPsPage() {
-  const navigate = useNavigate()
+  const fileInputRef = React.useRef(null)
+  const [importing, setImporting] = useState(false)
+
   // ── Document tab system ──────────────────────────────────────────────────
   const [tabs, setTabs] = useState([
     { id: 'sops-list', label: 'SOPs', type: 'list', closeable: false },
@@ -178,6 +190,8 @@ export default function SOPsPage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [sops, setSops] = useState([])
+  const [sopToDelete, setSopToDelete] = useState(null)
+  const [isDeletingSOP, setIsDeletingSOP] = useState(false)
 
   const loadSOPs = useCallback(async () => {
     setLoading(true)
@@ -207,27 +221,32 @@ export default function SOPsPage() {
     'Entwurf': ['draft'],
   }
 
-  const filteredSops = sops.filter(sop => {
-    const matchesSearch =
-      sop.title.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      sop.code.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      (sop.department || '').toLowerCase().includes(searchTerm.toLowerCase())
-    if (activeFilterTab === 'Alle') return matchesSearch
-    const allowed = STATUS_MAP[activeFilterTab] || []
-    return matchesSearch && allowed.includes((sop.status || '').toLowerCase())
-  })
+  const filteredSops = useMemo(() => {
+    const normalizedSearch = searchTerm.toLowerCase()
+    return sops.filter(sop => {
+      const matchesSearch =
+        sop.title.toLowerCase().includes(normalizedSearch) ||
+        sop.code.toLowerCase().includes(normalizedSearch) ||
+        (sop.department || '').toLowerCase().includes(normalizedSearch)
+      if (activeFilterTab === 'Alle') return matchesSearch
+      const allowed = STATUS_MAP[activeFilterTab] || []
+      return matchesSearch && allowed.includes((sop.status || '').toLowerCase())
+    })
+  }, [sops, searchTerm, activeFilterTab])
 
   // ── Client-side sorting (works on real backend data) ─────────────────────
-  const sortedSops = [...filteredSops].sort((a, b) => {
-    if (sortOrder === 'recent') {
-      return new Date(b.updated_at_raw || 0) - new Date(a.updated_at_raw || 0)
-    }
-    if (sortOrder === 'oldest') {
-      return new Date(a.updated_at_raw || 0) - new Date(b.updated_at_raw || 0)
-    }
-    // Default: ascending A→Z by SOP number
-    return (a.sop_number || a.code || '').localeCompare(b.sop_number || b.code || '', 'de')
-  })
+  const sortedSops = useMemo(() => {
+    return [...filteredSops].sort((a, b) => {
+      if (sortOrder === 'recent') {
+        return new Date(b.updated_at_raw || 0) - new Date(a.updated_at_raw || 0)
+      }
+      if (sortOrder === 'oldest') {
+        return new Date(a.updated_at_raw || 0) - new Date(b.updated_at_raw || 0)
+      }
+      // Default: ascending A→Z by SOP number
+      return (a.sop_number || a.code || '').localeCompare(b.sop_number || b.code || '', 'de')
+    })
+  }, [filteredSops, sortOrder])
 
   // ── Actions ──────────────────────────────────────────────────────────────
   const handleOpen = useCallback((sopOrId) => {
@@ -265,42 +284,115 @@ export default function SOPsPage() {
   }
 
   const handleQuickFilter = (query) => setSearchQuery(query)
+  
+  const handleImportClick = () => {
+    fileInputRef.current?.click()
+  }
 
-  const hasEditorTabs = tabs.some(t => t.type === 'editor')
+  const handleDeleteClick = useCallback((sop) => {
+    setSopToDelete(sop)
+  }, [])
+
+  const handleDeleteCancel = useCallback(() => {
+    if (isDeletingSOP) return
+    setSopToDelete(null)
+  }, [isDeletingSOP])
+
+  const handleDeleteConfirm = useCallback(async () => {
+    if (!sopToDelete) return
+    setIsDeletingSOP(true)
+    try {
+      await deleteDocument(sopToDelete.id)
+      // Success: refresh the list
+      await loadSOPs()
+      // Also close any open tabs for this doc
+      setTabs(prev => prev.filter(t => t.docId !== String(sopToDelete.id)))
+      setSopToDelete(null)
+    } catch (err) {
+      console.error('Failed to delete SOP:', err)
+      alert(`Fehler beim Löschen: ${err.message}`)
+    } finally {
+      setIsDeletingSOP(false)
+    }
+  }, [loadSOPs, sopToDelete])
+
+  const handleFileChange = async (e) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+
+    setImporting(true)
+    try {
+      const { text } = await extractText(file)
+      if (!text) throw new Error('No text content found in PDF.')
+
+      // Create a new SOP from the extracted text
+      const newDoc = await createDocument({
+        title: file.name.replace(/\.[^/.]+$/, "") || 'Imported SOP',
+        doc_json: {
+          type: 'doc',
+          content: [
+            {
+              type: 'paragraph',
+              content: [{ type: 'text', text: text }]
+            }
+          ]
+        },
+        metadata_json: {
+          sopMetadata: {
+            author: 'System (Import)',
+            department: 'Quality'
+          }
+        }
+      })
+
+      // Open the new document in a tab
+      openSOPEditorTab(newDoc.id, newDoc.sop_number || newDoc.title)
+      
+      // Reset file input
+      if (fileInputRef.current) fileInputRef.current.value = ''
+      
+      // Optional: reload list
+      loadSOPs()
+    } catch (err) {
+      console.error('PDF Import failed:', err)
+      alert(`Import fehlgeschlagen: ${err.message}`)
+    } finally {
+      setImporting(false)
+    }
+  }
 
   return (
     <div className="sops-tabbed-page">
 
       {/* ── Document tab bar ──────────────────────────────────────────── */}
-      {hasEditorTabs && (
-        <div className="doc-tab-bar" role="tablist" aria-label="SOP Tabs">
-          {tabs.map(tab => (
-            <button
-              key={tab.id}
-              role="tab"
-              aria-selected={tab.id === activeTabId}
-              className={`doc-tab${tab.id === activeTabId ? ' doc-tab-active' : ''}`}
-              onClick={() => setActiveTabId(tab.id)}
-            >
-              {tab.type === 'editor'
-                ? <FileEdit size={13} className="doc-tab-icon" />
-                : <List size={13} className="doc-tab-icon" />
-              }
-              <span className="doc-tab-label">{tab.label}</span>
-              {tab.closeable && (
-                <span
-                  className="doc-tab-close"
-                  role="button"
-                  aria-label={`${tab.label} schließen`}
-                  onClick={(e) => closeTab(tab.id, e)}
-                >
-                  <X size={11} />
-                </span>
-              )}
-            </button>
-          ))}
-        </div>
-      )}
+      <div className="doc-tab-bar" role="tablist" aria-label="SOP Tabs">
+        {tabs.map(tab => (
+          <button
+            key={tab.id}
+            role="tab"
+            aria-selected={tab.id === activeTabId}
+            className={`doc-tab${tab.id === activeTabId ? ' doc-tab-active' : ''}`}
+            onClick={() => setActiveTabId(tab.id)}
+            title={tab.label}
+          >
+            {tab.type === 'editor'
+              ? <FileEdit size={13} className="doc-tab-icon" />
+              : <List size={13} className="doc-tab-icon" />
+            }
+            <span className="doc-tab-label" title={tab.label}>{tab.label}</span>
+            {tab.closeable && (
+              <span
+                className="doc-tab-close"
+                role="button"
+                aria-label={`${tab.label} schließen`}
+                onClick={(e) => closeTab(tab.id, e)}
+              >
+                <X size={11} />
+              </span>
+            )}
+          </button>
+        ))}
+      </div>
 
       {/* ── LIST TAB CONTENT ──────────────────────────────────────────── */}
       <div
@@ -375,7 +467,12 @@ export default function SOPsPage() {
               ) : sortedSops.length === 0 ? (
                 <div className="table-loading">Keine SOPs gefunden.</div>
               ) : (
-                <SOPTable data={sortedSops} onRowClick={(id) => handleOpen(id)} onOpenNewTab={handleOpenNewTab} />
+                <SOPTable 
+                  data={sortedSops} 
+                  onRowClick={(id) => handleOpen(id)} 
+                  onOpenNewTab={handleOpenNewTab} 
+                  onDelete={handleDeleteClick}
+                />
               )}
             </div>
           </div>
@@ -447,6 +544,21 @@ export default function SOPsPage() {
                 <button className="sops-action-btn sops-action-primary" onClick={handleCreate}>
                   <Plus size={14} /> Neue SOP
                 </button>
+                <button 
+                  className={`sops-action-btn sops-action-primary ${importing ? 'loading' : ''}`} 
+                  onClick={handleImportClick}
+                  disabled={importing}
+                >
+                  {importing ? <Loader size={14} className="spin" /> : <Upload size={14} />}
+                  <span>{importing ? 'Importiere...' : 'Import SOP'}</span>
+                </button>
+                <input
+                  type="file"
+                  ref={fileInputRef}
+                  style={{ display: 'none' }}
+                  accept=".pdf,.txt"
+                  onChange={handleFileChange}
+                />
               </div>
 
               {/* Quick filter chips */}
@@ -505,6 +617,7 @@ export default function SOPsPage() {
                   onOpen={handleOpen}
                   onOpenNewTab={handleOpenNewTab}
                   onEdit={handleOpen}
+                  onDelete={handleDeleteClick}
                 />
               ))}
             </div>
@@ -513,19 +626,58 @@ export default function SOPsPage() {
       </div>
 
       {/* ── EDITOR TABS CONTENT ──────────────────────────────────────────── */}
-      {tabs.filter(t => t.type === 'editor').map(tab => (
+      {tabs.filter(t => t.type === 'editor' && t.id === activeTabId).map(tab => (
         <div
           key={tab.id}
           role="tabpanel"
           className="editor-tab-wrapper"
-          style={{ display: tab.id === activeTabId ? undefined : 'none' }}
         >
-          <EditorPage
-            isEmbedded
-            initialDocId={tab.docId !== undefined ? tab.docId : null}
-          />
+          <Suspense
+            fallback={
+              <div style={{ padding: '24px', color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 8 }}>
+                <Loader size={16} className="spin" /> Lade Editor...
+              </div>
+            }
+          >
+            <EditorPage
+              isEmbedded
+              initialDocId={tab.docId !== undefined ? tab.docId : null}
+            />
+          </Suspense>
         </div>
       ))}
+
+      {sopToDelete && (
+        <div className="sop-delete-modal-overlay" role="presentation">
+          <div className="sop-delete-modal" role="dialog" aria-modal="true" aria-labelledby="sop-delete-title">
+            <h3 id="sop-delete-title" className="sop-delete-title">
+              SOP wirklich löschen?
+            </h3>
+            <p className="sop-delete-message">
+              Sind Sie sicher, dass Sie "{sopToDelete.title}" ({sopToDelete.sop_number}) löschen möchten?
+              Alle Versionen werden dauerhaft entfernt.
+            </p>
+            <div className="sop-delete-actions">
+              <button
+                type="button"
+                className="sop-delete-btn sop-delete-btn-cancel"
+                onClick={handleDeleteCancel}
+                disabled={isDeletingSOP}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="sop-delete-btn sop-delete-btn-confirm"
+                onClick={handleDeleteConfirm}
+                disabled={isDeletingSOP}
+              >
+                {isDeletingSOP ? 'Deleting...' : 'OK'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

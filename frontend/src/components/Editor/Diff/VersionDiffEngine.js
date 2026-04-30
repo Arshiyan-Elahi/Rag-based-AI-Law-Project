@@ -16,9 +16,9 @@ import { compareTableNodes } from './TableComparator';
  */
 const buildIdMap = (contentArray = []) => {
     const map = new Map();
-    contentArray.forEach(node => {
+    contentArray.forEach((node, index) => {
         const blockId = node?.attrs?.['block-id'];
-        if (blockId) map.set(blockId, node);
+        if (blockId) map.set(blockId, { node, index });
     });
     return map;
 };
@@ -42,50 +42,75 @@ export const generateDocumentDiff = (oldJson, newJson) => {
     // Map old nodes by their block-id for O(1) lookups
     const oldMap = buildIdMap(oldContent);
     // Track which old nodes have been checked to find deletions later
-    const processedOldIds = new Set();
+    const processedOldIndexes = new Set();
     const diffResult = [];
 
+    const compareNodePair = (oldNode, newNode) => {
+        if (newNode?.type === 'table') {
+            const tableDiff = compareTableNodes(oldNode, newNode);
+            return tableDiff.isChanged ? { ...tableDiff.node, diffStatus: 'modified' } : newNode;
+        }
+        const diff = compareBlocks(oldNode, newNode);
+        return diff.isChanged ? { ...diff.node, diffStatus: 'modified' } : newNode;
+    };
+
+    const findFallbackOldIndex = (startIndex, preferredType) => {
+        for (let i = startIndex; i < oldContent.length; i++) {
+            if (processedOldIndexes.has(i)) continue;
+            const candidate = oldContent[i];
+            if (candidate?.attrs?.['block-id']) continue;
+            if (!preferredType || candidate?.type === preferredType) return i;
+        }
+        for (let i = 0; i < oldContent.length; i++) {
+            if (processedOldIndexes.has(i)) continue;
+            const candidate = oldContent[i];
+            if (candidate?.attrs?.['block-id']) continue;
+            return i;
+        }
+        return -1;
+    };
+
     // 1. Iterate through new content to find additions and modifications
-    newContent.forEach((newNode) => {
+    newContent.forEach((newNode, newIndex) => {
         const blockId = newNode?.attrs?.['block-id'];
 
-        // Handle complex Table nodes separately
-        if (newNode.type === 'table') {
-            const oldNode = blockId ? oldMap.get(blockId) : null;
-
-            if (oldNode) {
-                processedOldIds.add(blockId);
-                const tableDiff = compareTableNodes(oldNode, newNode);
-                diffResult.push(tableDiff.isChanged ? { ...tableDiff.node, diffStatus: 'modified' } : newNode);
-            } else {
-                diffResult.push({ ...newNode, diffStatus: 'added' });
-            }
-            return;
-        }
-
-        // Handle standard blocks (paragraphs, headings, lists)
         if (blockId) {
-            const oldNode = oldMap.get(blockId);
+            const oldEntry = oldMap.get(blockId);
 
-            if (oldNode) {
-                processedOldIds.add(blockId);
-                const diff = compareBlocks(oldNode, newNode);
-                diffResult.push(diff.isChanged ? { ...diff.node, diffStatus: 'modified' } : newNode);
+            if (oldEntry?.node) {
+                processedOldIndexes.add(oldEntry.index);
+                diffResult.push(compareNodePair(oldEntry.node, newNode));
             } else {
                 diffResult.push({ ...newNode, diffStatus: 'added' });
             }
             return;
         }
 
-        // Nodes without block-ids (rare/fallback) are marked as added
+        // Fallback path for nodes without block-id: compare by document order.
+        const sameIndexOld = oldContent[newIndex];
+        if (
+            sameIndexOld &&
+            !processedOldIndexes.has(newIndex) &&
+            !sameIndexOld?.attrs?.['block-id']
+        ) {
+            processedOldIndexes.add(newIndex);
+            diffResult.push(compareNodePair(sameIndexOld, newNode));
+            return;
+        }
+
+        const fallbackOldIndex = findFallbackOldIndex(newIndex, newNode?.type);
+        if (fallbackOldIndex >= 0) {
+            processedOldIndexes.add(fallbackOldIndex);
+            diffResult.push(compareNodePair(oldContent[fallbackOldIndex], newNode));
+            return;
+        }
+
         diffResult.push({ ...newNode, diffStatus: 'added' });
     });
 
     // 2. Identify and append removed blocks from the old content
-    oldContent.forEach((oldNode) => {
-        const blockId = oldNode?.attrs?.['block-id'];
-        // If an old block was not processed, it means it was deleted in the new version
-        if (blockId && !processedOldIds.has(blockId)) {
+    oldContent.forEach((oldNode, oldIndex) => {
+        if (!processedOldIndexes.has(oldIndex)) {
             diffResult.push({ ...oldNode, diffStatus: 'removed' });
         }
     });

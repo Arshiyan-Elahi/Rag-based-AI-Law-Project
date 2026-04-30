@@ -37,7 +37,13 @@ const typeConfig = {
 
 export default function EntitiesPage({ type }) {
   const navigate = useNavigate()
-  const config = typeConfig[type]
+  const config = typeConfig[type] || {
+    title: 'Unbekannter Bereich',
+    fetch: async () => [],
+    icon: <HelpCircle className="text-gray-500" />,
+    color: 'gray',
+    codeKey: 'id',
+  }
   const [items, setItems] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
@@ -53,7 +59,8 @@ export default function EntitiesPage({ type }) {
     setError(null)
     try {
       const data = await config.fetch()
-      setItems(data || [])
+      const normalized = Array.isArray(data) ? data.filter((item) => item && typeof item === 'object') : []
+      setItems(normalized)
     } catch (err) {
       setError(`Fehler beim Laden von ${config.title}`)
     } finally {
@@ -67,7 +74,8 @@ export default function EntitiesPage({ type }) {
 
   const filteredItems = useMemo(() => {
     const term = searchTerm.trim().toLowerCase()
-    const byTerm = items.filter((item) =>
+    const safeItems = Array.isArray(items) ? items.filter((item) => item && typeof item === 'object') : []
+    const byTerm = safeItems.filter((item) =>
       `${item.title || ''} ${item.description_text || ''} ${item[config.codeKey] || ''} ${item.category || ''} ${item.site || ''}`
         .toLowerCase()
         .includes(term),
@@ -84,6 +92,13 @@ export default function EntitiesPage({ type }) {
       return new Date(b.created_at || 0) - new Date(a.created_at || 0)
     })
   }, [items, config.codeKey, searchTerm, statusFilter, sortOrder])
+
+  const formatSafeDate = useCallback((value) => {
+    if (!value) return '—'
+    const date = new Date(value)
+    if (Number.isNaN(date.getTime())) return '—'
+    return date.toLocaleDateString('de-DE')
+  }, [])
 
   const isDeviations = type === 'deviations'
 
@@ -286,14 +301,14 @@ export default function EntitiesPage({ type }) {
             <div className="entities-loading-row">Keine Einträge gefunden.</div>
           ) : (
             <div className="entities-items">
-              {topItems.map((item) => (
+              {topItems.filter((item) => item && typeof item === 'object').map((item) => (
                 <article key={item.id} className="entities-item">
                   <div className="entities-item-top">
                     <span className="entities-item-code">{item[config.codeKey] || '—'}</span>
                     <span className="entities-item-status">{item.external_status || item.acceptance_status || 'open'}</span>
                   </div>
                   <h3>{item.title || item.description_text?.slice(0, 80) || 'Unbenannt'}</h3>
-                  <p>{item.site ? `${item.site} · ` : ''}{item.created_at ? new Date(item.created_at).toLocaleDateString('de-DE') : '—'}</p>
+                  <p>{item.site ? `${item.site} · ` : ''}{formatSafeDate(item.created_at)}</p>
                   <div className="entities-item-tags">
                     {item.deviation_number ? <span>{item.deviation_number}</span> : null}
                     {item.impact_level ? <span>{item.impact_level}</span> : null}
@@ -431,12 +446,12 @@ export default function EntitiesPage({ type }) {
                   <tr><td colSpan="5"><div className="entities-loading-row"><Loader className="spin" size={18} /> Lade Daten...</div></td></tr>
                 ) : filteredItems.length === 0 ? (
                   <tr><td colSpan="5"><div className="entities-loading-row">Keine Einträge gefunden.</div></td></tr>
-                ) : filteredItems.map((item) => (
+                ) : filteredItems.filter((item) => item && typeof item === 'object').map((item) => (
                   <tr key={item.id}>
                     <td>{item[config.codeKey] || '—'}</td>
                     <td>{item.title || item.description_text?.slice(0, 50) || 'Unbenannt'}</td>
                     <td>{item.external_status || item.acceptance_status || 'Offen'}</td>
-                    <td>{new Date(item.created_at).toLocaleDateString('de-DE')}</td>
+                    <td>{formatSafeDate(item.created_at)}</td>
                     <td>Details</td>
                   </tr>
                 ))}

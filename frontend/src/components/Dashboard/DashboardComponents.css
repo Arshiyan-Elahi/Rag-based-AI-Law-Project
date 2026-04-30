@@ -856,18 +856,20 @@
 
 .ai-greeting-text {
   font-family: Inter, sans-serif;
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 500;
   color: #357856;
   margin: 0;
-  line-height: 1.5;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 /* Message tags (n_cbfbb, n_5e15d) */
 .ai-message-tags {
   display: flex;
   flex-wrap: wrap;
-  gap: 5px;
+  gap: 8px;
 }
 
 .ai-message-tag {
@@ -884,9 +886,11 @@
   padding: 10px 12px;
   border-radius: 4px;
   font-family: Inter, sans-serif;
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 500;
-  line-height: 1.5;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .ai-chat-message.user {

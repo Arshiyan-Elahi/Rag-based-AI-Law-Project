@@ -11,6 +11,10 @@
   overflow: hidden;
 }
 
+.ai-action-menu[data-placement='below'] {
+  transform: translate(-50%, 12px);
+}
+
 .ai-action-menu__header {
   padding: 8px 12px;
   background: #f5f7fa;
