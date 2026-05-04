@@ -28,6 +28,7 @@ app.add_middleware(
 )
 
 Base.metadata.create_all(bind=engine)
+
 def _ensure_performance_indexes() -> None:
     statements = [
         "CREATE INDEX IF NOT EXISTS idx_sops_is_active_updated ON sops (is_active, updated_at DESC)",

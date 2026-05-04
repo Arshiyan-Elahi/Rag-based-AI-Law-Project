@@ -4,9 +4,16 @@ import os
 import math
 import threading
 import asyncio
+<<<<<<< HEAD
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
+=======
+import io
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, UploadFile, File
+>>>>>>> c79857e1a6411c0dba3277d0d34266acf508094d
 from sqlalchemy import or_
 from langchain_core.output_parsers import StrOutputParser
 
@@ -38,8 +45,15 @@ DEV_REF_PATTERN = re.compile(r"\bDEV-[A-Z0-9-]+\b", re.IGNORECASE)
 CAPA_REF_PATTERN = re.compile(r"\bCAPA-[A-Z0-9-]+\b", re.IGNORECASE)
 AUDIT_REF_PATTERN = re.compile(r"\bAUDIT-[A-Z0-9-]+\b", re.IGNORECASE)
 DECISION_REF_PATTERN = re.compile(r"\bDEC-[A-Z0-9-]+\b", re.IGNORECASE)
+<<<<<<< HEAD
 # Reload server after changing CHATBOT_USE_LOCAL_DB in .env (import-time flag).
 CHATBOT_USE_LOCAL_DB = os.getenv("CHATBOT_USE_LOCAL_DB", "true").strip().lower() == "true"
+=======
+# Reload server after changing CHATBOT_USE_LOCAL_DB in environment (import-time flag).
+# Default is false so semantic RAG/Qdrant is used unless explicitly overridden.
+CHATBOT_USE_LOCAL_DB = os.getenv("CHATBOT_USE_LOCAL_DB", "false").strip().lower() == "true"
+CHATBOT_ALLOW_LOCAL_DB_PRIMARY = os.getenv("CHATBOT_ALLOW_LOCAL_DB_PRIMARY", "false").strip().lower() == "true"
+>>>>>>> c79857e1a6411c0dba3277d0d34266acf508094d
 
 
 from typing import Any
@@ -191,6 +205,40 @@ def _build_local_db_chat_response(question: str, chat_history: list[dict], categ
     category = (category or "").strip().lower()
     db = SessionLocal()
     try:
+<<<<<<< HEAD
+=======
+        count_intent = bool(
+            re.search(r"\b(how many|count|number of|total)\b", q_lower)
+        )
+        sop_intent = category in {"sops", "sop"} or "sop" in q_lower
+        if count_intent and sop_intent:
+            total_sops = db.query(SOP).count()
+            return {
+                "answer": f"Summary: There are {total_sops} SOP record(s) currently available.",
+                "sources": [{
+                    "id": f"INDEX-SOP-COUNT({total_sops})",
+                    "type": "sop",
+                    "label": "Indexed SOP inventory",
+                }],
+                "citations": [{
+                    "ref": f"INDEX-SOP-COUNT({total_sops})",
+                    "title": "Indexed SOP inventory",
+                    "type": "sop",
+                    "status": "",
+                    "score": 1.0,
+                    "excerpt": f"Distinct SOPs in primary database: {total_sops}.",
+                }],
+                "retrieval_debug": [],
+                "suggestions": [
+                    "List all SOPs with titles",
+                    "Open a specific SOP by number",
+                    "Ask for latest SOP changes",
+                ],
+                "retrieval_stats": {"mode": "local-db", "hits": 1, "count_mode": True},
+                "routed_to": "local-db-count",
+            }
+
+>>>>>>> c79857e1a6411c0dba3277d0d34266acf508094d
         citations = []
         sources = []
         answer_parts = []
@@ -412,6 +460,10 @@ def _build_local_db_chat_response(question: str, chat_history: list[dict], categ
                 "answer": "No relevant local database records were found for this query.",
                 "sources": [],
                 "citations": [],
+<<<<<<< HEAD
+=======
+                "retrieval_debug": [],
+>>>>>>> c79857e1a6411c0dba3277d0d34266acf508094d
                 "suggestions": [
                     "Ask with an exact SOP/DEV/CAPA number",
                     "Try a shorter and more specific query",
@@ -425,6 +477,21 @@ def _build_local_db_chat_response(question: str, chat_history: list[dict], categ
             "answer": " ".join(answer_parts),
             "sources": sources,
             "citations": citations,
+<<<<<<< HEAD
+=======
+            "retrieval_debug": [
+                {
+                    "rank": idx + 1,
+                    "source_id": c.get("ref", ""),
+                    "ref": c.get("ref", ""),
+                    "title": c.get("title", ""),
+                    "score": c.get("score", 1.0),
+                    "type": c.get("type", ""),
+                    "snippet": c.get("excerpt", ""),
+                }
+                for idx, c in enumerate(citations[:20])
+            ],
+>>>>>>> c79857e1a6411c0dba3277d0d34266acf508094d
             "suggestions": [
                 "Ask for details of one returned record",
                 "Ask for status and ownership of a returned item",
@@ -517,6 +584,21 @@ def _build_sop_db_fallback(question: str, chat_history: list[dict]) -> dict | No
             "answer": answer,
             "sources": sources,
             "citations": citations,
+<<<<<<< HEAD
+=======
+            "retrieval_debug": [
+                {
+                    "rank": idx + 1,
+                    "source_id": item["sop_number"],
+                    "ref": item["sop_number"],
+                    "title": item["title"],
+                    "score": 1.0,
+                    "type": "sop",
+                    "snippet": item["excerpt"],
+                }
+                for idx, item in enumerate(hits[:20])
+            ],
+>>>>>>> c79857e1a6411c0dba3277d0d34266acf508094d
             "suggestions": [
                 f"Summarize {hits[0]['sop_number']} responsibilities",
                 f"Show procedure steps from {hits[0]['sop_number']}",
@@ -881,7 +963,13 @@ async def query_ai(payload: dict):
     category = payload.get("category")
     chat_history = payload.get("chat_history") or []
 
+<<<<<<< HEAD
     if CHATBOT_USE_LOCAL_DB:
+=======
+    # RAG is the default source of truth. Local DB primary mode is opt-in only
+    # for diagnostics and should not be used in normal semantic chatbot flow.
+    if CHATBOT_USE_LOCAL_DB and CHATBOT_ALLOW_LOCAL_DB_PRIMARY:
+>>>>>>> c79857e1a6411c0dba3277d0d34266acf508094d
         # Run in a worker thread so SQLAlchemy work does not block the event loop
         # (avoids piling up slow requests, nginx timeouts, and a stuck-feeling UI).
         return await asyncio.to_thread(
@@ -917,6 +1005,10 @@ async def query_ai(payload: dict):
             "answer": fallback_answer,
             "sources": [],
             "citations": [],
+<<<<<<< HEAD
+=======
+            "retrieval_debug": [],
+>>>>>>> c79857e1a6411c0dba3277d0d34266acf508094d
             "suggestions": [
                 "Try again in a few seconds",
                 "Ask with an exact SOP/DEV/CAPA number",
@@ -932,6 +1024,10 @@ async def query_ai(payload: dict):
             "answer": fallback_answer,
             "sources": [],
             "citations": [],
+<<<<<<< HEAD
+=======
+            "retrieval_debug": [],
+>>>>>>> c79857e1a6411c0dba3277d0d34266acf508094d
             "suggestions": [
                 "Retry the same question",
                 "Check chatbot credentials in backend .env",
@@ -968,6 +1064,10 @@ async def query_ai(payload: dict):
         "answer": result.get("answer", ""),
         "sources": sources,
         "citations": citations,
+<<<<<<< HEAD
+=======
+        "retrieval_debug": result.get("retrieval_debug", []),
+>>>>>>> c79857e1a6411c0dba3277d0d34266acf508094d
         "suggestions": result.get("suggestions", []),
         "retrieval_stats": result.get("retrieval_stats", {}),
         "routed_to": result.get("routed_to", ""),
@@ -983,3 +1083,99 @@ async def query_ai(payload: dict):
         return db_fallback_response
 
     return response
+<<<<<<< HEAD
+=======
+
+
+@ai_router.post("/api/extract-text")
+async def extract_text_from_upload(file: UploadFile = File(...)):
+    """
+    Extract plain text from a small text file or PDF (editor import / OCR path).
+    """
+    from .services.pdf_extractor import extract_structured_blocks
+    
+    name = (file.filename or "").lower()
+    try:
+        if name.endswith(".pdf"):
+            # Single-pass structured extraction to keep import latency low.
+            blocks = extract_structured_blocks(file.file)
+            text_parts = []
+            for block in blocks:
+                btype = str(block.get("type", "")).lower()
+                if btype in {"section_heading", "heading", "paragraph", "note", "line"}:
+                    value = str(block.get("text", "")).strip()
+                    if value:
+                        text_parts.append(value)
+                elif btype in {"bullet_list", "numbered_list", "list", "ordered_list"}:
+                    for item in block.get("items", []) or []:
+                        value = str(item).strip()
+                        if value:
+                            text_parts.append(value)
+                elif btype == "table":
+                    for row in block.get("rows", []) or []:
+                        for cell in row or []:
+                            value = str(cell).strip()
+                            if value:
+                                text_parts.append(value)
+            text = "\n\n".join(text_parts)
+            return {
+                "text": (text or "").strip(),
+                "blocks": blocks,
+            }
+        elif name.endswith((".png", ".jpg", ".jpeg", ".tiff", ".bmp")):
+            from .services.pdf_extractor import HAS_OCR_DEPS, TESSERACT_CMD
+            if not HAS_OCR_DEPS:
+                raise HTTPException(
+                    status_code=500,
+                    detail="OCR dependencies (pytesseract, pillow) are missing. Please install them and configure Tesseract path."
+                )
+            
+            import pytesseract
+            from PIL import Image
+            
+            # Ensure Tesseract path is set (redundant but safe)
+            if TESSERACT_CMD:
+                pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+                
+            try:
+                raw = await file.read()
+                img = Image.open(io.BytesIO(raw))
+                text = pytesseract.image_to_string(img)
+                paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+                blocks = [{"type": "paragraph", "text": p} for p in paras]
+                return {
+                    "text": (text or "").strip(),
+                    "blocks": blocks,
+                }
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Image OCR failed: {e!s}")
+        elif name.endswith((".txt", ".md", ".csv", ".json")):
+            raw = await file.read()
+            text = raw.decode("utf-8", errors="replace")
+            paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+            blocks = [{"type": "paragraph", "text": p} for p in paras]
+            return {
+                "text": (text or "").strip(),
+                "blocks": blocks,
+            }
+        else:
+            # Best-effort UTF-8 for unknown extensions
+            raw = await file.read()
+            try:
+                text = raw.decode("utf-8")
+            except Exception:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Unsupported or binary file; use .pdf or .txt",
+                ) from None
+            paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+            blocks = [{"type": "paragraph", "text": p} for p in paras]
+            return {
+                "text": (text or "").strip(),
+                "blocks": blocks,
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Extraction failed: {e!s}") from e
+>>>>>>> c79857e1a6411c0dba3277d0d34266acf508094d

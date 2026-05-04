@@ -19,3 +19,9 @@ sentence-transformers
 rank-bm25
 langchain-huggingface
 langchain-qdrant
+alembic
+asyncpg
+pytesseract
+pdf2image
+pillow
+pdfplumber
