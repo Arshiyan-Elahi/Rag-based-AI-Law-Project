@@ -18,3 +18,5 @@ sentence-transformers
 rank-bm25
 langchain-huggingface
 langchain-qdrant
+alembic
+asyncpg
