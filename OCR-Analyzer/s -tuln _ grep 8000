@@ -1,0 +1,6 @@
+● fastapi.service - FastAPI app
+     Loaded: loaded (]8;;file://v2202507287959363600/etc/systemd/system/fastapi.service/etc/systemd/system/fastapi.service]8;;; [0;1;32menabled[0m; preset: [0;1;32menabled[0m)
+     Active: activating (auto-restart) (Result: exit-code) since Mon 2025-07-21 11:07:16 CEST; 3s ago
+    Process: 22939 ExecStart=/root/contractAnlyzer/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 [0;1;31m(code=exited, status=1/FAILURE)[0m
+   Main PID: 22939 (code=exited, status=1/FAILURE)
+        CPU: 118ms

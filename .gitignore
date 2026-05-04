@@ -11,6 +11,8 @@ venv/
 # --- Environment & Secrets ---
 .env
 *.local
+*.file_list
+.local
 
 # --- Editor & IDE ---
 .vscode/
