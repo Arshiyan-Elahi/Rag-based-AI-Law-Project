@@ -71,3 +71,61 @@ export function countWordsInDocument(tiptapJson) {
   if (!text) return 0
   return text.split(/\s+/).filter(Boolean).length
 }
+
+const _text = (s) => ({ type: 'text', text: String(s ?? '') })
+
+/**
+ * Map backend PDF/OCR blocks to a TipTap-compatible doc JSON (StarterKit + table).
+ * @param {Array<{type: string, text?: string, items?: string[], rows?: string[][]}>} blocks
+ * @param {string} fallbackText
+ * @returns {{ type: 'doc', content: object[] }}
+ */
+export function mapBlocksToTipTapDoc(blocks, fallbackText = '') {
+  const content = []
+  if (!Array.isArray(blocks) || blocks.length === 0) {
+    const t = String(fallbackText || '').trim()
+    if (t) content.push({ type: 'paragraph', content: [_text(t)] })
+    return { type: 'doc', content }
+  }
+
+  for (const block of blocks) {
+    const typ = String(block.type || '').toLowerCase()
+    if ((typ === 'section_heading' || typ === 'heading') && block.text) {
+      const level = Math.min(3, Math.max(1, Number(block.level) || 2))
+      content.push({ type: 'heading', attrs: { level }, content: [_text(block.text)] })
+    } else if (typ === 'paragraph' && block.text) {
+      content.push({ type: 'paragraph', content: [_text(block.text)] })
+    } else if ((typ === 'bullet_list' || typ === 'numbered_list') && Array.isArray(block.items)) {
+      const listType = typ === 'numbered_list' ? 'orderedList' : 'bulletList'
+      const items = block.items
+        .filter((it) => String(it ?? '').trim())
+        .map((it) => ({
+          type: 'listItem',
+          content: [{ type: 'paragraph', content: [_text(it)] }],
+        }))
+      if (items.length) content.push({ type: listType, content: items })
+    } else if (typ === 'table' && Array.isArray(block.rows) && block.rows.length) {
+      const rows = []
+      for (const row of block.rows) {
+        const cells = (row || []).map((cell) => ({
+          type: 'tableCell',
+          content: [{ type: 'paragraph', content: [_text(cell)] }],
+        }))
+        if (cells.length) rows.push({ type: 'tableRow', content: cells })
+      }
+      if (rows.length) {
+        content.push({
+          type: 'table',
+          content: rows,
+        })
+      }
+    }
+  }
+
+  if (!content.length) {
+    const t = String(fallbackText || '').trim()
+    if (t) content.push({ type: 'paragraph', content: [_text(t)] })
+  }
+
+  return { type: 'doc', content }
+}

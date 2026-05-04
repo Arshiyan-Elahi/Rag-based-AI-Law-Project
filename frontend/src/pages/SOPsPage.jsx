@@ -5,6 +5,8 @@ import {
   AlertCircle, FileText, X, FileEdit, List, Loader, Upload, Trash2
 } from 'lucide-react'
 import { getSOPs, queryAI, extractText, createDocument, deleteDocument } from '../api/editorApi'
+import { mapBlocksToTipTapDoc } from '../utils/editorUtils'
+import { DEFAULT_SOP_VERSION_METADATA } from '../utils/sopConstants'
 import SOPTable from '../components/SOPs/SOPTable'
 import StatusBadge from '../components/Common/StatusBadge'
 import './SOPsPage.css'
@@ -322,31 +324,38 @@ export default function SOPsPage() {
 
     setImporting(true)
     try {
-      const { text } = await extractText(file)
-      if (!text) throw new Error('No text content found in PDF.')
+      const data = await extractText(file)
+      const text = data?.text || ''
+      const ui = data?.sop_metadata_ui || {}
+      if (!text?.trim() && (!Array.isArray(data?.blocks) || data.blocks.length === 0)) {
+        throw new Error('No text content found in PDF.')
+      }
 
-      // Create a new SOP from the extracted text
+      const docJson = mapBlocksToTipTapDoc(data.blocks, text)
+      const fallbackTitle = file.name.replace(/\.[^/.]+$/, '') || 'Imported SOP'
+      const resolvedTitle = (ui.title || '').trim() || fallbackTitle
+
       const newDoc = await createDocument({
-        title: file.name.replace(/\.[^/.]+$/, "") || 'Imported SOP',
-        doc_json: {
-          type: 'doc',
-          content: [
-            {
-              type: 'paragraph',
-              content: [{ type: 'text', text: text }]
-            }
-          ]
-        },
+        title: resolvedTitle,
+        doc_json: docJson,
         metadata_json: {
+          sopStatus: DEFAULT_SOP_VERSION_METADATA.sopStatus,
           sopMetadata: {
+            ...DEFAULT_SOP_VERSION_METADATA.sopMetadata,
+            ...ui,
             author: 'System (Import)',
-            department: 'Quality'
-          }
-        }
+            reviewer: '',
+          },
+          auditTrail: [],
+          versionNote: '',
+        },
       })
 
-      // Open the new document in a tab
-      openSOPEditorTab(newDoc.id, newDoc.sop_number || newDoc.title)
+      const tabLabel = [ui.documentId, ui.title, (ui.sopVersion || '').trim()].filter(Boolean).join(' — ')
+        || newDoc.sop_number
+        || resolvedTitle
+
+      openSOPEditorTab(newDoc.id, tabLabel)
       
       // Reset file input
       if (fileInputRef.current) fileInputRef.current.value = ''
@@ -355,7 +364,14 @@ export default function SOPsPage() {
       loadSOPs()
     } catch (err) {
       console.error('PDF Import failed:', err)
-      alert(`Import fehlgeschlagen: ${err.message}`)
+      if (err?.status === 409) {
+        alert(
+          err.message ||
+            'This SOP ID already exists. Please create a new version or choose another SOP ID.',
+        )
+      } else {
+        alert(`Import fehlgeschlagen: ${err.message}`)
+      }
     } finally {
       setImporting(false)
     }
@@ -642,6 +658,13 @@ export default function SOPsPage() {
             <EditorPage
               isEmbedded
               initialDocId={tab.docId !== undefined ? tab.docId : null}
+              embedTabId={tab.id}
+              onImportMetadataApplied={({ tabId, tabLabel }) => {
+                if (!tabId || !tabLabel) return
+                setTabs((prev) =>
+                  prev.map((row) => (row.id === tabId ? { ...row, label: tabLabel } : row)),
+                )
+              }}
             />
           </Suspense>
         </div>
