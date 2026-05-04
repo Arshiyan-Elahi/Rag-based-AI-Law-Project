@@ -1,7 +1,98 @@
 import pdfplumber
 import re
 import uuid
-from typing import List, Dict, Any
+import os
+import io
+import logging
+from typing import List, Dict, Any, Optional
+
+try:
+    import pytesseract
+    from pdf2image import convert_from_bytes
+    from PIL import Image
+    HAS_OCR_DEPS = True
+except ImportError:
+    HAS_OCR_DEPS = False
+
+logger = logging.getLogger(__name__)
+
+# Configure Tesseract and Poppler paths for Windows environments
+TESSERACT_CMD = os.getenv("TESSERACT_CMD")
+if TESSERACT_CMD and os.path.exists(TESSERACT_CMD):
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+
+POPPLER_PATH = os.getenv("POPPLER_PATH")
+if POPPLER_PATH and not os.path.exists(POPPLER_PATH):
+    POPPLER_PATH = None
+
+def check_ocr_setup() -> Dict[str, Any]:
+    """
+    Diagnostic tool to check OCR readiness.
+    """
+    status = {
+        "pytesseract": HAS_OCR_DEPS,
+        "tesseract_binary": False,
+        "poppler_binaries": False,
+        "tesseract_path": pytesseract.pytesseract.tesseract_cmd if HAS_OCR_DEPS else None,
+        "poppler_path": POPPLER_PATH
+    }
+    
+    if HAS_OCR_DEPS:
+        try:
+            pytesseract.get_tesseract_version()
+            status["tesseract_binary"] = True
+        except Exception:
+            pass
+            
+    # Check poppler by trying to find pdftoppm in the path or configured path
+    try:
+        import subprocess
+        pdftoppm = "pdftoppm"
+        if POPPLER_PATH:
+            pdftoppm = os.path.join(POPPLER_PATH, "pdftoppm.exe")
+        
+        subprocess.run([pdftoppm, "-v"], capture_output=True, check=False)
+        status["poppler_binaries"] = True
+    except Exception:
+        pass
+        
+    return status
+
+def _run_ocr_on_page(file_bytes: bytes, page_num: int) -> str:
+    """
+    Fallback OCR for scanned PDF pages.
+    """
+    if not HAS_OCR_DEPS:
+        logger.warning("OCR dependencies (pytesseract, pdf2image) not installed.")
+        return ""
+    
+    setup = check_ocr_setup()
+    if not setup["tesseract_binary"]:
+        logger.error(f"Tesseract binary not found at {setup['tesseract_path']}. OCR skipped.")
+        return "[Error: Tesseract OCR binary not found. Please install Tesseract-OCR.]"
+    
+    if not setup["poppler_binaries"]:
+        logger.error("Poppler binaries (pdftoppm) not found. OCR skipped.")
+        return "[Error: Poppler binaries not found. Required for PDF to Image conversion.]"
+
+    try:
+        # Convert specific PDF page to image
+        images = convert_from_bytes(
+            file_bytes,
+            first_page=page_num,
+            last_page=page_num,
+            poppler_path=POPPLER_PATH
+        )
+        if not images:
+            return ""
+        
+        # Run Tesseract OCR on the image
+        text = pytesseract.image_to_string(images[0])
+        return text or ""
+    except Exception as e:
+        logger.error(f"OCR failed for page {page_num}: {e}")
+        return ""
+
 
 def extract_traceable_text(file_path_or_obj) -> List[Dict[str, Any]]:
     """
@@ -9,10 +100,25 @@ def extract_traceable_text(file_path_or_obj) -> List[Dict[str, Any]]:
     """
     results = []
     
+    file_bytes = None
+    if HAS_OCR_DEPS:
+        if hasattr(file_path_or_obj, "read"):
+            file_bytes = file_path_or_obj.read()
+            file_path_or_obj.seek(0)
+        elif isinstance(file_path_or_obj, (str, os.PathLike)):
+            with open(file_path_or_obj, "rb") as f:
+                file_bytes = f.read()
+
     with pdfplumber.open(file_path_or_obj) as pdf:
         for i, page in enumerate(pdf.pages):
             page_num = i + 1
             text = page.extract_text()
+            
+            # Fallback to OCR if no text found
+            if not text or not text.strip():
+                if file_bytes:
+                    text = _run_ocr_on_page(file_bytes, page_num)
+                
             if not text:
                 continue
                 
@@ -112,9 +218,24 @@ def extract_structured_blocks(file_path_or_obj) -> List[Dict[str, Any]]:
         if text:
             blocks.append({"type": "paragraph", "text": text})
 
+    file_bytes = None
+    if HAS_OCR_DEPS:
+        if hasattr(file_path_or_obj, "read"):
+            file_bytes = file_path_or_obj.read()
+            file_path_or_obj.seek(0)
+        elif isinstance(file_path_or_obj, (str, os.PathLike)):
+            with open(file_path_or_obj, "rb") as f:
+                file_bytes = f.read()
+
     with pdfplumber.open(file_path_or_obj) as pdf:
-        for page in pdf.pages:
+        for p_idx, page in enumerate(pdf.pages):
+            page_num = p_idx + 1
             text = page.extract_text() or ""
+            
+            # Fallback to OCR if no text found
+            if not text.strip():
+                if file_bytes:
+                    text = _run_ocr_on_page(file_bytes, page_num)
             raw_lines = [_clean_line(line) for line in text.splitlines()]
             lines = [line for line in raw_lines if line]
             para_buffer: List[str] = []

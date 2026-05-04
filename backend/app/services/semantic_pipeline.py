@@ -10,7 +10,7 @@ from typing import Any
 
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
-from sentence_transformers import SentenceTransformer
+# from sentence_transformers import SentenceTransformer  <-- Moved inside _get_embedder
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -78,6 +78,7 @@ def _get_embedder() -> SentenceTransformer:
     if _embedder is None:
         with _embedder_lock:
             if _embedder is None:
+                from sentence_transformers import SentenceTransformer
                 cache_dir = _resolve_hf_cache_dir()
                 local_only = _is_model_cached(cache_dir, BGE_M3_MODEL)
                 _embedder = SentenceTransformer(
