@@ -789,7 +789,6 @@ def health():
     return {"status": "ok"}
 
 
-<<<<<<< HEAD
 @router.post("/api/extract-text")
 async def extract_text_from_upload(file: UploadFile = File(...)):
     """
@@ -854,9 +853,6 @@ async def extract_text_from_upload(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Extraction failed: {e!s}") from e
 
 
-
-=======
->>>>>>> c79857e1a6411c0dba3277d0d34266acf508094d
 # ==========================================
 # OLD EDITOR COMPATIBILITY ROUTES
 # All field mappings live here — NOT in the DB
