@@ -1,13 +1,16 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react'
-import { useLocation } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { Send, Zap } from 'lucide-react'
-import { nowTime, runUnifiedAssistantQuery, getAssistantRouteMeta } from '../../utils/chatAssistant'
+import { nowTime, runUnifiedAssistantQuery, getAssistantRouteMeta, toHtml } from '../../utils/chatAssistant'
+import { createDocument } from '../../api/editorApi'
+import { htmlToPlainText, deriveSopTitleFromText, plainTextToTiptapDoc } from '../../utils/chatSopSave'
 import './DashboardComponents.css'
 
 const STORAGE_KEY_BY_PATH = 'ai_widget_messages_by_path_v2_reset'
 
 export default function AIWidget() {
   const location = useLocation()
+  const navigate = useNavigate()
   const routeMeta = getAssistantRouteMeta(location.pathname)
   const [messages, setMessages] = useState(() => {
     try {
@@ -128,6 +131,50 @@ export default function AIWidget() {
   // Clicking a suggestion triggers the actual query immediately
   const handleSuggestionClick = (text) => sendMessage(text)
 
+  const handleCreateSOP = useCallback(async (messageText) => {
+    try {
+      if (!messageText) return
+      const htmlText = toHtml(messageText)
+      const plain = htmlToPlainText(htmlText)
+      const title = deriveSopTitleFromText(plain)
+      const docJson = plainTextToTiptapDoc(plain)
+      
+      const created = await createDocument({
+        title,
+        doc_type: 'sop',
+        doc_json: docJson,
+        metadata_json: {
+          sopStatus: 'draft',
+          sopMetadata: {
+            title,
+            author: 'AI Assistant',
+            reviewer: '',
+            riskLevel: 'Medium',
+            department: 'Quality',
+            documentId: '',
+            references: [],
+            reviewDate: '',
+            effectiveDate: '',
+            regulatoryReferences: [],
+          },
+          auditTrail: [
+            {
+              action: 'generated_from_chatbot',
+              note: 'SOP created from KL Assistant-generated content.',
+              actor: 'AI Assistant',
+              createdAt: new Date().toISOString(),
+            },
+          ],
+        },
+      })
+      if (created?.id) {
+        navigate(`/editor/${created.id}`)
+      }
+    } catch (err) {
+      console.error('Failed to create SOP from AIWidget:', err)
+    }
+  }, [navigate])
+
   const contextLabel = routeMeta.contextLabel
 
   return (
@@ -198,13 +245,22 @@ export default function AIWidget() {
             key={m.id}
             className={`ai-chat-message ${m.role}${m.isError ? ' error' : ''}`}
           >
-            <p>{m.text}</p>
+            <div className="ai-message-content" dangerouslySetInnerHTML={{ __html: toHtml(m.text) }} />
             {m.tags && m.tags.length > 0 && (
               <div className="ai-message-tags">
                 {m.tags.map(tag => (
                   <span key={tag} className="ai-message-tag">{tag}</span>
                 ))}
               </div>
+            )}
+            {m.role === 'ai' && !m.isError && /purpose|zweck|scope|geltungsbereich|procedure|verfahren|responsibilities|verantwortlichkeiten/i.test(m.text) && (
+              <button 
+                className="ai-kontext-btn" 
+                style={{ marginTop: '10px', padding: '6px 12px', fontSize: '11px', minHeight: 'auto', borderRadius: '4px' }}
+                onClick={() => handleCreateSOP(m.text)}
+              >
+                Als SOP speichern
+              </button>
             )}
           </div>
         ))}
