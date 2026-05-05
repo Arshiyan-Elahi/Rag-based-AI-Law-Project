@@ -66,10 +66,10 @@ QDRANT_HOST=localhost
 QDRANT_PORT=6333
 
 # PostgreSQL Config
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=admin123
+POSTGRES_USER=your postgres user
+POSTGRES_PASSWORD=your pass
 POSTGRES_HOST=localhost
-POSTGRES_PORT=5432
+POSTGRES_PORT=your port
 POSTGRES_DB=qdrant
 
 # Authentication
