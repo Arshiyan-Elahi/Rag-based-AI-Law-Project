@@ -1,1 +1,0 @@
-"""SOP editor action package."""

@@ -152,7 +152,7 @@ export const MenuBar = ({
       <input
         ref={fileInputRef}
         type="file"
-        accept=".pdf,.docx,.doc,.txt"
+        accept=".pdf,.docx,.txt"
         style={{ display: 'none' }}
         onChange={handleFileChange}
       />

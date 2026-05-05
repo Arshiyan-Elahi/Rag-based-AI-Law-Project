@@ -152,6 +152,28 @@ const RelatedContextSidebar = ({ sopId, onLinkClick, refreshToken = 0 }) => {
 }
 
 const ContextSection = ({ title, items, icon, tone, emptyText, getLabel, getStatus }) => {
+  const buildContextItemKey = (item, index) => {
+    const primaryId =
+      item.id ||
+      item.uuid ||
+      item.document_id ||
+      item.version_id ||
+      item.sop_id ||
+      item.sop_number ||
+      item.deviation_id ||
+      item.deviation_number ||
+      item.capa_id ||
+      item.capa_number ||
+      item.finding_id ||
+      item.finding_number ||
+      item.decision_id ||
+      item.decision_number ||
+      ''
+    const titlePart = item.title || item.name || item.finding_text || item.authority || 'item'
+    const versionPart = item.version || item.version_number || item.current_version?.version_number || 'na'
+    return `${tone || 'item'}-${primaryId || titlePart}-${versionPart}-${index}`
+  }
+
   return (
     <div className="context-section" data-type={title}>
       <h4 className="context-section-header">
@@ -165,7 +187,7 @@ const ContextSection = ({ title, items, icon, tone, emptyText, getLabel, getStat
       <div className="context-items-list">
         {items.map((item, index) => (
           <div
-            key={item.id || item.sop_number || item.deviation_number || item.capa_number || item.finding_number || item.decision_number || `${title}-${index}`}
+            key={buildContextItemKey(item, index)}
             className="context-item-card"
           >
             <div className="context-item-label">{getLabel(item, index)}</div>

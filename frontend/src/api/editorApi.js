@@ -310,5 +310,7 @@ export async function extractText(file) {
     body: formData,
   })
   if (!res.ok) await throwApiError(res, 'OCR extraction failed')
-  return res.json()
+  const data = await res.json()
+  console.debug('[OCR] API response', data)
+  return data
 }

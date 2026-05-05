@@ -19,7 +19,7 @@ def sanitize_text_for_metadata_extraction(text: str) -> str:
         return ""
     out_lines: List[str] = []
     for raw in text.splitlines():
-        ln = raw.strip()
+        ln = raw.replace("\ufeff", "").strip()
         ln = re.sub(r"^#{1,6}\s*", "", ln)
         ln = re.sub(r"\*{1,3}|_{1,3}|`+", "", ln)
         ln = re.sub(r"\s+", " ", ln).strip()
@@ -27,10 +27,11 @@ def sanitize_text_for_metadata_extraction(text: str) -> str:
     return "\n".join(out_lines)
 
 
+_SOP_TOKEN = r"SOP(?:[-/][A-Z0-9]+){2,}"
 _SOP_ID_LINE = re.compile(
-    r"(?i)(?:SOP\s*ID|Dokumenten?\s*(?:ID|Nr\.?))\s*[:#]?\s*(SOP-[A-Z0-9]+(?:-[A-Z0-9]+)+)"
+    rf"(?i)(?:SOP\s*(?:ID|Nr\.?|Number)?|Dokumenten?\s*(?:ID|Nr\.?))\s*(?:\+\s*(?:Titel|Title))?\s*[:#]?\s*({_SOP_TOKEN})"
 )
-_SOP_ID_GENERIC = re.compile(r"\b(SOP-[A-Z0-9]+(?:-[A-Z0-9]+)+)\b", re.I)
+_SOP_ID_GENERIC = re.compile(rf"\b({_SOP_TOKEN})\b", re.I)
 
 # Title on same row as label (may be empty if continued on next lines)
 _TITLE_SAME_LINE = re.compile(
@@ -41,10 +42,27 @@ _INLINE_TITLE = re.compile(
     r"(?im)^\s*(?:Title|Titel|Betreff)\s*[:#]\s*(.+?)\s*$"
 )
 
+_COMBINED_SOP_TITLE = re.compile(
+    rf"(?im)^\s*(?:SOP\s*ID\s*\+\s*(?:Titel|Title)|SOP\s*(?:ID|Nr\.?)\s*(?:/|\+|-)\s*(?:Titel|Title))\s*[:#]?\s*{_SOP_TOKEN}\s*(?:[-–—:]\s*)?(.+?)\s*$"
+)
+
 _NEXT_FIELD_LINE = re.compile(
     r"(?i)^(SOP\s*ID|Document\s*(?:ID|Nr\.?)|Dokumenten?\s*(?:ID|Nr)|Version|Revision|Rev\.?|"
     r"Abteilung|Department|Bereich|Datum|Date|Effective|Gültig|Page|Seite|Ausgabe|Stand|"
     r"Scope|Geltungsbereich|Purpose|Zweck)\s*[:#]?"
+)
+
+_TITLE_METADATA_LINE = re.compile(
+    r"(?i)^\s*(?:"
+    r"Effective\s*Date|Gültig\s*ab|Gueltig\s*ab|Date|Datum|Version|Revision|Rev\.?|"
+    r"Department|Abteilung|Status|Author|Approved\s*by|Review\s*Date|"
+    r"Nächste\s*Prüfung|Prüfdatum|Überprüfung"
+    r")\b"
+)
+
+_TITLE_SECTION_HEADING = re.compile(
+    r"(?i)^\s*(?:Zweck|Purpose|Scope|Geltungsbereich|Definitions?|Definitionen|"
+    r"Verantwortlichkeiten|Responsibilities)\b"
 )
 
 # Explicit document-version labels (line-based). Order: most specific first.
@@ -88,7 +106,7 @@ _VERSION_LABEL = re.compile(
 )
 
 _DATE_LABEL = re.compile(
-    r"(?i)(?:Datum|Date|Effective\s*Date|Gültig(?:keit)?|Gültig\s*ab|Freigabedatum)\s*[:#]?\s*"
+    r"(?i)(?:Datum|Date|Effective\s*Date|Gültig(?:keit)?|Gueltig(?:keit)?|Gültig\s*ab|Gueltig\s*ab|Freigabedatum)\s*[:#]?\s*"
     r"(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}-\d{2}-\d{2})"
 )
 
@@ -107,6 +125,8 @@ _GENERIC_DATE = re.compile(
 
 _CATEGORY_KEYWORDS = [
     (re.compile(r"(?i)\b(notfall|notfallzugriff|emergency|break[-\s]?glass)\b"), "Emergency / Notfall"),
+    (re.compile(r"(?i)\b(firewall|network|netzwerk)\b"), "Network Security"),
+    (re.compile(r"(?i)\b(ki|ai|predictive\s+maintenance)\b"), "AI / Production Systems"),
     (re.compile(r"(?i)\bcapa\b"), "CAPA"),
     (re.compile(r"(?i)\b(abweichung|deviation)\b"), "Deviation"),
     (re.compile(r"(?i)\baudit\b"), "Audit"),
@@ -159,10 +179,10 @@ def _normalize_date(raw: str) -> str:
 def _find_sop_id(text: str) -> str:
     m = _SOP_ID_LINE.search(text)
     if m:
-        return m.group(1).strip()
+        return m.group(1).strip().upper()
     m = _SOP_ID_GENERIC.search(text)
     if m:
-        return m.group(1).strip()
+        return m.group(1).strip().upper()
     return ""
 
 
@@ -171,6 +191,8 @@ def _invalid_title(title: str, sop_id: str) -> bool:
         return True
     t = title.strip()
     tl = t.lower()
+    if _TITLE_METADATA_LINE.match(t) or _TITLE_SECTION_HEADING.match(t):
+        return True
     if tl.startswith("sop id") or tl.startswith("document id") or tl.startswith("dokument"):
         return True
     if "##" in t or (t.startswith("*") and t.endswith("*") and len(t) < 80):
@@ -201,6 +223,12 @@ def _invalid_department(dept: str) -> bool:
 
 def _find_title(text: str, sop_id: str) -> str:
     lines = text.splitlines()
+    m = _COMBINED_SOP_TITLE.search(text)
+    if m:
+        combined = _clean_title_value(m.group(1))
+        if combined and not _invalid_title(combined, sop_id):
+            return combined
+
     for i, line in enumerate(lines):
         m = _TITLE_SAME_LINE.match(line)
         if m:
@@ -239,7 +267,7 @@ def _find_title(text: str, sop_id: str) -> str:
         if len(sl) < 10:
             continue
         if re.match(
-            r"^(version|revision|page|seite|datum|date|department|abteilung|scope|purpose|zweck)\b",
+            r"^(version|revision|page|seite|datum|date|effective\s*date|department|abteilung|status|author|approved\s*by|review\s*date|scope|purpose|zweck|geltungsbereich|definitions?|definitionen|verantwortlichkeiten|responsibilities)\b",
             sl,
             re.I,
         ):
@@ -256,7 +284,14 @@ def _find_title(text: str, sop_id: str) -> str:
 def _clean_title_value(s: str) -> str:
     t = re.sub(r"\s+", " ", (s or "").strip())
     t = re.sub(r"^[:\-\s]+", "", t)
+    t = re.sub(r"^[^\wÄÖÜäöü(]+", "", t)
     t = re.sub(r"\*{1,3}|_{1,3}", "", t)
+    t = re.split(
+        r"\s+\|\s*(?:Status|Version|Revision|Rev\.?|Department|Abteilung|Date|Datum|Effective|Gültig|Gueltig)\b",
+        t,
+        maxsplit=1,
+        flags=re.I,
+    )[0]
     return t.strip()
 
 
@@ -315,6 +350,15 @@ def _canonicalize_version_token(raw: str, label_kind: str) -> str:
     if not raw:
         return ""
     s = raw.strip().strip(":*#.- ")
+    s = re.split(
+        r"\s+\|\s*(?:Status|Department|Abteilung|Date|Datum|Effective|Gültig|Gueltig|Title|Titel)\b",
+        s,
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+    m_first = re.match(r"(?i)^(V\s*\d+(?:\.\d+)*|0*\d+(?:\.\d+)*|Rev\.?\s*0*\d+(?:\.\d+)?)\b", s)
+    if m_first:
+        s = m_first.group(1)
     s = re.sub(r"\s+", "", s)
     if not s:
         return ""
@@ -655,7 +699,12 @@ def _find_department(text: str, sop_id: str) -> str:
     m = _DEPT_LABEL.search(text)
     if m:
         dept = m.group(1).strip()
-        dept = re.split(r"\s{2,}|\n", dept)[0].strip()
+        dept = re.split(
+            r"\s{2,}|\n|\s+\|\s*(?:Status|Version|Revision|Rev\.?|Date|Datum|Effective|Gültig|Gueltig|Title|Titel)\b",
+            dept,
+            maxsplit=1,
+            flags=re.I,
+        )[0].strip()
         dept = _clean_title_value(dept)
         if dept and not _invalid_department(dept):
             return dept[:160]

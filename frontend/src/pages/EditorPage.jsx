@@ -20,6 +20,7 @@ import {
 } from 'lucide-react'
 
 import RelatedContextSidebar from '../components/Editor/SOP/RelatedContextSidebar'
+import SOPMetadataPanel from '../components/Editor/SOP/SOPMetadataPanel'
 import LinkModal from '../components/Common/LinkModal'
 import LinkingModal from '../components/Common/LinkingModal'
 import EditorToolbarSection from '../components/Editor/EditorToolbarSection'
@@ -30,7 +31,6 @@ import { useLanguage } from '../context/LanguageContext'
 import {
   createDocument,
   createVersion,
-  extractText,
   getDocument,
   getVersion,
   getVersions,
@@ -38,8 +38,11 @@ import {
   updateVersionStatus,
 } from '../api/editorApi'
 import { DEFAULT_SOP_VERSION_METADATA, SOP_ORDER, SOP_STATES } from '../utils/sopConstants'
-import { formatOCRText } from '../utils/formatOCRText'
-import { mapOCRBlocksToHTML } from '../utils/mapOCRBlocksToHTML'
+import {
+  applySOPImportMetadata,
+  buildSOPDisplayLabel,
+  prepareEditorSOPImport,
+} from '../utils/sopImportService'
 import '../assets/styles/global.css'
 
 const PreviewModal = lazy(() => import('../components/Common/PreviewModal'))
@@ -213,6 +216,10 @@ const mapVersion = (version) => ({
 const EditorPage = ({
   isEmbedded = false,
   initialDocId = null,
+  initialMetadataJson = null,
+  initialStatus = '',
+  initialDocTitle = '',
+  openRequestKey = '',
   embedTabId = null,
   onImportMetadataApplied = null,
 }) => {
@@ -247,6 +254,42 @@ const EditorPage = ({
   const hydrationRef = useRef(false)
   const saveInFlightRef = useRef(false)
   const [isEditorMounted, setIsEditorMounted] = useState(false)
+
+  useEffect(() => {
+    if (!initialMetadataJson || typeof initialMetadataJson !== 'object') return
+    const normalizedMeta = normalizeMeta(initialMetadataJson)
+    const hydrated = {
+      ...DEFAULT_SOP_VERSION_METADATA.sopMetadata,
+      ...(normalizedMeta?.sopMetadata || {}),
+    }
+    if (!hydrated.title && initialDocTitle) {
+      hydrated.title = initialDocTitle
+    }
+    console.debug('[SOP Open] initial metadata hydration', {
+      initialDocId,
+      embedTabId,
+      openRequestKey,
+      initialStatus,
+      initialDocTitle,
+      metadataKeys: Object.keys(initialMetadataJson),
+      sopMetadataKeys:
+        normalizedMeta?.sopMetadata && typeof normalizedMeta.sopMetadata === 'object'
+          ? Object.keys(normalizedMeta.sopMetadata)
+          : [],
+      hydratedPreview: {
+        documentId: hydrated.documentId,
+        title: hydrated.title,
+        sopVersion: hydrated.sopVersion,
+        docType: hydrated.docType,
+        category: hydrated.category,
+        department: hydrated.department,
+      },
+    })
+    setMetadata(hydrated)
+    setSopStatus(normalizedMeta?.sopStatus || initialStatus || DEFAULT_SOP_VERSION_METADATA.sopStatus)
+    setAuditTrail(Array.isArray(normalizedMeta?.auditTrail) ? normalizedMeta.auditTrail : [])
+    setVersionNote(normalizedMeta?.versionNote || '')
+  }, [initialMetadataJson, initialStatus, initialDocId, embedTabId, initialDocTitle, openRequestKey])
   const editorExtensions = useMemo(() => ([
     StarterKit.configure({
       hardBreak: false,
@@ -284,7 +327,12 @@ const EditorPage = ({
   const isHistoricalView = Boolean(latestVersionId && currentVersionId && latestVersionId !== currentVersionId)
   const currentVersionLabel = buildVersionLabel(currentVersion)
   const docRevision = (metadata?.sopVersion || '').trim()
-  const breadcrumbLabel = docRevision ? `${currentVersionLabel} · ${docRevision}` : currentVersionLabel
+  const headerParts = [
+    (metadata?.documentId || '').trim(),
+    (metadata?.title || '').trim(),
+    docRevision ? `v${docRevision.replace(/^v/i, '')}` : '',
+  ].filter(Boolean)
+  const breadcrumbLabel = headerParts.length ? headerParts.join(' · ') : currentVersionLabel
 
   const applyVersionState = useCallback((versionRecord, fallbackTitle = '') => {
     if (!editor || !versionRecord || !isEditorMounted || editor.isDestroyed) return
@@ -320,6 +368,18 @@ const EditorPage = ({
         getDocument(docId),
         getVersions(docId),
       ])
+      console.debug('[SOP Open] hydrateFromDocument response', {
+        requestedDocId: docId,
+        returnedDocId: doc?.id,
+        title: doc?.title,
+        status: doc?.status,
+        hasMetadataJson: Boolean(doc?.metadata_json && typeof doc.metadata_json === 'object'),
+        metadataKeys: doc?.metadata_json && typeof doc.metadata_json === 'object' ? Object.keys(doc.metadata_json) : [],
+        sopMetadataKeys:
+          doc?.metadata_json?.sopMetadata && typeof doc.metadata_json.sopMetadata === 'object'
+            ? Object.keys(doc.metadata_json.sopMetadata)
+            : [],
+      })
 
       const nextVersions = dbVersions.map(mapVersion)
       const currentDocVersion = {
@@ -351,6 +411,15 @@ const EditorPage = ({
       setIsLoadingDocument(false)
     }
   }, [editor, applyVersionState, isEditorMounted])
+
+  useEffect(() => {
+    if (!initialDocId || !openRequestKey || !editor || !isEditorMounted || editor.isDestroyed) return
+    // Explicit re-hydration when user clicks Open/Open again for the same tab.
+    // This updates metadata for mounted editor tabs without affecting normal typing flow.
+    hydrateFromDocument(initialDocId).catch((error) => {
+      console.error('Failed to refresh document on open request:', error)
+    })
+  }, [initialDocId, openRequestKey, editor, isEditorMounted, hydrateFromDocument])
 
   useEffect(() => {
     if (!editor || !isEditorMounted || editor.isDestroyed) return
@@ -493,6 +562,11 @@ const EditorPage = ({
     }))
   }
 
+  const handleMetadataPanelChange = (nextMetadata) => {
+    console.debug('[OCR] metadata passed to SOPMetadataPanel', nextMetadata)
+    setMetadata(nextMetadata)
+  }
+
   const addReference = () => {
     const value = window.prompt('Enter SOP reference')
     if (!value?.trim()) return
@@ -628,36 +702,25 @@ const EditorPage = ({
     try {
       // Let loading state render before extraction/mapping work starts.
       await new Promise((resolve) => window.requestAnimationFrame(resolve))
-      const data = await extractText(file)
-      const html = Array.isArray(data?.blocks) && data.blocks.length
-        ? mapOCRBlocksToHTML(data.blocks, 'sop')
-        : formatOCRText(data?.text || '')
+      const imported = await prepareEditorSOPImport(file)
+      console.debug('[OCR] metadata received', imported.metadata || imported.response?.sop_metadata || {})
       // Yield one frame so UI can paint loading state before heavy content insert.
       await new Promise((resolve) => window.requestAnimationFrame(resolve))
-      if (!html || !String(html).trim()) {
-        throw new Error('No structured content extracted from file.')
-      }
-      editor.commands.setContent(html, false)
+      editor.commands.setContent(imported.html, false)
 
-      const ui = data?.sop_metadata_ui || {}
+      const ui = imported.metadata || {}
       if (ui && typeof ui === 'object') {
-        setMetadata((prev) => {
-          const next = { ...prev }
-          if (ui.documentId) next.documentId = ui.documentId
-          if (ui.title) next.title = ui.title
-          if (ui.department) next.department = ui.department
-          if (ui.docType) next.docType = ui.docType
-          else if (!next.docType) next.docType = 'SOP'
-          if (ui.category) next.category = ui.category
-          if (ui.sopVersion) next.sopVersion = ui.sopVersion
-          if (ui.effectiveDate) next.effectiveDate = ui.effectiveDate
-          if (ui.reviewDate) next.reviewDate = ui.reviewDate
-          return next
-        })
-        const idPart = (ui.documentId || '').trim()
-        const titlePart = (ui.title || '').trim()
-        const verPart = (ui.sopVersion || '').trim()
-        const tabLabel = [idPart, titlePart, verPart].filter(Boolean).join(' — ')
+        console.debug('[OCR] metadata passed to SOPMetadataPanel', ui)
+        const normalized = applySOPImportMetadata(DEFAULT_SOP_VERSION_METADATA.sopMetadata, ui)
+        setMetadata((prev) => ({
+          ...prev,
+          ...normalized,
+        }))
+        const extractedStatus = (ui.sopStatus || ui.status || '').trim()
+        if (extractedStatus) {
+          setSopStatus(extractedStatus)
+        }
+        const tabLabel = buildSOPDisplayLabel(ui)
         if (tabLabel && typeof onImportMetadataApplied === 'function') {
           onImportMetadataApplied({
             tabId: embedTabId,
@@ -803,23 +866,13 @@ const EditorPage = ({
               </section>
             </main>
             <aside id="sop-metadata-sidebar" className={`sop-sidebar figma-sidebar${isSidebarOpen ? '' : ' collapsed'}`} aria-hidden={!isSidebarOpen}>
-            <div className="sidebar-card sidebar-card-emphasis">
-              <div className="sidebar-section-kicker">{t.documentDetails}</div>
-              <h3 className="sidebar-title">{t.sopMetadata}</h3>
-              <div className="sidebar-field-stack">
-                <input className="sidebar-input" value={metadata.documentId || ''} onChange={(event) => handleMetadataChange('documentId', event.target.value)} placeholder="SOP-001" disabled={isHistoricalView} />
-                <input className="sidebar-input" value={metadata.title || ''} onChange={(event) => handleMetadataChange('title', event.target.value)} placeholder={t.title} disabled={isHistoricalView} />
-                <input className="sidebar-input" value={metadata.docType || ''} onChange={(event) => handleMetadataChange('docType', event.target.value)} placeholder={t.docType} disabled={isHistoricalView} />
-                <input className="sidebar-input" value={metadata.category || ''} onChange={(event) => handleMetadataChange('category', event.target.value)} placeholder={t.category} disabled={isHistoricalView} />
-                <input className="sidebar-input" value={metadata.sopVersion || ''} onChange={(event) => handleMetadataChange('sopVersion', event.target.value)} placeholder={t.sopVersion} disabled={isHistoricalView} />
-                <input className="sidebar-input" value={metadata.department || ''} onChange={(event) => handleMetadataChange('department', event.target.value)} placeholder={t.department} disabled={isHistoricalView} />
-                <input className="sidebar-input" value={metadata.author || ''} onChange={(event) => handleMetadataChange('author', event.target.value)} placeholder={t.author} disabled={isHistoricalView} />
-                <input className="sidebar-input" value={metadata.reviewer || ''} onChange={(event) => handleMetadataChange('reviewer', event.target.value)} placeholder={t.reviewer} disabled={isHistoricalView} />
-                <input className="sidebar-input" type="date" value={metadata.effectiveDate || ''} onChange={(event) => handleMetadataChange('effectiveDate', event.target.value)} disabled={isHistoricalView} />
-                <input className="sidebar-input" type="date" value={metadata.reviewDate || ''} onChange={(event) => handleMetadataChange('reviewDate', event.target.value)} disabled={isHistoricalView} />
-                <input className="sidebar-input" value={metadata.riskLevel || ''} onChange={(event) => handleMetadataChange('riskLevel', event.target.value)} placeholder={t.riskLevel} disabled={isHistoricalView} />
-              </div>
-            </div>
+            <SOPMetadataPanel
+              metadata={metadata}
+              onChange={handleMetadataPanelChange}
+              status={sopStatus}
+              onStatusChange={setSopStatus}
+              isReadOnly={isHistoricalView}
+            />
 
             <div className="sidebar-card">
               <div className="sidebar-section-kicker">{t.referenceManagement}</div>

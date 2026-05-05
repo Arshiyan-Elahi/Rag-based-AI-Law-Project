@@ -1688,6 +1688,75 @@ select {
   margin-bottom: 6px;
 }
 
+.figma-sidebar .sop-panel-card {
+  padding: 16px;
+}
+
+.figma-sidebar .sop-panel-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.figma-sidebar .sop-panel-title svg {
+  color: var(--success);
+  flex: 0 0 auto;
+}
+
+.figma-sidebar .sop-metadata-sections,
+.figma-sidebar .sop-metadata-section,
+.figma-sidebar .sop-field-group {
+  min-width: 0;
+}
+
+.figma-sidebar .sop-metadata-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.figma-sidebar .sop-metadata-section-title {
+  margin: 0 0 10px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  line-height: 1.1;
+  text-transform: uppercase;
+  color: #7a8698;
+}
+
+.figma-sidebar .sop-metadata-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+  min-width: 0;
+}
+
+.figma-sidebar .sop-field-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.figma-sidebar .sop-field-label {
+  color: #586273;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.figma-sidebar .sop-input,
+.figma-sidebar .sop-textarea {
+  min-width: 0;
+  border-radius: 10px;
+}
+
+.figma-sidebar .sop-field-title,
+.figma-sidebar .sop-field-regulatoryReferences {
+  grid-column: 1 / -1;
+}
+
 /* Keep toolbars on a single line on wide screens */
 @media (min-width: 1440px) {
   .figma-toolbar-row {

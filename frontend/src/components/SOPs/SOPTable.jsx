@@ -17,7 +17,7 @@ export default function SOPTable({ data, onRowClick, onOpenNewTab, onDelete }) {
       </thead>
       <tbody>
         {data.map((sop) => (
-          <tr key={sop.id} className="sop-row" onClick={() => onRowClick?.(sop.id)}>
+          <tr key={sop.id} className="sop-row" onClick={() => onRowClick?.(sop)}>
             <td className="title-cell">
               <div className="title-wrapper">
                 <div className="file-icon">
@@ -46,7 +46,7 @@ export default function SOPTable({ data, onRowClick, onOpenNewTab, onDelete }) {
                 style={{ marginRight: '8px', border: 'none', background: 'transparent', cursor: 'pointer', color: '#667085' }}
                 onClick={(e) => {
                   e.stopPropagation();
-                  onOpenNewTab?.(sop.id);
+                  onOpenNewTab?.(sop);
                 }}
                 title="In neuem Tab öffnen"
               >

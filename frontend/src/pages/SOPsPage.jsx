@@ -4,9 +4,12 @@ import {
   Sparkles, ExternalLink, Edit3, Filter, Download,
   AlertCircle, FileText, X, FileEdit, List, Loader, Upload, Trash2
 } from 'lucide-react'
-import { getSOPs, queryAI, extractText, createDocument, deleteDocument } from '../api/editorApi'
-import { mapBlocksToTipTapDoc } from '../utils/editorUtils'
-import { DEFAULT_SOP_VERSION_METADATA } from '../utils/sopConstants'
+import { getSOPs, getDocument, queryAI, createDocument, deleteDocument } from '../api/editorApi'
+import {
+  buildSOPDisplayLabel,
+  prepareNewSOPImport,
+  SOP_IMPORT_ACCEPT,
+} from '../utils/sopImportService'
 import SOPTable from '../components/SOPs/SOPTable'
 import StatusBadge from '../components/Common/StatusBadge'
 import './SOPsPage.css'
@@ -139,6 +142,59 @@ function mapSOP(s) {
     owner: cv?.metadata_json?.sopMetadata?.author || s.department || 'System',
     is_active: s.is_active,
     updated_at_raw: s.updated_at || null, // kept for client-side sorting
+    current_version: cv || null,
+  }
+}
+
+function buildInitialSOPMetadata(sop) {
+  if (!sop || typeof sop !== 'object') return null
+
+  const cv = sop.current_version || {}
+  const rawMetadata = cv.metadata_json && typeof cv.metadata_json === 'object'
+    ? cv.metadata_json
+    : {}
+  const rawSopMetadata = rawMetadata.sopMetadata && typeof rawMetadata.sopMetadata === 'object'
+    ? rawMetadata.sopMetadata
+    : rawMetadata
+
+  const normalizedSopMetadata = {
+    ...rawSopMetadata,
+    documentId: rawSopMetadata.documentId
+      || rawSopMetadata.sop_id
+      || rawSopMetadata.sopId
+      || rawSopMetadata.document_id
+      || sop.sop_number
+      || sop.code
+      || sop.id,
+    title: rawSopMetadata.title || sop.title || '',
+    sopVersion: rawSopMetadata.sopVersion
+      || rawSopMetadata.version
+      || rawSopMetadata.document_revision
+      || rawSopMetadata.revision
+      || cv.version_number
+      || '',
+    docType: rawSopMetadata.docType
+      || rawSopMetadata.doc_type
+      || rawSopMetadata.documentType
+      || sop.document_type
+      || '',
+    category: rawSopMetadata.category || sop.category || '',
+    department: rawSopMetadata.department || sop.department || '',
+    author: rawSopMetadata.author || '',
+    reviewer: rawSopMetadata.reviewer || '',
+    effectiveDate: rawSopMetadata.effectiveDate || rawSopMetadata.effective_date || '',
+    reviewDate: rawSopMetadata.reviewDate || rawSopMetadata.review_date || '',
+    riskLevel: rawSopMetadata.riskLevel || rawSopMetadata.risk_level || '',
+    regulatoryReferences:
+      rawSopMetadata.regulatoryReferences
+      || rawSopMetadata.regulatory_references
+      || [],
+  }
+
+  return {
+    ...rawMetadata,
+    sopMetadata: normalizedSopMetadata,
+    sopStatus: rawMetadata.sopStatus || cv.external_status || cv.status || sop.status || '',
   }
 }
 
@@ -163,11 +219,49 @@ export default function SOPsPage() {
     setActiveTabId(tabId)
   }, [])
 
-  const openSOPEditorTab = useCallback((sopId, sopCode) => {
+  const openSOPEditorTab = useCallback((sopId, sopCode, initialMetadataJson = null, initialStatus = '', initialDocTitle = '') => {
     const tabId = `editor-${sopId}`
+    const openRequestKey = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    console.debug('[SOP Open] openSOPEditorTab payload', {
+      tabId,
+      sopId,
+      sopCode,
+      initialStatus,
+      initialDocTitle,
+      hasInitialMetadataJson: Boolean(initialMetadataJson),
+      metadataKeys: initialMetadataJson && typeof initialMetadataJson === 'object' ? Object.keys(initialMetadataJson) : [],
+      sopMetadataKeys:
+        initialMetadataJson?.sopMetadata && typeof initialMetadataJson.sopMetadata === 'object'
+          ? Object.keys(initialMetadataJson.sopMetadata)
+          : [],
+    })
     setTabs(prev => {
-      if (prev.find(t => t.id === tabId)) return prev
-      return [...prev, { id: tabId, label: sopCode || `SOP-${sopId}`, type: 'editor', docId: String(sopId), closeable: true }]
+      const existing = prev.find(t => t.id === tabId)
+      if (existing) {
+        return prev.map((tab) => (
+          tab.id === tabId
+            ? {
+                ...tab,
+                label: sopCode || tab.label,
+                initialMetadataJson: initialMetadataJson || tab.initialMetadataJson || null,
+                initialStatus: initialStatus || tab.initialStatus || '',
+                initialDocTitle: initialDocTitle || tab.initialDocTitle || '',
+                openRequestKey,
+              }
+            : tab
+        ))
+      }
+      return [...prev, {
+        id: tabId,
+        label: sopCode || `SOP-${sopId}`,
+        type: 'editor',
+        docId: String(sopId),
+        initialMetadataJson,
+        initialStatus,
+        initialDocTitle,
+        openRequestKey,
+        closeable: true,
+      }]
     })
     setActiveTabId(tabId)
   }, [])
@@ -251,11 +345,36 @@ export default function SOPsPage() {
   }, [filteredSops, sortOrder])
 
   // ── Actions ──────────────────────────────────────────────────────────────
-  const handleOpen = useCallback((sopOrId) => {
+  const handleOpen = useCallback(async (sopOrId) => {
     const sop = typeof sopOrId === 'object' ? sopOrId : sops.find(s => s.id === String(sopOrId))
     const id = typeof sopOrId === 'object' ? sopOrId.id : String(sopOrId)
     const code = sop?.sop_number || sop?.code || `SOP-${id}`
-    openSOPEditorTab(id, code)
+    try {
+      const doc = await getDocument(id)
+      console.debug('[SOP Open] getDocument response', {
+        id: doc?.id,
+        title: doc?.title,
+        status: doc?.status,
+        sop_number: doc?.sop_number,
+        hasMetadataJson: Boolean(doc?.metadata_json && typeof doc.metadata_json === 'object'),
+        metadataKeys: doc?.metadata_json && typeof doc.metadata_json === 'object' ? Object.keys(doc.metadata_json) : [],
+        sopMetadataKeys:
+          doc?.metadata_json?.sopMetadata && typeof doc.metadata_json.sopMetadata === 'object'
+            ? Object.keys(doc.metadata_json.sopMetadata)
+            : [],
+      })
+      const metadataJson = doc?.metadata_json && typeof doc.metadata_json === 'object'
+        ? doc.metadata_json
+        : buildInitialSOPMetadata(sop)
+      const status = doc?.status || sop?.status || ''
+      const title = doc?.title || sop?.title || ''
+      openSOPEditorTab(id, code, metadataJson, status, title)
+    } catch (err) {
+      console.error('Failed to preload SOP document metadata, falling back to list data:', err)
+      const metadataJson = buildInitialSOPMetadata(sop)
+      const status = sop?.status || ''
+      openSOPEditorTab(id, code, metadataJson, status, sop?.title || '')
+    }
   }, [sops, openSOPEditorTab])
 
   const handleOpenNewTab = useCallback((sopOrId) => {
@@ -324,36 +443,17 @@ export default function SOPsPage() {
 
     setImporting(true)
     try {
-      const data = await extractText(file)
-      const text = data?.text || ''
-      const ui = data?.sop_metadata_ui || {}
-      if (!text?.trim() && (!Array.isArray(data?.blocks) || data.blocks.length === 0)) {
-        throw new Error('No text content found in PDF.')
-      }
-
-      const docJson = mapBlocksToTipTapDoc(data.blocks, text)
-      const fallbackTitle = file.name.replace(/\.[^/.]+$/, '') || 'Imported SOP'
-      const resolvedTitle = (ui.title || '').trim() || fallbackTitle
+      const imported = await prepareNewSOPImport(file)
 
       const newDoc = await createDocument({
-        title: resolvedTitle,
-        doc_json: docJson,
-        metadata_json: {
-          sopStatus: DEFAULT_SOP_VERSION_METADATA.sopStatus,
-          sopMetadata: {
-            ...DEFAULT_SOP_VERSION_METADATA.sopMetadata,
-            ...ui,
-            author: 'System (Import)',
-            reviewer: '',
-          },
-          auditTrail: [],
-          versionNote: '',
-        },
+        title: imported.resolvedTitle,
+        doc_json: imported.docJson,
+        metadata_json: imported.metadataJson,
       })
 
-      const tabLabel = [ui.documentId, ui.title, (ui.sopVersion || '').trim()].filter(Boolean).join(' — ')
+      const tabLabel = buildSOPDisplayLabel(imported.metadata)
         || newDoc.sop_number
-        || resolvedTitle
+        || imported.resolvedTitle
 
       openSOPEditorTab(newDoc.id, tabLabel)
       
@@ -485,7 +585,7 @@ export default function SOPsPage() {
               ) : (
                 <SOPTable 
                   data={sortedSops} 
-                  onRowClick={(id) => handleOpen(id)} 
+                  onRowClick={(sop) => handleOpen(sop)} 
                   onOpenNewTab={handleOpenNewTab} 
                   onDelete={handleDeleteClick}
                 />
@@ -572,7 +672,7 @@ export default function SOPsPage() {
                   type="file"
                   ref={fileInputRef}
                   style={{ display: 'none' }}
-                  accept=".pdf,.txt"
+                  accept={SOP_IMPORT_ACCEPT}
                   onChange={handleFileChange}
                 />
               </div>
@@ -658,6 +758,10 @@ export default function SOPsPage() {
             <EditorPage
               isEmbedded
               initialDocId={tab.docId !== undefined ? tab.docId : null}
+              initialMetadataJson={tab.initialMetadataJson || null}
+              initialStatus={tab.initialStatus || ''}
+              initialDocTitle={tab.initialDocTitle || ''}
+              openRequestKey={tab.openRequestKey || ''}
               embedTabId={tab.id}
               onImportMetadataApplied={({ tabId, tabLabel }) => {
                 if (!tabId || !tabLabel) return

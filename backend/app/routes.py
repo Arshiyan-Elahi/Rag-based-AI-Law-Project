@@ -57,6 +57,7 @@ import uuid
 import os
 import re
 import threading
+import logging
 from datetime import datetime
 
 # ==========================================
@@ -67,6 +68,7 @@ from datetime import datetime
 FIXED_TENANT_ID = uuid.UUID("11111111-1111-1111-1111-111111111111")
 SEMANTIC_WORKER_THREADS = max(1, int(os.getenv("SEMANTIC_WORKER_THREADS", "2")))
 _semantic_job_executor = ThreadPoolExecutor(max_workers=SEMANTIC_WORKER_THREADS, thread_name_prefix="semantic-job")
+logger = logging.getLogger(__name__)
 
 
 # ==========================================
@@ -208,6 +210,8 @@ def _create_new_version_for_existing_sop(
         version_number=next_version,
         content_json=doc_json,
         metadata_json=normalized_meta,
+        effective_date=_metadata_date(normalized_meta.get("sopMetadata", {}).get("effectiveDate")),
+        review_date=_metadata_date(normalized_meta.get("sopMetadata", {}).get("reviewDate")),
         external_status="draft",
     )
     db.add(new_version)
@@ -680,6 +684,48 @@ def _normalize_sop_metadata(sop_number: str, title: str, department: str = None,
     return normalized
 
 
+def _metadata_date(value: str):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except Exception:
+        return None
+
+
+def _metadata_debug_sources(structured: dict) -> dict:
+    return {
+        "sop_id": "SOP ID label/generic SOP token" if structured.get("sop_id") else "not found",
+        "title": "Title/Titel label or combined SOP ID + Titel line" if structured.get("title") else "not found",
+        "version": "explicit version/revision label or change-history table" if structured.get("version") else "not found",
+        "date": "effective date label or change-history date" if structured.get("date") else "not found",
+        "department": "department label or SOP/context inference" if structured.get("department") else "not found",
+        "category": "keyword/context inference" if structured.get("category") else "not found",
+    }
+
+
+def _build_extract_response(text: str, blocks: list, structured: dict) -> dict:
+    from .services.sop_metadata_extractor import to_frontend_sop_metadata
+
+    sop_ui = to_frontend_sop_metadata(structured)
+    public_meta = {k: v for k, v in structured.items() if not str(k).startswith("_")}
+    response = {
+        "text": (text or "").strip(),
+        "blocks": blocks,
+        "sop_metadata": public_meta,
+        "sop_metadata_ui": sop_ui,
+        "metadata_sources": _metadata_debug_sources(public_meta),
+    }
+    logger.info("[ocr-import] raw text first 1000 chars: %s", (text or "")[:1000])
+    logger.info("[ocr-import] extracted metadata result: %s", public_meta)
+    logger.info("[ocr-import] metadata sources: %s", response["metadata_sources"])
+    logger.info(
+        "[ocr-import] final response sent to frontend: %s",
+        {**response, "text": response["text"][:300], "blocks": f"{len(blocks)} blocks"},
+    )
+    return response
+
+
 def _build_editor_doc_response(sop: SOP, version: SOPVersion) -> dict:
     """
     Compatibility adapter: maps SOP + SOPVersion onto old editor response shape.
@@ -795,8 +841,8 @@ async def extract_text_from_upload(file: UploadFile = File(...)):
     Extract plain text from a small text file or PDF (editor import / OCR path).
     Includes structured SOP metadata inferred from content (rules + optional LLM fallback).
     """
-    from .services.pdf_extractor import extract_pdf_bytes_robust
-    from .services.sop_metadata_extractor import extract_sop_metadata_from_text, to_frontend_sop_metadata
+    from .services.pdf_extractor import extract_docx_bytes, extract_pdf_bytes_robust
+    from .services.sop_metadata_extractor import extract_sop_metadata_from_text
 
     name = (file.filename or "").lower()
     try:
@@ -804,28 +850,19 @@ async def extract_text_from_upload(file: UploadFile = File(...)):
             raw_pdf = await file.read()
             blocks, text = extract_pdf_bytes_robust(raw_pdf)
             structured = extract_sop_metadata_from_text(text, blocks)
-            sop_ui = to_frontend_sop_metadata(structured)
-            public_meta = {k: v for k, v in structured.items() if not str(k).startswith("_")}
-            return {
-                "text": (text or "").strip(),
-                "blocks": blocks,
-                "sop_metadata": public_meta,
-                "sop_metadata_ui": sop_ui,
-            }
+            return _build_extract_response(text, blocks, structured)
+        elif name.endswith(".docx"):
+            raw_docx = await file.read()
+            blocks, text = extract_docx_bytes(raw_docx)
+            structured = extract_sop_metadata_from_text(text, blocks)
+            return _build_extract_response(text, blocks, structured)
         elif name.endswith((".txt", ".md", ".csv", ".json")):
             raw = await file.read()
             text = raw.decode("utf-8", errors="replace")
             paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
             blocks = [{"type": "paragraph", "text": p} for p in paras]
             structured = extract_sop_metadata_from_text(text, blocks)
-            sop_ui = to_frontend_sop_metadata(structured)
-            public_meta = {k: v for k, v in structured.items() if not str(k).startswith("_")}
-            return {
-                "text": (text or "").strip(),
-                "blocks": blocks,
-                "sop_metadata": public_meta,
-                "sop_metadata_ui": sop_ui,
-            }
+            return _build_extract_response(text, blocks, structured)
         else:
             # Best-effort UTF-8 for unknown extensions
             raw = await file.read()
@@ -834,19 +871,12 @@ async def extract_text_from_upload(file: UploadFile = File(...)):
             except Exception:
                 raise HTTPException(
                     status_code=400,
-                    detail="Unsupported or binary file; use .pdf or .txt",
+                    detail="Unsupported or binary file; use .pdf, .docx, or .txt",
                 ) from None
             paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
             blocks = [{"type": "paragraph", "text": p} for p in paras]
             structured = extract_sop_metadata_from_text(text, blocks)
-            sop_ui = to_frontend_sop_metadata(structured)
-            public_meta = {k: v for k, v in structured.items() if not str(k).startswith("_")}
-            return {
-                "text": (text or "").strip(),
-                "blocks": blocks,
-                "sop_metadata": public_meta,
-                "sop_metadata_ui": sop_ui,
-            }
+            return _build_extract_response(text, blocks, structured)
     except HTTPException:
         raise
     except Exception as e:
@@ -927,9 +957,11 @@ def create_document(
     initial_version = SOPVersion(
         id=new_ver_id,
         sop_id=new_sop_id,
-        version_number="1",
+        version_number=normalized_meta.get("sopMetadata", {}).get("sopVersion") or "1",
         content_json=payload.doc_json if payload.doc_json is not None else {"type": "doc", "content": []},
         metadata_json=normalized_meta,
+        effective_date=_metadata_date(normalized_meta.get("sopMetadata", {}).get("effectiveDate")),
+        review_date=_metadata_date(normalized_meta.get("sopMetadata", {}).get("reviewDate")),
         external_status="draft",
     )
 
@@ -1019,16 +1051,29 @@ def update_document(
         incoming_title = payload.metadata_json.get("sopMetadata", {}).get("title")
     if incoming_title:
         sop.title = incoming_title.strip() or sop.title
+    incoming_meta = payload.metadata_json.get("sopMetadata", {}) if isinstance(payload.metadata_json, dict) else {}
+    incoming_sop_number = (incoming_meta.get("documentId") or "").strip()
+    if incoming_sop_number and incoming_sop_number != sop.sop_number:
+        conflict = db.query(SOP).filter(SOP.sop_number == incoming_sop_number, SOP.id != sop.id).first()
+        if conflict:
+            raise HTTPException(status_code=409, detail=_DUP_SOP_MSG)
+        sop.sop_number = incoming_sop_number
+    incoming_department = (incoming_meta.get("department") or "").strip()
+    if incoming_department:
+        sop.department = _truncate_field(incoming_department, 100) or sop.department
 
     # doc_json from frontend → stored as content_json in DB
     current_version.content_json = payload.doc_json
     if payload.metadata_json is not None:
-        current_version.metadata_json = _normalize_sop_metadata(
+        normalized_meta = _normalize_sop_metadata(
             sop_number=sop.sop_number,
             title=sop.title,
             department=sop.department,
             raw_meta=payload.metadata_json,
         )
+        current_version.metadata_json = normalized_meta
+        current_version.effective_date = _metadata_date(normalized_meta.get("sopMetadata", {}).get("effectiveDate"))
+        current_version.review_date = _metadata_date(normalized_meta.get("sopMetadata", {}).get("reviewDate"))
 
     db.commit()
     db.refresh(sop)

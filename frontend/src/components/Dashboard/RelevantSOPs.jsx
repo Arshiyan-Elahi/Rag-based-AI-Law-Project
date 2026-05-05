@@ -66,7 +66,10 @@ export default function RelevantSOPs({ sops = [], loading = false }) {
           {gridSOPs.length > 0 && (
             <div className="sop-grid-two">
               {gridSOPs.map((sop, i) => (
-                <div key={sop.id || i} className="sop-mini-card">
+                <div
+                  key={`${sop.type || 'sop'}-${sop.id || sop.document_id || sop.sop_number || sop.title || 'item'}-${sop.version_number || i}`}
+                  className="sop-mini-card"
+                >
                   <div className="sop-mini-header">
                     <span className="sop-number-text small">
                       {sop.metadata_json?.sop_number || sop.title?.slice(0, 8) || 'SOP'}
@@ -90,8 +93,8 @@ export default function RelevantSOPs({ sops = [], loading = false }) {
       <div className="sop-quick-access">
         <p className="sop-quick-title">Direkter Zugriff auf Qualitätswissen</p>
         <div className="sop-quick-grid">
-          {QUICK_ACCESS.map(item => (
-            <button key={item.label} className={`sop-quick-btn ${item.colorClass}`} aria-label={item.label}>
+          {QUICK_ACCESS.map((item, index) => (
+            <button key={`quick-${item.label}-${index}`} className={`sop-quick-btn ${item.colorClass}`} aria-label={item.label}>
               <span className="sop-quick-icon">{item.icon}</span>
               <div className="sop-quick-text">
                 <span className="sop-quick-label">{item.label}</span>
