@@ -52,7 +52,7 @@ export function getDefaultMetadata(config = sopWorkflowConfig) {
         } else if (field.type === 'date') {
             meta[field.key] = ''
         } else {
-            meta[field.key] = ''
+            meta[field.key] = field.key === 'docType' ? 'SOP' : ''
         }
     }
     // Always include references array

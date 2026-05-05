@@ -210,7 +210,12 @@ const mapVersion = (version) => ({
   timestamp: formatTimestamp(version.created_at),
 })
 
-const EditorPage = ({ isEmbedded = false, initialDocId = null }) => {
+const EditorPage = ({
+  isEmbedded = false,
+  initialDocId = null,
+  embedTabId = null,
+  onImportMetadataApplied = null,
+}) => {
   const { language, setLanguage, t } = useLanguage()
   const { id: urlDocId } = useParams()
   const [documentId, setDocumentId] = useState(initialDocId || urlDocId || null)
@@ -278,6 +283,8 @@ const EditorPage = ({ isEmbedded = false, initialDocId = null }) => {
   const currentVersion = versions.find((item) => item.id === currentVersionId) || null
   const isHistoricalView = Boolean(latestVersionId && currentVersionId && latestVersionId !== currentVersionId)
   const currentVersionLabel = buildVersionLabel(currentVersion)
+  const docRevision = (metadata?.sopVersion || '').trim()
+  const breadcrumbLabel = docRevision ? `${currentVersionLabel} · ${docRevision}` : currentVersionLabel
 
   const applyVersionState = useCallback((versionRecord, fallbackTitle = '') => {
     if (!editor || !versionRecord || !isEditorMounted || editor.isDestroyed) return
@@ -414,6 +421,12 @@ const EditorPage = ({ isEmbedded = false, initialDocId = null }) => {
       }
     } catch (error) {
       console.error('Save failed:', error)
+      if (error?.status === 409) {
+        window.alert(
+          error.message ||
+            'This SOP ID already exists. Please create a new version or choose another SOP ID.',
+        )
+      }
     } finally {
       saveInFlightRef.current = false
       if (showSavingIndicator) {
@@ -625,6 +638,35 @@ const EditorPage = ({ isEmbedded = false, initialDocId = null }) => {
         throw new Error('No structured content extracted from file.')
       }
       editor.commands.setContent(html, false)
+
+      const ui = data?.sop_metadata_ui || {}
+      if (ui && typeof ui === 'object') {
+        setMetadata((prev) => {
+          const next = { ...prev }
+          if (ui.documentId) next.documentId = ui.documentId
+          if (ui.title) next.title = ui.title
+          if (ui.department) next.department = ui.department
+          if (ui.docType) next.docType = ui.docType
+          else if (!next.docType) next.docType = 'SOP'
+          if (ui.category) next.category = ui.category
+          if (ui.sopVersion) next.sopVersion = ui.sopVersion
+          if (ui.effectiveDate) next.effectiveDate = ui.effectiveDate
+          if (ui.reviewDate) next.reviewDate = ui.reviewDate
+          return next
+        })
+        const idPart = (ui.documentId || '').trim()
+        const titlePart = (ui.title || '').trim()
+        const verPart = (ui.sopVersion || '').trim()
+        const tabLabel = [idPart, titlePart, verPart].filter(Boolean).join(' — ')
+        if (tabLabel && typeof onImportMetadataApplied === 'function') {
+          onImportMetadataApplied({
+            tabId: embedTabId,
+            tabLabel,
+            documentId,
+          })
+        }
+      }
+
       setImportNotice('SOP imported successfully')
       window.setTimeout(() => setImportNotice(''), 2600)
     } catch (error) {
@@ -702,7 +744,7 @@ const EditorPage = ({ isEmbedded = false, initialDocId = null }) => {
         </aside>
         <div className="figma-workspace">
           <div className="figma-header-strip">
-            <div className="figma-breadcrumb"><span>{currentVersionLabel}</span></div>
+            <div className="figma-breadcrumb"><span>{breadcrumbLabel}</span></div>
             <div className="figma-header-actions">
               <button type="button" className="figma-sidebar-toggle" onClick={() => setIsSidebarOpen((prev) => !prev)} aria-expanded={isSidebarOpen} aria-controls="sop-metadata-sidebar" title={isSidebarOpen ? t.hideMetadataPanel : t.showMetadataPanel}>
                 {isSidebarOpen ? <ChevronRight size={14} /> : <ChevronLeft size={14} />}
@@ -767,6 +809,9 @@ const EditorPage = ({ isEmbedded = false, initialDocId = null }) => {
               <div className="sidebar-field-stack">
                 <input className="sidebar-input" value={metadata.documentId || ''} onChange={(event) => handleMetadataChange('documentId', event.target.value)} placeholder="SOP-001" disabled={isHistoricalView} />
                 <input className="sidebar-input" value={metadata.title || ''} onChange={(event) => handleMetadataChange('title', event.target.value)} placeholder={t.title} disabled={isHistoricalView} />
+                <input className="sidebar-input" value={metadata.docType || ''} onChange={(event) => handleMetadataChange('docType', event.target.value)} placeholder={t.docType} disabled={isHistoricalView} />
+                <input className="sidebar-input" value={metadata.category || ''} onChange={(event) => handleMetadataChange('category', event.target.value)} placeholder={t.category} disabled={isHistoricalView} />
+                <input className="sidebar-input" value={metadata.sopVersion || ''} onChange={(event) => handleMetadataChange('sopVersion', event.target.value)} placeholder={t.sopVersion} disabled={isHistoricalView} />
                 <input className="sidebar-input" value={metadata.department || ''} onChange={(event) => handleMetadataChange('department', event.target.value)} placeholder={t.department} disabled={isHistoricalView} />
                 <input className="sidebar-input" value={metadata.author || ''} onChange={(event) => handleMetadataChange('author', event.target.value)} placeholder={t.author} disabled={isHistoricalView} />
                 <input className="sidebar-input" value={metadata.reviewer || ''} onChange={(event) => handleMetadataChange('reviewer', event.target.value)} placeholder={t.reviewer} disabled={isHistoricalView} />

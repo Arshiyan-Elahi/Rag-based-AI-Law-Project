@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, U
 from typing import List
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_, asc
+from sqlalchemy.exc import IntegrityError
 from concurrent.futures import ThreadPoolExecutor
 from qdrant_client.http import models as qmodels
 import hashlib
@@ -148,6 +149,81 @@ def _resolve_sop_lookup(db: Session, sop_ref: str):
         return base_query.filter(SOP.id == id_val).first()
     except ValueError:
         return base_query.filter(SOP.sop_number == sop_ref).first()
+
+
+def _truncate_field(value: str | None, max_len: int) -> str:
+    if not value:
+        return ""
+    s = value.strip()
+    return s[:max_len] if len(s) > max_len else s
+
+
+def _compute_next_version_number(db: Session, sop_internal_id: uuid.UUID) -> str:
+    """Next integer version string for an SOP (matches create_version logic)."""
+    all_versions = db.query(SOPVersion).filter(SOPVersion.sop_id == sop_internal_id).all()
+    max_v = 0
+    for v in all_versions:
+        try:
+            val = int(str(v.version_number).split(".")[0])
+            if val > max_v:
+                max_v = val
+        except Exception:
+            continue
+    return str(max_v + 1)
+
+
+def _create_new_version_for_existing_sop(
+    db: Session,
+    existing: SOP,
+    payload: CreateDocumentRequest,
+    resolved_title: str,
+    department: str,
+    sop_number: str,
+    background_tasks: BackgroundTasks | None,
+) -> dict:
+    """
+    Add a new sop_version row, point current_version_id to it, refresh SOP header.
+    Used when importing/creating a document with an SOP number that already exists.
+    """
+    doc_json = payload.doc_json if payload.doc_json is not None else {"type": "doc", "content": []}
+    if _is_tiptap_empty(doc_json):
+        raise HTTPException(
+            status_code=422,
+            detail="Cannot create a new version with empty content.",
+        )
+
+    dept_final = _truncate_field(department, 100) or "Quality"
+    title_final = _truncate_field(resolved_title, 255) or "Untitled SOP"
+
+    normalized_meta = _normalize_sop_metadata(
+        sop_number=sop_number,
+        title=title_final,
+        department=dept_final,
+        raw_meta=payload.metadata_json,
+    )
+
+    next_version = _compute_next_version_number(db, existing.id)
+    new_version = SOPVersion(
+        sop_id=existing.id,
+        version_number=next_version,
+        content_json=doc_json,
+        metadata_json=normalized_meta,
+        external_status="draft",
+    )
+    db.add(new_version)
+    db.flush()
+    existing.current_version_id = new_version.id
+    existing.title = title_final
+    existing.department = dept_final
+    db.commit()
+    db.refresh(existing)
+    db.refresh(new_version)
+
+    _upsert_import_context_entities(db, existing, new_version, background_tasks)
+    if background_tasks:
+        _schedule_semantic_job(background_tasks, "sop", existing.id, new_version.id)
+
+    return _build_editor_doc_response(existing, new_version)
 
 
 def _resolve_current_version(db: Session, sop: SOP) -> SOPVersion | None:
@@ -576,7 +652,10 @@ def _normalize_sop_metadata(sop_number: str, title: str, department: str = None,
             "reviewer": raw_meta.get("sopMetadata", {}).get("reviewer", ""),
             "riskLevel": raw_meta.get("sopMetadata", {}).get("riskLevel", "Low"),
             "department": department or "Quality",
-            "documentId": sop_number or "", 
+            "documentId": sop_number or "",
+            "docType": raw_meta.get("sopMetadata", {}).get("docType", "SOP"),
+            "category": raw_meta.get("sopMetadata", {}).get("category", ""),
+            "sopVersion": raw_meta.get("sopMetadata", {}).get("sopVersion", ""),
             "references": raw_meta.get("sopMetadata", {}).get("references", []),
             "reviewDate": raw_meta.get("sopMetadata", {}).get("reviewDate", ""),
             "effectiveDate": raw_meta.get("sopMetadata", {}).get("effectiveDate", ""),
@@ -584,11 +663,18 @@ def _normalize_sop_metadata(sop_number: str, title: str, department: str = None,
         }
     }
     
-    # Merge nested sopMetadata fields safely
+    # Merge nested sopMetadata: client may send documentId/title; incoming values win when non-empty
     input_sop_meta = raw_meta.get("sopMetadata", {})
     if isinstance(input_sop_meta, dict):
         for k, v in input_sop_meta.items():
-            if k not in ["documentId", "title"]: 
+            if v is None:
+                continue
+            if isinstance(v, str) and v.strip() == "" and k not in ("author", "reviewer"):
+                continue
+            if k in ("title", "documentId"):
+                if v:
+                    normalized["sopMetadata"][k] = v
+            else:
                 normalized["sopMetadata"][k] = v
 
     return normalized
@@ -703,11 +789,84 @@ def health():
     return {"status": "ok"}
 
 
+<<<<<<< HEAD
+@router.post("/api/extract-text")
+async def extract_text_from_upload(file: UploadFile = File(...)):
+    """
+    Extract plain text from a small text file or PDF (editor import / OCR path).
+    Includes structured SOP metadata inferred from content (rules + optional LLM fallback).
+    """
+    from .services.pdf_extractor import extract_pdf_bytes_robust
+    from .services.sop_metadata_extractor import extract_sop_metadata_from_text, to_frontend_sop_metadata
+
+    name = (file.filename or "").lower()
+    try:
+        if name.endswith(".pdf"):
+            raw_pdf = await file.read()
+            blocks, text = extract_pdf_bytes_robust(raw_pdf)
+            structured = extract_sop_metadata_from_text(text, blocks)
+            sop_ui = to_frontend_sop_metadata(structured)
+            public_meta = {k: v for k, v in structured.items() if not str(k).startswith("_")}
+            return {
+                "text": (text or "").strip(),
+                "blocks": blocks,
+                "sop_metadata": public_meta,
+                "sop_metadata_ui": sop_ui,
+            }
+        elif name.endswith((".txt", ".md", ".csv", ".json")):
+            raw = await file.read()
+            text = raw.decode("utf-8", errors="replace")
+            paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+            blocks = [{"type": "paragraph", "text": p} for p in paras]
+            structured = extract_sop_metadata_from_text(text, blocks)
+            sop_ui = to_frontend_sop_metadata(structured)
+            public_meta = {k: v for k, v in structured.items() if not str(k).startswith("_")}
+            return {
+                "text": (text or "").strip(),
+                "blocks": blocks,
+                "sop_metadata": public_meta,
+                "sop_metadata_ui": sop_ui,
+            }
+        else:
+            # Best-effort UTF-8 for unknown extensions
+            raw = await file.read()
+            try:
+                text = raw.decode("utf-8")
+            except Exception:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Unsupported or binary file; use .pdf or .txt",
+                ) from None
+            paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+            blocks = [{"type": "paragraph", "text": p} for p in paras]
+            structured = extract_sop_metadata_from_text(text, blocks)
+            sop_ui = to_frontend_sop_metadata(structured)
+            public_meta = {k: v for k, v in structured.items() if not str(k).startswith("_")}
+            return {
+                "text": (text or "").strip(),
+                "blocks": blocks,
+                "sop_metadata": public_meta,
+                "sop_metadata_ui": sop_ui,
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Extraction failed: {e!s}") from e
+
+
+
+=======
+>>>>>>> c79857e1a6411c0dba3277d0d34266acf508094d
 # ==========================================
 # OLD EDITOR COMPATIBILITY ROUTES
 # All field mappings live here — NOT in the DB
 # doc_json = content_json, status = external_status, doc_id = sop_id
 # ==========================================
+
+_DUP_SOP_MSG = (
+    "SOP with this SOP ID already exists. Please create a new version or choose another SOP ID."
+)
+
 
 @router.post("/api/editor/docs", response_model=EditorDocResponse)
 def create_document(
@@ -718,31 +877,55 @@ def create_document(
 ):
     """
     Create a new SOP + its first version.
-    Ensures identity is only generated once at the source.
+    If metadata documentId/sop_number matches an existing SOP, add a new version instead of INSERT (no duplicate key).
     """
     new_sop_id = uuid.uuid4()
     new_ver_id = uuid.uuid4()
-    
-    # Identify: only generate SOP number if NOT provided 
+
     sop_number = payload.metadata_json.get("sopMetadata", {}).get("documentId") if payload.metadata_json else None
+    sop_number = (sop_number or "").strip()
     if not sop_number:
         sop_number = f"SOP-{uuid.uuid4().hex[:8].upper()}"
-    
+
+    dept_sm = None
+    if payload.metadata_json and isinstance(payload.metadata_json.get("sopMetadata"), dict):
+        dept_sm = (payload.metadata_json["sopMetadata"].get("department") or "").strip() or None
+    department = dept_sm or "Quality"
+
+    resolved_title = (payload.title or "").strip() if payload.title else ""
+    if not resolved_title and payload.metadata_json and isinstance(payload.metadata_json.get("sopMetadata"), dict):
+        resolved_title = (payload.metadata_json["sopMetadata"].get("title") or "").strip()
+    if not resolved_title:
+        resolved_title = "Untitled SOP"
+
+    existing = (
+        db.query(SOP)
+        .filter(SOP.sop_number == sop_number, SOP.tenant_id == FIXED_TENANT_ID)
+        .first()
+    )
+    if existing:
+        return _create_new_version_for_existing_sop(
+            db, existing, payload, resolved_title, department, sop_number, background_tasks
+        )
+
+    dept_final = _truncate_field(department, 100) or "Quality"
+    title_final = _truncate_field(resolved_title, 255) or "Untitled SOP"
+
     sop = SOP(
         id=new_sop_id,
         tenant_id=FIXED_TENANT_ID,
-        title=payload.title,
+        title=title_final,
         sop_number=sop_number,
-        department="Quality",
+        department=dept_final,
         is_active=True,
-        current_version_id=new_ver_id 
+        current_version_id=new_ver_id,
     )
-    
+
     normalized_meta = _normalize_sop_metadata(
         sop_number=sop_number,
-        title=payload.title,
-        department="Quality",
-        raw_meta=payload.metadata_json
+        title=title_final,
+        department=dept_final,
+        raw_meta=payload.metadata_json,
     )
 
     initial_version = SOPVersion(
@@ -753,10 +936,27 @@ def create_document(
         metadata_json=normalized_meta,
         external_status="draft",
     )
-    
+
     db.add(sop)
     db.add(initial_version)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raced = (
+            db.query(SOP)
+            .filter(SOP.sop_number == sop_number, SOP.tenant_id == FIXED_TENANT_ID)
+            .first()
+        )
+        if raced:
+            return _create_new_version_for_existing_sop(
+                db, raced, payload, resolved_title, department, sop_number, background_tasks
+            )
+        raise HTTPException(
+            status_code=409,
+            detail=_DUP_SOP_MSG,
+        ) from None
+
     db.refresh(sop)
     db.refresh(initial_version)
 

@@ -14,7 +14,14 @@ async function throwApiError(res, fallbackMsg) {
   let detail = fallbackMsg
   try {
     const body = await res.json()
-    if (body?.detail) detail = body.detail
+    if (body?.detail != null) {
+      const d = body.detail
+      if (Array.isArray(d)) {
+        detail = d.map((x) => (typeof x === 'string' ? x : x?.msg || JSON.stringify(x))).join(' ')
+      } else {
+        detail = typeof d === 'string' ? d : JSON.stringify(d)
+      }
+    }
   } catch {
     // Ignore non-JSON error bodies and fall back to the provided message.
   }

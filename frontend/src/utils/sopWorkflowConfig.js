@@ -130,6 +130,9 @@ const sopWorkflowConfig = {
     metadataFields: [
         { key: 'documentId', type: 'text', label: 'documentId', required: true },
         { key: 'title', type: 'text', label: 'title', required: true },
+        { key: 'docType', type: 'text', label: 'docType', required: false },
+        { key: 'category', type: 'text', label: 'category', required: false },
+        { key: 'sopVersion', type: 'text', label: 'sopVersion', required: false },
         { key: 'department', type: 'text', label: 'department', required: false },
         { key: 'author', type: 'text', label: 'author', required: true },
         { key: 'reviewer', type: 'text', label: 'reviewer', required: true },

@@ -4,10 +4,16 @@ import os
 import math
 import threading
 import asyncio
+<<<<<<< HEAD
+from typing import Any
+
+from fastapi import APIRouter, HTTPException
+=======
 import io
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, UploadFile, File
+>>>>>>> c79857e1a6411c0dba3277d0d34266acf508094d
 from sqlalchemy import or_
 from langchain_core.output_parsers import StrOutputParser
 
@@ -39,10 +45,15 @@ DEV_REF_PATTERN = re.compile(r"\bDEV-[A-Z0-9-]+\b", re.IGNORECASE)
 CAPA_REF_PATTERN = re.compile(r"\bCAPA-[A-Z0-9-]+\b", re.IGNORECASE)
 AUDIT_REF_PATTERN = re.compile(r"\bAUDIT-[A-Z0-9-]+\b", re.IGNORECASE)
 DECISION_REF_PATTERN = re.compile(r"\bDEC-[A-Z0-9-]+\b", re.IGNORECASE)
+<<<<<<< HEAD
+# Reload server after changing CHATBOT_USE_LOCAL_DB in .env (import-time flag).
+CHATBOT_USE_LOCAL_DB = os.getenv("CHATBOT_USE_LOCAL_DB", "true").strip().lower() == "true"
+=======
 # Reload server after changing CHATBOT_USE_LOCAL_DB in environment (import-time flag).
 # Default is false so semantic RAG/Qdrant is used unless explicitly overridden.
 CHATBOT_USE_LOCAL_DB = os.getenv("CHATBOT_USE_LOCAL_DB", "false").strip().lower() == "true"
 CHATBOT_ALLOW_LOCAL_DB_PRIMARY = os.getenv("CHATBOT_ALLOW_LOCAL_DB_PRIMARY", "false").strip().lower() == "true"
+>>>>>>> c79857e1a6411c0dba3277d0d34266acf508094d
 
 
 from typing import Any
@@ -194,6 +205,8 @@ def _build_local_db_chat_response(question: str, chat_history: list[dict], categ
     category = (category or "").strip().lower()
     db = SessionLocal()
     try:
+<<<<<<< HEAD
+=======
         count_intent = bool(
             re.search(r"\b(how many|count|number of|total)\b", q_lower)
         )
@@ -225,6 +238,7 @@ def _build_local_db_chat_response(question: str, chat_history: list[dict], categ
                 "routed_to": "local-db-count",
             }
 
+>>>>>>> c79857e1a6411c0dba3277d0d34266acf508094d
         citations = []
         sources = []
         answer_parts = []
@@ -446,7 +460,10 @@ def _build_local_db_chat_response(question: str, chat_history: list[dict], categ
                 "answer": "No relevant local database records were found for this query.",
                 "sources": [],
                 "citations": [],
+<<<<<<< HEAD
+=======
                 "retrieval_debug": [],
+>>>>>>> c79857e1a6411c0dba3277d0d34266acf508094d
                 "suggestions": [
                     "Ask with an exact SOP/DEV/CAPA number",
                     "Try a shorter and more specific query",
@@ -460,6 +477,8 @@ def _build_local_db_chat_response(question: str, chat_history: list[dict], categ
             "answer": " ".join(answer_parts),
             "sources": sources,
             "citations": citations,
+<<<<<<< HEAD
+=======
             "retrieval_debug": [
                 {
                     "rank": idx + 1,
@@ -472,6 +491,7 @@ def _build_local_db_chat_response(question: str, chat_history: list[dict], categ
                 }
                 for idx, c in enumerate(citations[:20])
             ],
+>>>>>>> c79857e1a6411c0dba3277d0d34266acf508094d
             "suggestions": [
                 "Ask for details of one returned record",
                 "Ask for status and ownership of a returned item",
@@ -564,6 +584,8 @@ def _build_sop_db_fallback(question: str, chat_history: list[dict]) -> dict | No
             "answer": answer,
             "sources": sources,
             "citations": citations,
+<<<<<<< HEAD
+=======
             "retrieval_debug": [
                 {
                     "rank": idx + 1,
@@ -576,6 +598,7 @@ def _build_sop_db_fallback(question: str, chat_history: list[dict]) -> dict | No
                 }
                 for idx, item in enumerate(hits[:20])
             ],
+>>>>>>> c79857e1a6411c0dba3277d0d34266acf508094d
             "suggestions": [
                 f"Summarize {hits[0]['sop_number']} responsibilities",
                 f"Show procedure steps from {hits[0]['sop_number']}",
@@ -940,9 +963,13 @@ async def query_ai(payload: dict):
     category = payload.get("category")
     chat_history = payload.get("chat_history") or []
 
+<<<<<<< HEAD
+    if CHATBOT_USE_LOCAL_DB:
+=======
     # RAG is the default source of truth. Local DB primary mode is opt-in only
     # for diagnostics and should not be used in normal semantic chatbot flow.
     if CHATBOT_USE_LOCAL_DB and CHATBOT_ALLOW_LOCAL_DB_PRIMARY:
+>>>>>>> c79857e1a6411c0dba3277d0d34266acf508094d
         # Run in a worker thread so SQLAlchemy work does not block the event loop
         # (avoids piling up slow requests, nginx timeouts, and a stuck-feeling UI).
         return await asyncio.to_thread(
@@ -978,7 +1005,10 @@ async def query_ai(payload: dict):
             "answer": fallback_answer,
             "sources": [],
             "citations": [],
+<<<<<<< HEAD
+=======
             "retrieval_debug": [],
+>>>>>>> c79857e1a6411c0dba3277d0d34266acf508094d
             "suggestions": [
                 "Try again in a few seconds",
                 "Ask with an exact SOP/DEV/CAPA number",
@@ -994,7 +1024,10 @@ async def query_ai(payload: dict):
             "answer": fallback_answer,
             "sources": [],
             "citations": [],
+<<<<<<< HEAD
+=======
             "retrieval_debug": [],
+>>>>>>> c79857e1a6411c0dba3277d0d34266acf508094d
             "suggestions": [
                 "Retry the same question",
                 "Check chatbot credentials in backend .env",
@@ -1031,7 +1064,10 @@ async def query_ai(payload: dict):
         "answer": result.get("answer", ""),
         "sources": sources,
         "citations": citations,
+<<<<<<< HEAD
+=======
         "retrieval_debug": result.get("retrieval_debug", []),
+>>>>>>> c79857e1a6411c0dba3277d0d34266acf508094d
         "suggestions": result.get("suggestions", []),
         "retrieval_stats": result.get("retrieval_stats", {}),
         "routed_to": result.get("routed_to", ""),
@@ -1047,6 +1083,8 @@ async def query_ai(payload: dict):
         return db_fallback_response
 
     return response
+<<<<<<< HEAD
+=======
 
 
 @ai_router.post("/api/extract-text")
@@ -1140,3 +1178,4 @@ async def extract_text_from_upload(file: UploadFile = File(...)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Extraction failed: {e!s}") from e
+>>>>>>> c79857e1a6411c0dba3277d0d34266acf508094d

@@ -228,7 +228,9 @@ export default function ChatPage() {
         const plain = htmlToPlainText(message.content || '')
         const title = deriveSopTitleFromText(plain)
         const docJson = plainTextToTiptapDoc(plain)
-        const created = await createDocument({
+        let created
+        try {
+          created = await createDocument({
           title,
           doc_type: 'sop',
           doc_json: docJson,
@@ -256,6 +258,16 @@ export default function ChatPage() {
             ],
           },
         })
+        } catch (createErr) {
+          if (createErr?.status === 409) {
+            window.alert(
+              createErr.message ||
+                'This SOP ID already exists. Please create a new version or choose another SOP ID.',
+            )
+            return
+          }
+          throw createErr
+        }
         if (created?.id) {
           navigate(`/editor/${created.id}`)
         }
