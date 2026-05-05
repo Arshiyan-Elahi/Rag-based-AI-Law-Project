@@ -119,6 +119,10 @@ _REVIEW_DATE_LABEL = re.compile(
     r"(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}-\d{2}-\d{2})"
 )
 
+_STATUS_LABEL = re.compile(
+    r"(?im)^\s*(?:Status|Freigabestatus|Dokumentstatus)\s*[:#]?\s*([^\n|]+)"
+)
+
 _GENERIC_DATE = re.compile(
     r"\b(\d{1,2}[./-]\d{1,2}[./-]\d{4}|\d{4}-\d{2}-\d{2})\b"
 )
@@ -155,6 +159,14 @@ _DEPT_FROM_SOP_SEGMENT = {
     "TEK": "Technical",
     "ENG": "Engineering",
 }
+
+_STATUS_VALUE_PATTERNS = [
+    (re.compile(r"(?i)\b(effective|freigegeben)\b"), "effective"),
+    (re.compile(r"(?i)\b(under\s*review|in\s*review|prüfung|pruefung)\b"), "under_review"),
+    (re.compile(r"(?i)\b(approved)\b"), "approved"),
+    (re.compile(r"(?i)\b(obsolete|obsolet)\b"), "obsolete"),
+    (re.compile(r"(?i)\b(draft|entwurf)\b"), "draft"),
+]
 
 
 def _normalize_date(raw: str) -> str:
@@ -725,6 +737,32 @@ def _find_category(text: str, title: str) -> str:
     return ""
 
 
+def _normalize_status(value: str) -> str:
+    if not value:
+        return ""
+    v = str(value).strip()
+    for rx, normalized in _STATUS_VALUE_PATTERNS:
+        if rx.search(v):
+            return normalized
+    compact = re.sub(r"[\s-]+", "_", v.lower())
+    return compact if compact in {"draft", "under_review", "effective", "obsolete", "approved"} else ""
+
+
+def _find_status(text: str) -> str:
+    m = _STATUS_LABEL.search(text or "")
+    if m:
+        normalized = _normalize_status(m.group(1))
+        if normalized:
+            return normalized
+    # fallback scan if label parser misses line format
+    for line in (text or "").splitlines()[:120]:
+        if re.search(r"(?i)\bstatus\b", line):
+            normalized = _normalize_status(line)
+            if normalized:
+                return normalized
+    return ""
+
+
 def _rules_extract(text: str, blocks: Optional[List[Dict[str, Any]]]) -> Dict[str, str]:
     text = text or ""
     sop_id = _find_sop_id(text)
@@ -742,6 +780,7 @@ def _rules_extract(text: str, blocks: Optional[List[Dict[str, Any]]]) -> Dict[st
                 break
     version = _find_version(text, blocks, sop_id)
     effective, review = _find_dates(text, blocks)
+    status = _find_status(text)
     department = _find_department(text, sop_id)
     category = _find_category(text, title)
 
@@ -758,6 +797,7 @@ def _rules_extract(text: str, blocks: Optional[List[Dict[str, Any]]]) -> Dict[st
         "type": "SOP",
         "category": category,
         "department": department,
+        "status": status,
         "_effective_date": effective,
         "_review_date": review,
     }
@@ -869,6 +909,7 @@ def extract_sop_metadata_from_text(
         "type": merged.get("type") or "SOP",
         "category": merged.get("category") or "",
         "department": merged.get("department") or "",
+        "status": _normalize_status(merged.get("status") or rule.get("status") or ""),
         "effective_date": eff_iso,
         "review_date": rev_iso,
     }
@@ -885,6 +926,8 @@ def to_frontend_sop_metadata(structured: Dict[str, Any]) -> Dict[str, Any]:
         "docType": structured.get("type") or "SOP",
         "category": structured.get("category") or "",
         "sopVersion": structured.get("version") or "",
+        "sopStatus": _normalize_status(structured.get("status") or ""),
+        "status": _normalize_status(structured.get("status") or ""),
         "effectiveDate": eff,
         "reviewDate": rev_d,
     }

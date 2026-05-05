@@ -312,7 +312,7 @@ const EditorPage = ({
     })
     setMetadata(normalizeEditorMetadataTitle(hydrated))
     setSopStatus(
-      normalizeWorkflowStatus(normalizedMeta?.sopStatus || initialStatus)
+      normalizeWorkflowStatus(initialStatus || normalizedMeta?.sopStatus)
       || DEFAULT_SOP_VERSION_METADATA.sopStatus,
     )
     setAuditTrail(Array.isArray(normalizedMeta?.auditTrail) ? normalizedMeta.auditTrail : [])
@@ -381,7 +381,7 @@ const EditorPage = ({
 
     setMetadata(normalizeEditorMetadataTitle(normalized))
     setSopStatus(
-      normalizeWorkflowStatus(versionRecord.metadata?.sopStatus || versionRecord.status)
+      normalizeWorkflowStatus(versionRecord.status || versionRecord.metadata?.sopStatus)
       || DEFAULT_SOP_VERSION_METADATA.sopStatus,
     )
     setAuditTrail(versionRecord.metadata?.auditTrail || [])
@@ -422,9 +422,17 @@ const EditorPage = ({
         version_number: doc.version_number,
         doc_json: doc.doc_json || EMPTY_DOC,
         metadata_json: doc.metadata_json || {},
-        status: doc.status || DEFAULT_SOP_VERSION_METADATA.sopStatus,
+        status: doc.current_version?.status || doc.status || DEFAULT_SOP_VERSION_METADATA.sopStatus,
         created_at: doc.updated_at || doc.created_at,
       }
+      console.debug('[SOP Status Debug] API status sources', {
+        docId: doc?.id,
+        currentVersionStatus: doc?.current_version?.status || null,
+        sopStatus: doc?.status || null,
+        metadataJsonStatus: doc?.metadata_json?.status || null,
+        metadataSopStatus: doc?.metadata_json?.sopStatus || null,
+        chosenStatusBeforeNormalize: currentDocVersion.status,
+      })
 
       const normalizedCurrent = mapVersion(currentDocVersion)
       const mergedVersions = nextVersions.some((item) => item.id === normalizedCurrent.id)
@@ -446,6 +454,14 @@ const EditorPage = ({
       setIsLoadingDocument(false)
     }
   }, [editor, applyVersionState, isEditorMounted])
+
+  useEffect(() => {
+    console.debug('[SOP Status Debug] final rendered status', {
+      documentId,
+      sopStatus,
+      normalizedSopStatus: normalizeWorkflowStatus(sopStatus),
+    })
+  }, [documentId, sopStatus])
 
   useEffect(() => {
     if (!initialDocId || !openRequestKey || !editor || !isEditorMounted || editor.isDestroyed) return
@@ -905,7 +921,7 @@ const EditorPage = ({
               metadata={metadata}
               onChange={handleMetadataPanelChange}
               status={sopStatus}
-              onStatusChange={setSopStatus}
+              onStatusChange={(value) => setSopStatus(normalizeWorkflowStatus(value) || value)}
               isReadOnly={isHistoricalView}
             />
 

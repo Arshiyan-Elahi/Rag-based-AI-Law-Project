@@ -66,6 +66,16 @@ export function normalizeSOPImportMetadata(rawMetadata) {
     }
   })
 
+  if (import.meta?.env?.DEV) {
+    console.debug('[SOP Status Debug] normalized import metadata', {
+      rawStatus: source?.status || null,
+      rawSopStatus: source?.sopStatus || null,
+      normalizedSopStatus: normalized?.sopStatus || null,
+      documentId: normalized?.documentId || null,
+      title: normalized?.title || null,
+    })
+  }
+
   return normalized
 }
 
@@ -142,8 +152,12 @@ export function applySOPImportMetadata(previousMetadata, importedMetadata = {}) 
 }
 
 export function prepareSOPMetadataJson(importedMetadata = {}, overrides = {}) {
+  const resolvedSopStatus =
+    importedMetadata.sopStatus
+    || importedMetadata.status
+    || DEFAULT_SOP_VERSION_METADATA.sopStatus
   return {
-    sopStatus: DEFAULT_SOP_VERSION_METADATA.sopStatus,
+    sopStatus: resolvedSopStatus,
     sopMetadata: {
       ...DEFAULT_SOP_VERSION_METADATA.sopMetadata,
       ...importedMetadata,

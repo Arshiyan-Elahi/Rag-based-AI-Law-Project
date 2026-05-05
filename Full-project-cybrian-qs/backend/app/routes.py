@@ -203,6 +203,14 @@ def _create_new_version_for_existing_sop(
         department=dept_final,
         raw_meta=payload.metadata_json,
     )
+    resolved_external_status = _resolve_external_status_from_payload(payload.metadata_json, fallback="draft")
+    logger.info(
+        "[sop-status] create new version for existing sop_number=%s resolved_external_status=%s payload_sopStatus=%s payload_status=%s",
+        sop_number,
+        resolved_external_status,
+        (payload.metadata_json or {}).get("sopStatus") if isinstance(payload.metadata_json, dict) else None,
+        (payload.metadata_json or {}).get("status") if isinstance(payload.metadata_json, dict) else None,
+    )
 
     next_version = _compute_next_version_number(db, existing.id)
     new_version = SOPVersion(
@@ -212,7 +220,7 @@ def _create_new_version_for_existing_sop(
         metadata_json=normalized_meta,
         effective_date=_metadata_date(normalized_meta.get("sopMetadata", {}).get("effectiveDate")),
         review_date=_metadata_date(normalized_meta.get("sopMetadata", {}).get("reviewDate")),
-        external_status="draft",
+        external_status=resolved_external_status,
     )
     db.add(new_version)
     db.flush()
@@ -701,6 +709,7 @@ def _metadata_debug_sources(structured: dict) -> dict:
         "date": "effective date label or change-history date" if structured.get("date") else "not found",
         "department": "department label or SOP/context inference" if structured.get("department") else "not found",
         "category": "keyword/context inference" if structured.get("category") else "not found",
+        "status": "Status label/value normalization from OCR text" if structured.get("status") else "not found",
     }
 
 
@@ -718,12 +727,47 @@ def _build_extract_response(text: str, blocks: list, structured: dict) -> dict:
     }
     logger.info("[ocr-import] raw text first 1000 chars: %s", (text or "")[:1000])
     logger.info("[ocr-import] extracted metadata result: %s", public_meta)
+    logger.info(
+        "[ocr-import] extracted status detail: structured.status=%s sop_ui.sopStatus=%s sop_ui.status=%s",
+        public_meta.get("status"),
+        sop_ui.get("sopStatus"),
+        sop_ui.get("status"),
+    )
     logger.info("[ocr-import] metadata sources: %s", response["metadata_sources"])
     logger.info(
         "[ocr-import] final response sent to frontend: %s",
         {**response, "text": response["text"][:300], "blocks": f"{len(blocks)} blocks"},
     )
     return response
+
+
+def _normalize_external_status(value: str) -> str:
+    v = str(value or "").strip()
+    if not v:
+        return ""
+    compact = re.sub(r"[\s-]+", "_", v.lower())
+    alias_map = {
+        "in_review": "under_review",
+        "underreview": "under_review",
+        "freigegeben": "effective",
+        "entwurf": "draft",
+        "prufung": "under_review",
+        "pruefung": "under_review",
+    }
+    normalized = alias_map.get(compact, compact)
+    return normalized if normalized in {"draft", "under_review", "effective", "obsolete", "approved", "accepted", "rejected", "changes_requested"} else ""
+
+
+def _resolve_external_status_from_payload(raw_meta: dict | None, fallback: str = "draft") -> str:
+    if not isinstance(raw_meta, dict):
+        return fallback
+    candidate = (
+        raw_meta.get("sopStatus")
+        or raw_meta.get("status")
+        or (raw_meta.get("sopMetadata", {}) or {}).get("sopStatus")
+        or (raw_meta.get("sopMetadata", {}) or {}).get("status")
+    )
+    return _normalize_external_status(candidate) or fallback
 
 
 def _build_editor_doc_response(sop: SOP, version: SOPVersion) -> dict:
@@ -953,6 +997,14 @@ def create_document(
         department=dept_final,
         raw_meta=payload.metadata_json,
     )
+    resolved_external_status = _resolve_external_status_from_payload(payload.metadata_json, fallback="draft")
+    logger.info(
+        "[sop-status] create document sop_number=%s resolved_external_status=%s payload_sopStatus=%s payload_status=%s",
+        sop_number,
+        resolved_external_status,
+        (payload.metadata_json or {}).get("sopStatus") if isinstance(payload.metadata_json, dict) else None,
+        (payload.metadata_json or {}).get("status") if isinstance(payload.metadata_json, dict) else None,
+    )
 
     initial_version = SOPVersion(
         id=new_ver_id,
@@ -962,7 +1014,7 @@ def create_document(
         metadata_json=normalized_meta,
         effective_date=_metadata_date(normalized_meta.get("sopMetadata", {}).get("effectiveDate")),
         review_date=_metadata_date(normalized_meta.get("sopMetadata", {}).get("reviewDate")),
-        external_status="draft",
+        external_status=resolved_external_status,
     )
 
     db.add(sop)

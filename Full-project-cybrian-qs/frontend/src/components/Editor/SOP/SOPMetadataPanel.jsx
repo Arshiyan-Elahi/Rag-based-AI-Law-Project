@@ -59,6 +59,21 @@ const hasValue = (value) => {
     return value !== undefined && value !== null && String(value).trim() !== ''
 }
 
+const formatStatusForDisplay = (value) => {
+    const normalized = String(value || '').trim().toLowerCase().replace(/[\s-]+/g, '_')
+    const map = {
+        draft: 'Draft',
+        under_review: 'Under Review',
+        changes_requested: 'Changes Requested',
+        accepted: 'Accepted',
+        rejected: 'Rejected',
+        approved: 'Approved',
+        effective: 'Effective',
+        obsolete: 'Obsolete',
+    }
+    return map[normalized] || String(value || '').trim()
+}
+
 export default function SOPMetadataPanel({
     metadata,
     onChange,
@@ -96,7 +111,7 @@ export default function SOPMetadataPanel({
     const requiredFieldByKey = new Map(requiredFields.map((field) => [field.key, field]))
 
     const getFieldValue = (fieldDef) => {
-        if (fieldDef.source === 'status') return status || ''
+        if (fieldDef.source === 'status') return formatStatusForDisplay(status)
         const keys = [fieldDef.key, ...(fieldDef.aliases || [])]
         for (const key of keys) {
             const value = metadataView?.[key]
@@ -232,6 +247,10 @@ export default function SOPMetadataPanel({
             },
             requiredFieldPresence,
             finalJsxSectionCount: guaranteedSections.length + (extraFields.length > 0 ? 1 : 0),
+        })
+        console.debug('[SOP Status Debug] SOPMetadataPanel status prop/render', {
+            statusProp: status,
+            renderedStatusField: formatStatusForDisplay(status),
         })
     }
 
