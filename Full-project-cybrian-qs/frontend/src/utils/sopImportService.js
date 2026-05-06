@@ -170,6 +170,7 @@ export function prepareSOPMetadataJson(importedMetadata = {}, overrides = {}) {
 
 export async function prepareEditorSOPImport(file) {
   const importResult = await extractSOPImport(file)
+  const docJson = mapBlocksToTipTapDoc(importResult.blocks, importResult.text)
   const html = importResult.blocks.length
     ? mapOCRBlocksToHTML(importResult.blocks, 'sop')
     : formatOCRText(importResult.text)
@@ -180,6 +181,7 @@ export async function prepareEditorSOPImport(file) {
 
   return {
     ...importResult,
+    docJson,
     html,
     tabLabel: buildSOPDisplayLabel(importResult.metadata),
   }

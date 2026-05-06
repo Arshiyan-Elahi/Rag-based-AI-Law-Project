@@ -444,12 +444,17 @@ export default function SOPsPage() {
     setImporting(true)
     try {
       const imported = await prepareNewSOPImport(file)
-
-      const newDoc = await createDocument({
+      const createPayload = {
         title: imported.resolvedTitle,
         doc_json: imported.docJson,
         metadata_json: imported.metadataJson,
-      })
+      }
+
+      if (import.meta?.env?.DEV) {
+        console.debug('[SOP Import] createDocument payload', createPayload)
+      }
+
+      const newDoc = await createDocument(createPayload)
 
       const tabLabel = buildSOPDisplayLabel(imported.metadata)
         || newDoc.sop_number
@@ -463,7 +468,10 @@ export default function SOPsPage() {
       // Optional: reload list
       loadSOPs()
     } catch (err) {
-      console.error('PDF Import failed:', err)
+      console.error('PDF Import failed:', err, {
+        status: err?.status,
+        responseBody: err?.responseBody || null,
+      })
       if (err?.status === 409) {
         alert(
           err.message ||

@@ -45,7 +45,7 @@ const renderParagraphs = (text = '', className = '') => {
     if (!paragraphs.length) return '';
 
     return paragraphs
-        .map((p) => `<p${className ? ` class="${className}"` : ''}>${escapeHtml(p)}</p>`)
+        .map((p) => `<p${className ? ` class="${className}"` : ''}>${escapeHtml(p).replace(/\n/g, '<br />')}</p>`)
         .join('');
 };
 
@@ -128,6 +128,9 @@ const renderBlock = (block = {}, isContract = false) => {
         case 'subheading':
             return text ? `<h3 class="ocr-heading">${escapeHtml(text)}</h3>` : '';
 
+        case 'line':
+            return text ? `<p class="ocr-line">${escapeHtml(text)}</p>` : '';
+
         case 'paragraph':
             return renderParagraphs(text);
 
@@ -156,9 +159,6 @@ const renderBlock = (block = {}, isContract = false) => {
         case 'divider':
         case 'horizontal_rule':
             return `<hr class="ocr-divider" />`;
-
-        case 'line':
-            return text ? `<p class="ocr-line">${escapeHtml(text)}</p>` : '';
 
         default:
             return text ? renderParagraphs(text) : '';

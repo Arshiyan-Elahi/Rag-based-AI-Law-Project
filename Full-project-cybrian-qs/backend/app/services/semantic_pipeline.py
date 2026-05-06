@@ -67,10 +67,15 @@ def _resolve_hf_cache_dir() -> str:
 
 def _is_model_cached(cache_dir: str, model_name: str) -> bool:
     model_key = model_name.replace("/", "--")
-    snapshots_dir = Path(cache_dir) / "hub" / f"models--{model_key}" / "snapshots"
-    if not snapshots_dir.exists():
-        return False
-    return any(p.is_dir() for p in snapshots_dir.iterdir())
+    candidate_roots = [
+        Path(cache_dir) / "hub" / f"models--{model_key}",
+        Path(cache_dir) / f"models--{model_key}",
+    ]
+    for root in candidate_roots:
+        snapshots_dir = root / "snapshots"
+        if snapshots_dir.exists() and any(p.is_dir() for p in snapshots_dir.iterdir()):
+            return True
+    return False
 
 
 def _get_embedder() -> SentenceTransformer:
@@ -81,6 +86,10 @@ def _get_embedder() -> SentenceTransformer:
                 from sentence_transformers import SentenceTransformer
                 cache_dir = _resolve_hf_cache_dir()
                 local_only = _is_model_cached(cache_dir, BGE_M3_MODEL)
+                if local_only:
+                    print(f"[hf-cache] BGE-M3 loading from local cache: {cache_dir}", flush=True)
+                else:
+                    print(f"[hf-cache] BGE-M3 cache miss, attempting download into: {cache_dir}", flush=True)
                 _embedder = SentenceTransformer(
                     BGE_M3_MODEL,
                     device=os.getenv("EMBEDDING_DEVICE", "cpu"),

@@ -12,21 +12,45 @@ function notifySidebarCountsRefresh() {
 
 async function throwApiError(res, fallbackMsg) {
   let detail = fallbackMsg
+  let rawBody = ''
   try {
-    const body = await res.json()
-    if (body?.detail != null) {
-      const d = body.detail
-      if (Array.isArray(d)) {
-        detail = d.map((x) => (typeof x === 'string' ? x : x?.msg || JSON.stringify(x))).join(' ')
-      } else {
-        detail = typeof d === 'string' ? d : JSON.stringify(d)
+    rawBody = await res.text()
+    if (rawBody) {
+      try {
+        const body = JSON.parse(rawBody)
+        if (body?.detail != null) {
+          const d = body.detail
+          if (Array.isArray(d)) {
+            detail = d.map((x) => (typeof x === 'string' ? x : x?.msg || JSON.stringify(x))).join(' ')
+          } else {
+            detail = typeof d === 'string' ? d : JSON.stringify(d)
+          }
+        } else if (body?.message) {
+          detail = String(body.message)
+        } else if (body?.error) {
+          detail = String(body.error)
+        } else {
+          detail = rawBody
+        }
+      } catch {
+        detail = rawBody
       }
     }
   } catch {
     // Ignore non-JSON error bodies and fall back to the provided message.
   }
+  if (import.meta?.env?.DEV) {
+    console.error('[API Error]', {
+      url: res.url,
+      status: res.status,
+      statusText: res.statusText,
+      detail,
+      rawBody: rawBody || null,
+    })
+  }
   const err = new Error(detail)
   err.status = res.status
+  err.responseBody = rawBody
   throw err
 }
 
@@ -40,6 +64,9 @@ export async function createDocument(payload) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   })
+  if (import.meta?.env?.DEV) {
+    console.debug('[createDocument] request payload', payload)
+  }
   if (!res.ok) await throwApiError(res, 'Failed to create document')
   const data = await res.json()
   notifySidebarCountsRefresh()

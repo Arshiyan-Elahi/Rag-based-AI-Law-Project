@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, U
 from typing import List
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_, asc
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from concurrent.futures import ThreadPoolExecutor
 from qdrant_client.http import models as qmodels
 import hashlib
@@ -59,6 +59,7 @@ import re
 import threading
 import logging
 from datetime import datetime
+from .services.sop_metadata_extractor import strip_invalid_control_chars
 
 # ==========================================
 # CONSTANTS
@@ -156,8 +157,19 @@ def _resolve_sop_lookup(db: Session, sop_ref: str):
 def _truncate_field(value: str | None, max_len: int) -> str:
     if not value:
         return ""
-    s = value.strip()
+    s = strip_invalid_control_chars(value).strip()
     return s[:max_len] if len(s) > max_len else s
+
+
+def _sanitize_json_like(value: Any) -> Any:
+    """Recursively sanitize strings for JSONB-safe persistence."""
+    if isinstance(value, str):
+        return strip_invalid_control_chars(value)
+    if isinstance(value, list):
+        return [_sanitize_json_like(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _sanitize_json_like(v) for k, v in value.items()}
+    return value
 
 
 def _compute_next_version_number(db: Session, sop_internal_id: uuid.UUID) -> str:
@@ -187,7 +199,8 @@ def _create_new_version_for_existing_sop(
     Add a new sop_version row, point current_version_id to it, refresh SOP header.
     Used when importing/creating a document with an SOP number that already exists.
     """
-    doc_json = payload.doc_json if payload.doc_json is not None else {"type": "doc", "content": []}
+    payload_meta_json = _sanitize_json_like(payload.metadata_json)
+    doc_json = _sanitize_json_like(payload.doc_json) if payload.doc_json is not None else {"type": "doc", "content": []}
     if _is_tiptap_empty(doc_json):
         raise HTTPException(
             status_code=422,
@@ -201,15 +214,15 @@ def _create_new_version_for_existing_sop(
         sop_number=sop_number,
         title=title_final,
         department=dept_final,
-        raw_meta=payload.metadata_json,
+        raw_meta=payload_meta_json,
     )
-    resolved_external_status = _resolve_external_status_from_payload(payload.metadata_json, fallback="draft")
+    resolved_external_status = _resolve_external_status_from_payload(payload_meta_json, fallback="draft")
     logger.info(
         "[sop-status] create new version for existing sop_number=%s resolved_external_status=%s payload_sopStatus=%s payload_status=%s",
         sop_number,
         resolved_external_status,
-        (payload.metadata_json or {}).get("sopStatus") if isinstance(payload.metadata_json, dict) else None,
-        (payload.metadata_json or {}).get("status") if isinstance(payload.metadata_json, dict) else None,
+        (payload_meta_json or {}).get("sopStatus") if isinstance(payload_meta_json, dict) else None,
+        (payload_meta_json or {}).get("status") if isinstance(payload_meta_json, dict) else None,
     )
 
     next_version = _compute_next_version_number(db, existing.id)
@@ -223,11 +236,24 @@ def _create_new_version_for_existing_sop(
         external_status=resolved_external_status,
     )
     db.add(new_version)
-    db.flush()
-    existing.current_version_id = new_version.id
-    existing.title = title_final
-    existing.department = dept_final
-    db.commit()
+    try:
+        db.flush()
+        existing.current_version_id = new_version.id
+        existing.title = title_final
+        existing.department = dept_final
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=f"Failed to create new SOP version due to a constraint conflict: {str(exc.orig)[:300]}",
+        ) from None
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to create new SOP version: {str(exc)[:500]}",
+        ) from None
     db.refresh(existing)
     db.refresh(new_version)
 
@@ -287,6 +313,23 @@ def _schedule_semantic_job(background_tasks: BackgroundTasks, entity_type: str, 
     try:
         if entity_type not in ENTITY_TYPES:
             return
+        if entity_type == "sop" and version_id:
+            db = SessionLocal()
+            try:
+                version = db.query(SOPVersion).filter(SOPVersion.id == version_id, SOPVersion.sop_id == entity_id).first()
+                if version and isinstance(version.metadata_json, dict):
+                    plain_text = _extract_plain_text_from_tiptap(version.content_json)
+                    if plain_text:
+                        content_hash = hashlib.sha256(plain_text.encode("utf-8", errors="ignore")).hexdigest()
+                        import_hash = version.metadata_json.get("_import_context_hash")
+                        if import_hash == content_hash:
+                            print(
+                                f"[semantic-job] Skipped unchanged already-indexed SOP {entity_id} v={version_id}",
+                                flush=True,
+                            )
+                            return
+            finally:
+                db.close()
         
         print(f"[semantic-job] Scheduling {job_type} for {entity_type} {entity_id}", flush=True)
         job_id = SemanticPipelineService.enqueue_reindex(
@@ -647,6 +690,10 @@ def _normalize_sop_metadata(sop_number: str, title: str, department: str = None,
     """
     if not isinstance(raw_meta, dict):
         raw_meta = {}
+    raw_meta = _sanitize_json_like(raw_meta)
+    sop_number = strip_invalid_control_chars(sop_number or "")
+    title = strip_invalid_control_chars(title or "")
+    department = strip_invalid_control_chars(department or "")
     
     # 1. Base Structure
     normalized = {
@@ -688,6 +735,11 @@ def _normalize_sop_metadata(sop_number: str, title: str, department: str = None,
                     normalized["sopMetadata"][k] = v
             else:
                 normalized["sopMetadata"][k] = v
+
+    # Preserve internal processing markers so idempotency guards survive metadata updates.
+    for key, value in raw_meta.items():
+        if isinstance(key, str) and key.startswith("_"):
+            normalized[key] = value
 
     return normalized
 
@@ -893,16 +945,18 @@ async def extract_text_from_upload(file: UploadFile = File(...)):
         if name.endswith(".pdf"):
             raw_pdf = await file.read()
             blocks, text = extract_pdf_bytes_robust(raw_pdf)
+            text = strip_invalid_control_chars(text)
             structured = extract_sop_metadata_from_text(text, blocks)
             return _build_extract_response(text, blocks, structured)
         elif name.endswith(".docx"):
             raw_docx = await file.read()
             blocks, text = extract_docx_bytes(raw_docx)
+            text = strip_invalid_control_chars(text)
             structured = extract_sop_metadata_from_text(text, blocks)
             return _build_extract_response(text, blocks, structured)
         elif name.endswith((".txt", ".md", ".csv", ".json")):
             raw = await file.read()
-            text = raw.decode("utf-8", errors="replace")
+            text = strip_invalid_control_chars(raw.decode("utf-8", errors="replace"))
             paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
             blocks = [{"type": "paragraph", "text": p} for p in paras]
             structured = extract_sop_metadata_from_text(text, blocks)
@@ -912,6 +966,7 @@ async def extract_text_from_upload(file: UploadFile = File(...)):
             raw = await file.read()
             try:
                 text = raw.decode("utf-8")
+                text = strip_invalid_control_chars(text)
             except Exception:
                 raise HTTPException(
                     status_code=400,
@@ -924,7 +979,11 @@ async def extract_text_from_upload(file: UploadFile = File(...)):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Extraction failed: {e!s}") from e
+        logger.exception("[extract-text] extraction failed for filename=%s", name)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Extraction failed ({type(e).__name__}): {e!s}",
+        ) from e
 
 
 # ==========================================
@@ -949,22 +1008,25 @@ def create_document(
     Create a new SOP + its first version.
     If metadata documentId/sop_number matches an existing SOP, add a new version instead of INSERT (no duplicate key).
     """
+    payload_doc_json = _sanitize_json_like(payload.doc_json)
+    payload_meta_json = _sanitize_json_like(payload.metadata_json)
+
     new_sop_id = uuid.uuid4()
     new_ver_id = uuid.uuid4()
 
-    sop_number = payload.metadata_json.get("sopMetadata", {}).get("documentId") if payload.metadata_json else None
+    sop_number = payload_meta_json.get("sopMetadata", {}).get("documentId") if isinstance(payload_meta_json, dict) else None
     sop_number = (sop_number or "").strip()
     if not sop_number:
         sop_number = f"SOP-{uuid.uuid4().hex[:8].upper()}"
 
     dept_sm = None
-    if payload.metadata_json and isinstance(payload.metadata_json.get("sopMetadata"), dict):
-        dept_sm = (payload.metadata_json["sopMetadata"].get("department") or "").strip() or None
+    if isinstance(payload_meta_json, dict) and isinstance(payload_meta_json.get("sopMetadata"), dict):
+        dept_sm = (payload_meta_json["sopMetadata"].get("department") or "").strip() or None
     department = dept_sm or "Quality"
 
     resolved_title = (payload.title or "").strip() if payload.title else ""
-    if not resolved_title and payload.metadata_json and isinstance(payload.metadata_json.get("sopMetadata"), dict):
-        resolved_title = (payload.metadata_json["sopMetadata"].get("title") or "").strip()
+    if not resolved_title and isinstance(payload_meta_json, dict) and isinstance(payload_meta_json.get("sopMetadata"), dict):
+        resolved_title = (payload_meta_json["sopMetadata"].get("title") or "").strip()
     if not resolved_title:
         resolved_title = "Untitled SOP"
 
@@ -995,22 +1057,22 @@ def create_document(
         sop_number=sop_number,
         title=title_final,
         department=dept_final,
-        raw_meta=payload.metadata_json,
+        raw_meta=payload_meta_json,
     )
-    resolved_external_status = _resolve_external_status_from_payload(payload.metadata_json, fallback="draft")
+    resolved_external_status = _resolve_external_status_from_payload(payload_meta_json, fallback="draft")
     logger.info(
         "[sop-status] create document sop_number=%s resolved_external_status=%s payload_sopStatus=%s payload_status=%s",
         sop_number,
         resolved_external_status,
-        (payload.metadata_json or {}).get("sopStatus") if isinstance(payload.metadata_json, dict) else None,
-        (payload.metadata_json or {}).get("status") if isinstance(payload.metadata_json, dict) else None,
+        (payload_meta_json or {}).get("sopStatus") if isinstance(payload_meta_json, dict) else None,
+        (payload_meta_json or {}).get("status") if isinstance(payload_meta_json, dict) else None,
     )
 
     initial_version = SOPVersion(
         id=new_ver_id,
         sop_id=new_sop_id,
         version_number=normalized_meta.get("sopMetadata", {}).get("sopVersion") or "1",
-        content_json=payload.doc_json if payload.doc_json is not None else {"type": "doc", "content": []},
+        content_json=payload_doc_json if payload_doc_json is not None else {"type": "doc", "content": []},
         metadata_json=normalized_meta,
         effective_date=_metadata_date(normalized_meta.get("sopMetadata", {}).get("effectiveDate")),
         review_date=_metadata_date(normalized_meta.get("sopMetadata", {}).get("reviewDate")),
@@ -1021,7 +1083,7 @@ def create_document(
     db.add(initial_version)
     try:
         db.commit()
-    except IntegrityError:
+    except IntegrityError as exc:
         db.rollback()
         raced = (
             db.query(SOP)
@@ -1032,9 +1094,24 @@ def create_document(
             return _create_new_version_for_existing_sop(
                 db, raced, payload, resolved_title, department, sop_number, background_tasks
             )
+        logger.exception("[create_document] integrity error for sop_number=%s", sop_number)
         raise HTTPException(
             status_code=409,
-            detail=_DUP_SOP_MSG,
+            detail=f"{_DUP_SOP_MSG} DB detail: {str(exc.orig)[:300]}",
+        ) from None
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.exception("[create_document] database error for sop_number=%s", sop_number)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to create document due to database validation error: {str(exc)[:500]}",
+        ) from None
+    except Exception as exc:
+        db.rollback()
+        logger.exception("[create_document] unexpected error for sop_number=%s", sop_number)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create document: {type(exc).__name__}: {str(exc)[:500]}",
         ) from None
 
     db.refresh(sop)
@@ -1098,12 +1175,15 @@ def update_document(
         raise HTTPException(status_code=404, detail="Current version not found")
 
     # Keep SOP header/title in sync with editor metadata or explicit payload title.
-    incoming_title = payload.title
-    if not incoming_title and isinstance(payload.metadata_json, dict):
-        incoming_title = payload.metadata_json.get("sopMetadata", {}).get("title")
+    payload_doc_json = _sanitize_json_like(payload.doc_json)
+    payload_meta_json = _sanitize_json_like(payload.metadata_json)
+
+    incoming_title = strip_invalid_control_chars(payload.title) if payload.title else payload.title
+    if not incoming_title and isinstance(payload_meta_json, dict):
+        incoming_title = payload_meta_json.get("sopMetadata", {}).get("title")
     if incoming_title:
         sop.title = incoming_title.strip() or sop.title
-    incoming_meta = payload.metadata_json.get("sopMetadata", {}) if isinstance(payload.metadata_json, dict) else {}
+    incoming_meta = payload_meta_json.get("sopMetadata", {}) if isinstance(payload_meta_json, dict) else {}
     incoming_sop_number = (incoming_meta.get("documentId") or "").strip()
     if incoming_sop_number and incoming_sop_number != sop.sop_number:
         conflict = db.query(SOP).filter(SOP.sop_number == incoming_sop_number, SOP.id != sop.id).first()
@@ -1115,13 +1195,13 @@ def update_document(
         sop.department = _truncate_field(incoming_department, 100) or sop.department
 
     # doc_json from frontend → stored as content_json in DB
-    current_version.content_json = payload.doc_json
-    if payload.metadata_json is not None:
+    current_version.content_json = payload_doc_json
+    if payload_meta_json is not None:
         normalized_meta = _normalize_sop_metadata(
             sop_number=sop.sop_number,
             title=sop.title,
             department=sop.department,
-            raw_meta=payload.metadata_json,
+            raw_meta=payload_meta_json,
         )
         current_version.metadata_json = normalized_meta
         current_version.effective_date = _metadata_date(normalized_meta.get("sopMetadata", {}).get("effectiveDate"))
@@ -1300,7 +1380,10 @@ def create_version(
     if not sop:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    if _is_tiptap_empty(payload.doc_json):
+    payload_doc_json = _sanitize_json_like(payload.doc_json)
+    payload_meta_json = _sanitize_json_like(payload.metadata_json)
+
+    if _is_tiptap_empty(payload_doc_json):
         raise HTTPException(
             status_code=422,
             detail="Cannot create a new version with empty content.",
@@ -1319,9 +1402,9 @@ def create_version(
     version = SOPVersion(
         sop_id=sop.id,
         version_number=next_version,
-        content_json=payload.doc_json,
+        content_json=payload_doc_json,
         external_status="draft",
-        metadata_json=payload.metadata_json or {},
+        metadata_json=payload_meta_json or {},
     )
     db.add(version)
     
@@ -1386,11 +1469,15 @@ def duplicate_document(
     if not source_sop:
         raise HTTPException(status_code=404, detail="Source document not found")
 
-    if payload.doc_json is None:
+    payload_doc_json = _sanitize_json_like(payload.doc_json)
+    payload_meta_json = _sanitize_json_like(payload.metadata_json)
+    payload_title = strip_invalid_control_chars(payload.title) if payload.title else payload.title
+
+    if payload_doc_json is None:
         source_version = db.query(SOPVersion).filter(SOPVersion.id == source_sop.current_version_id).first()
         content = source_version.content_json if source_version else {"type": "doc", "content": []}
     else:
-        content = payload.doc_json
+        content = payload_doc_json
 
     new_sop_id = uuid.uuid4()
     new_ver_id = uuid.uuid4()
@@ -1399,7 +1486,7 @@ def duplicate_document(
     new_sop = SOP(
         id=new_sop_id,
         tenant_id=FIXED_TENANT_ID,
-        title=payload.title or f"Copy of {source_sop.title}",
+        title=payload_title or f"Copy of {source_sop.title}",
         sop_number=new_sop_num,
         department=source_sop.department,
         is_active=True,
@@ -1413,7 +1500,7 @@ def duplicate_document(
         version_number="1",
         content_json=content,
         external_status="draft",
-        metadata_json=payload.metadata_json or {},
+        metadata_json=payload_meta_json or {},
     )
     db.add(new_version)
     
@@ -1454,9 +1541,9 @@ def update_version_status(
     if not version:
         raise HTTPException(status_code=404, detail="Version not found")
 
-    version.external_status = payload.status
+    version.external_status = strip_invalid_control_chars(payload.status)
     if payload.metadata_json is not None:
-        version.metadata_json = payload.metadata_json
+        version.metadata_json = _sanitize_json_like(payload.metadata_json)
 
     db.commit()
     db.refresh(version)

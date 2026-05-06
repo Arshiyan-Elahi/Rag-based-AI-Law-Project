@@ -73,6 +73,21 @@ export function countWordsInDocument(tiptapJson) {
 }
 
 const _text = (s) => ({ type: 'text', text: String(s ?? '') })
+const _strongText = (s) => ({ type: 'text', text: String(s ?? ''), marks: [{ type: 'bold' }] })
+
+const splitParagraphLines = (text = '') =>
+  String(text || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+
+const isBulletLine = (line = '') => /^[-*•]\s+/.test(line)
+const isNumberedLine = (line = '') => /^\(?[A-Za-z0-9]+\)?[.)]\s+/.test(line)
+const isKeyValueLine = (line = '') => /^[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\s/&()\-]{1,40}:\s+\S+/.test(line)
+
+const paragraphNode = (text = '') => ({ type: 'paragraph', content: [_text(text)] })
+const headingNode = (text = '', level = 2) => ({ type: 'heading', attrs: { level }, content: [_text(text)] })
+const listItemNode = (text = '') => ({ type: 'listItem', content: [paragraphNode(text)] })
 
 /**
  * Map backend PDF/OCR blocks to a TipTap-compatible doc JSON (StarterKit + table).
@@ -92,17 +107,55 @@ export function mapBlocksToTipTapDoc(blocks, fallbackText = '') {
     const typ = String(block.type || '').toLowerCase()
     if ((typ === 'section_heading' || typ === 'heading') && block.text) {
       const level = Math.min(3, Math.max(1, Number(block.level) || 2))
-      content.push({ type: 'heading', attrs: { level }, content: [_text(block.text)] })
+      content.push(headingNode(block.text, level))
     } else if (typ === 'paragraph' && block.text) {
-      content.push({ type: 'paragraph', content: [_text(block.text)] })
+      const lines = splitParagraphLines(block.text)
+      if (!lines.length) continue
+      if (lines.every(isBulletLine)) {
+        content.push({
+          type: 'bulletList',
+          content: lines.map((line) => listItemNode(line.replace(/^[-*•]\s+/, '').trim())),
+        })
+        continue
+      }
+      if (lines.every(isNumberedLine)) {
+        content.push({
+          type: 'orderedList',
+          content: lines.map((line) => listItemNode(line.replace(/^\(?[A-Za-z0-9]+\)?[.)]\s+/, '').trim())),
+        })
+        continue
+      }
+      for (const line of lines) {
+        if (isKeyValueLine(line)) {
+          const [key, ...rest] = line.split(':')
+          const value = rest.join(':').trim()
+          content.push({
+            type: 'paragraph',
+            content: [_strongText(`${key.trim()}: `), _text(value)],
+          })
+        } else {
+          content.push(paragraphNode(line))
+        }
+      }
+    } else if ((typ === 'two_column_row' || typ === 'key_value') && (block.left || block.right)) {
+      const left = String(block.left || '').trim()
+      const right = String(block.right || '').trim()
+      if (left && right) {
+        content.push({
+          type: 'paragraph',
+          content: [
+            _strongText(`${left}: `),
+            _text(right),
+          ],
+        })
+      } else {
+        content.push(paragraphNode(left || right))
+      }
     } else if ((typ === 'bullet_list' || typ === 'numbered_list') && Array.isArray(block.items)) {
       const listType = typ === 'numbered_list' ? 'orderedList' : 'bulletList'
       const items = block.items
         .filter((it) => String(it ?? '').trim())
-        .map((it) => ({
-          type: 'listItem',
-          content: [{ type: 'paragraph', content: [_text(it)] }],
-        }))
+        .map((it) => listItemNode(it))
       if (items.length) content.push({ type: listType, content: items })
     } else if (typ === 'table' && Array.isArray(block.rows) && block.rows.length) {
       const rows = []

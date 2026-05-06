@@ -9,6 +9,15 @@ import os
 import re
 from typing import Any, Dict, List, Optional
 
+_INVALID_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
+
+
+def strip_invalid_control_chars(text: str) -> str:
+    """Remove null/control chars unsafe for JSONB while preserving Unicode."""
+    if text is None:
+        return ""
+    return _INVALID_CONTROL_CHARS.sub("", str(text))
+
 
 def sanitize_text_for_metadata_extraction(text: str) -> str:
     """
@@ -17,6 +26,7 @@ def sanitize_text_for_metadata_extraction(text: str) -> str:
     """
     if not text:
         return ""
+    text = strip_invalid_control_chars(text)
     out_lines: List[str] = []
     for raw in text.splitlines():
         ln = raw.replace("\ufeff", "").strip()
@@ -63,6 +73,30 @@ _TITLE_METADATA_LINE = re.compile(
 _TITLE_SECTION_HEADING = re.compile(
     r"(?i)^\s*(?:Zweck|Purpose|Scope|Geltungsbereich|Definitions?|Definitionen|"
     r"Verantwortlichkeiten|Responsibilities)\b"
+)
+
+_FLATTENED_LABELS = [
+    "SOP ID",
+    "Document ID",
+    "Dokumenten ID",
+    "Title",
+    "Titel",
+    "Version",
+    "Revision",
+    "Rev.",
+    "Status",
+    "Department",
+    "Abteilung",
+    "Bereich",
+    "Effective Date",
+    "Review Date",
+    "Date",
+    "Datum",
+]
+
+_TITLE_BAD_VERBS = re.compile(
+    r"(?i)\b(documents?|verifies?|approves?|reviews?|performs?|ensures?|records?|collects?|"
+    r"validates?|grants?|applies?|restores?|coordinates?|executes?)\b"
 )
 
 # Explicit document-version labels (line-based). Order: most specific first.
@@ -189,6 +223,11 @@ def _normalize_date(raw: str) -> str:
 
 
 def _find_sop_id(text: str) -> str:
+    explicit = _extract_labeled_value(text, ["SOP ID", "SOP Nr.", "SOP Number", "Document ID", "Dokumenten ID"])
+    if explicit:
+        m_explicit = _SOP_ID_GENERIC.search(explicit)
+        if m_explicit:
+            return m_explicit.group(1).strip().upper()
     m = _SOP_ID_LINE.search(text)
     if m:
         return m.group(1).strip().upper()
@@ -196,6 +235,33 @@ def _find_sop_id(text: str) -> str:
     if m:
         return m.group(1).strip().upper()
     return ""
+
+
+def _label_stop_pattern(exclude_labels: Optional[List[str]] = None) -> re.Pattern:
+    exclude = {x.lower() for x in (exclude_labels or [])}
+    labels = [lbl for lbl in _FLATTENED_LABELS if lbl.lower() not in exclude]
+    escaped = "|".join(re.escape(lbl) for lbl in labels)
+    return re.compile(rf"(?i)\b(?:{escaped})\s*[:#]")
+
+
+def _extract_labeled_value(
+    text: str,
+    labels: List[str],
+    *,
+    stop_labels: Optional[List[str]] = None,
+) -> str:
+    if not text:
+        return ""
+    label_pat = "|".join(re.escape(lbl) for lbl in labels)
+    m = re.search(rf"(?is)\b(?:{label_pat})\s*[:#]\s*", text)
+    if not m:
+        return ""
+    tail = text[m.end() :]
+    stop_re = _label_stop_pattern(stop_labels)
+    m_stop = stop_re.search(tail)
+    raw = tail[: m_stop.start()] if m_stop else tail
+    raw = raw.splitlines()[0] if "\n" in raw else raw
+    return re.sub(r"\s+", " ", raw).strip()
 
 
 def _invalid_title(title: str, sop_id: str) -> bool:
@@ -208,6 +274,12 @@ def _invalid_title(title: str, sop_id: str) -> bool:
     if tl.startswith("sop id") or tl.startswith("document id") or tl.startswith("dokument"):
         return True
     if "##" in t or (t.startswith("*") and t.endswith("*") and len(t) < 80):
+        return True
+    if t.endswith("."):
+        return True
+    if _TITLE_BAD_VERBS.search(t):
+        return True
+    if len(t) > 120:
         return True
     if sop_id:
         compact_t = re.sub(r"\s+", "", t).upper()
@@ -234,6 +306,14 @@ def _invalid_department(dept: str) -> bool:
 
 
 def _find_title(text: str, sop_id: str) -> str:
+    explicit = _extract_labeled_value(
+        text,
+        ["Title", "Titel", "Document Title", "SOP Title", "Betreff", "Bezeichnung"],
+    )
+    explicit = _clean_title_value(explicit)
+    if explicit and not _invalid_title(explicit, sop_id):
+        return explicit
+
     lines = text.splitlines()
     m = _COMBINED_SOP_TITLE.search(text)
     if m:
@@ -672,12 +752,18 @@ def _dates_from_tables(blocks: Optional[List[Dict[str, Any]]]) -> tuple[str, str
 
 def _find_dates(text: str, blocks: Optional[List[Dict[str, Any]]]) -> tuple[str, str]:
     effective = ""
+    exp_effective = _extract_labeled_value(text, ["Effective Date", "Gültig ab", "Gueltig ab", "Freigabedatum"])
+    if exp_effective:
+        effective = _normalize_date(exp_effective)
     m = _DATE_LABEL.search(text)
-    if m:
+    if m and not effective:
         effective = _normalize_date(m.group(1))
     review = ""
+    exp_review = _extract_labeled_value(text, ["Review Date", "Nächste Prüfung", "Prüfdatum", "Überprüfung"])
+    if exp_review:
+        review = _normalize_date(exp_review)
     m = _REVIEW_DATE_LABEL.search(text)
-    if m:
+    if m and not review:
         review = _normalize_date(m.group(1))
 
     teff, trev = _dates_from_tables(blocks)
@@ -708,11 +794,21 @@ def _department_from_sop_id(sop_id: str) -> str:
 
 
 def _find_department(text: str, sop_id: str) -> str:
+    explicit = _extract_labeled_value(
+        text,
+        ["Department", "Abteilung", "Bereich", "Organisationseinheit", "Organisation"],
+    )
+    if explicit:
+        dept = _clean_title_value(explicit)
+        if dept and not _invalid_department(dept):
+            return dept[:160]
+
     m = _DEPT_LABEL.search(text)
     if m:
         dept = m.group(1).strip()
         dept = re.split(
-            r"\s{2,}|\n|\s+\|\s*(?:Status|Version|Revision|Rev\.?|Date|Datum|Effective|Gültig|Gueltig|Title|Titel)\b",
+            r"\s{2,}|\n|\s+\|\s*(?:Status|Version|Revision|Rev\.?|Date|Datum|Effective|Gültig|Gueltig|Title|Titel)\b|"
+            r"\b(?:Status|Version|Title|Effective\s*Date|Review\s*Date|Date|SOP\s*ID)\s*[:#]",
             dept,
             maxsplit=1,
             flags=re.I,
@@ -749,6 +845,12 @@ def _normalize_status(value: str) -> str:
 
 
 def _find_status(text: str) -> str:
+    explicit = _extract_labeled_value(text, ["Status", "Freigabestatus", "Dokumentstatus"])
+    if explicit:
+        normalized = _normalize_status(explicit)
+        if normalized:
+            return normalized
+
     m = _STATUS_LABEL.search(text or "")
     if m:
         normalized = _normalize_status(m.group(1))

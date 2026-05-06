@@ -42,6 +42,9 @@ const isStandaloneLabel = (line = '') =>
 const isKeyValueLine = (line = '') =>
     /^[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\s/&()-]{0,40}:\s+\S+/.test(line);
 
+const isTableLikeLine = (line = '') =>
+    /\|/.test(line) || /\S+\s{2,}\S+/.test(line);
+
 const isShortHeadingLike = (line = '') => {
     const cleaned = cleanLine(line);
     if (!cleaned) return false;
@@ -113,6 +116,8 @@ export const formatOCRText = (text = '') => {
     let paragraphBuffer = [];
     let bulletListBuffer = [];
     let orderedListBuffer = [];
+    let tableBuffer = [];
+    let titleEmitted = false;
 
     const flushParagraph = () => {
         if (!paragraphBuffer.length) return;
@@ -157,11 +162,35 @@ export const formatOCRText = (text = '') => {
         flushParagraph();
         flushBulletList();
         flushOrderedList();
+        if (tableBuffer.length) {
+            const candidateRows = tableBuffer
+                .map((line) => line.split(/\s{2,}|\|/).map((cell) => cleanLine(cell)).filter(Boolean))
+            const rows = candidateRows.filter((row) => row.length > 1);
+            if (rows.length) {
+                htmlParts.push(
+                    `<table class="ocr-table"><tbody>${rows
+                        .map((row) => `<tr>${row.map((cell) => `<td>${escapeHtml(cell)}</td>`).join('')}</tr>`)
+                        .join('')}</tbody></table>`
+                );
+            } else {
+                candidateRows.forEach((row) => {
+                    htmlParts.push(`<p>${escapeHtml(row.join(' '))}</p>`);
+                });
+            }
+            tableBuffer = [];
+        }
     };
 
     for (const line of lines) {
         if (!line) {
             flushAll();
+            continue;
+        }
+
+        if (!titleEmitted && isShortHeadingLike(line) && line.length <= 90) {
+            flushAll();
+            htmlParts.push(`<h1 class="ocr-title">${escapeHtml(line)}</h1>`);
+            titleEmitted = true;
             continue;
         }
 
@@ -211,6 +240,14 @@ export const formatOCRText = (text = '') => {
             htmlParts.push(
                 `<p class="ocr-key-value"><strong>${escapeHtml(label)}:</strong> ${escapeHtml(value)}</p>`
             );
+            continue;
+        }
+
+        if (isTableLikeLine(line) && !isBulletLine(line) && !isNumberedListLine(line)) {
+            flushParagraph();
+            flushBulletList();
+            flushOrderedList();
+            tableBuffer.push(line);
             continue;
         }
 

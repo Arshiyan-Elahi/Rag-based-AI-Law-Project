@@ -9,6 +9,7 @@ from io import BytesIO
 from typing import Any, Dict, List, Tuple
 
 import pdfplumber
+from .sop_metadata_extractor import strip_invalid_control_chars
 
 try:
     from pypdf import PdfReader
@@ -157,7 +158,12 @@ def _is_likely_heading(text: str) -> bool:
 
 
 def _clean_line(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "")).strip()
+    return re.sub(r"\s+", " ", strip_invalid_control_chars(text or "")).strip()
+
+
+def sanitize_extracted_text(text: str) -> str:
+    """Sanitize OCR/PDF text before downstream metadata parsing and DB writes."""
+    return strip_invalid_control_chars(text or "")
 
 
 def _is_numbered_heading(line: str) -> bool:
@@ -170,6 +176,10 @@ def _is_bullet_item(line: str) -> bool:
 
 def _is_numbered_item(line: str) -> bool:
     return bool(re.match(r"^\d+[\)\.]\s+.+", line))
+
+
+def _is_key_value_line(line: str) -> bool:
+    return bool(re.match(r"^[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\s/&()\-]{1,40}:\s+\S+", line))
 
 
 def _to_heading_level(line: str) -> int:
@@ -195,7 +205,7 @@ def _flatten_blocks_text(blocks: List[Dict[str, Any]]) -> str:
                 cells = [str(cell).strip() for cell in row or [] if str(cell).strip()]
                 if cells:
                     parts.append(" | ".join(cells))
-    return "\n\n".join(parts).strip()
+    return sanitize_extracted_text("\n\n".join(parts).strip())
 
 
 def _pypdf_full_text(pdf_bytes: bytes) -> str:
@@ -208,7 +218,7 @@ def _pypdf_full_text(pdf_bytes: bytes) -> str:
             text = page.extract_text()
             if text and text.strip():
                 chunks.append(text)
-        return "\n\n".join(chunks).strip()
+        return sanitize_extracted_text("\n\n".join(chunks).strip())
     except Exception:
         return ""
 
@@ -234,16 +244,17 @@ def extract_pdf_bytes_robust(pdf_bytes: bytes) -> Tuple[List[Dict[str, Any]], st
 
     if wc_pypdf > max(wc_plumber, 20) and wc_pypdf > wc_plumber * 1.15:
         blocks = _paragraph_blocks_from_text(pypdf_text) or blocks
-        return blocks, pypdf_text.strip()
+        return blocks, sanitize_extracted_text(pypdf_text.strip())
 
     if plumber_text.strip():
-        return blocks, plumber_text.strip()
+        return blocks, sanitize_extracted_text(plumber_text.strip())
     if pypdf_text.strip():
-        return _paragraph_blocks_from_text(pypdf_text), pypdf_text.strip()
+        return _paragraph_blocks_from_text(pypdf_text), sanitize_extracted_text(pypdf_text.strip())
     return blocks, ""
 
 
 def _paragraph_blocks_from_text(text: str) -> List[Dict[str, Any]]:
+    text = sanitize_extracted_text(text or "")
     paras = [p.strip() for p in re.split(r"\n\s*\n", text or "") if p.strip()]
     if not paras:
         paras = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
@@ -262,13 +273,26 @@ def _extract_page_blocks(page, pdf_bytes: bytes | None = None, page_num: int = 1
     if not text.strip() and pdf_bytes:
         text = _run_ocr_on_page(pdf_bytes, page_num)
 
-    raw_lines = [_clean_line(line) for line in text.splitlines()]
-    lines = [line for line in raw_lines if line]
+    # Some OCR/PDF parsers return flattened metadata in one physical line.
+    # Re-introduce line boundaries before common labels to preserve structure.
+    flattened_label_pattern = re.compile(
+        r"\s+(?=(?:SOP\s*ID|ID|Titel|Title|Status|Version|Department|Bereich|"
+        r"Effective\s*Date|Review\s*Date)\s*:)",
+        re.IGNORECASE,
+    )
+    normalized_text = flattened_label_pattern.sub("\n", text)
+    raw_lines = normalized_text.splitlines()
     para_buffer: List[str] = []
 
     i = 0
-    while i < len(lines):
-        line = lines[i]
+    while i < len(raw_lines):
+        raw_line = raw_lines[i]
+        line = _clean_line(raw_line)
+        if not line:
+            flush_paragraph(para_buffer)
+            para_buffer = []
+            i += 1
+            continue
         if _is_numbered_heading(line) or _is_likely_heading(line):
             flush_paragraph(para_buffer)
             para_buffer = []
@@ -277,12 +301,22 @@ def _extract_page_blocks(page, pdf_bytes: bytes | None = None, page_num: int = 1
             blocks.append({"type": block_type, "text": line, "level": level})
             i += 1
             continue
+        if _is_key_value_line(line):
+            flush_paragraph(para_buffer)
+            para_buffer = []
+            key, value = line.split(":", 1)
+            blocks.append({"type": "two_column_row", "left": _clean_line(key), "right": _clean_line(value)})
+            i += 1
+            continue
         if _is_bullet_item(line):
             flush_paragraph(para_buffer)
             para_buffer = []
             items: List[str] = []
-            while i < len(lines) and _is_bullet_item(lines[i]):
-                items.append(_clean_line(re.sub(r"^[-*•]\s+", "", lines[i])))
+            while i < len(raw_lines):
+                row = _clean_line(raw_lines[i])
+                if not row or not _is_bullet_item(row):
+                    break
+                items.append(_clean_line(re.sub(r"^[-*•]\s+", "", row)))
                 i += 1
             if items:
                 blocks.append({"type": "bullet_list", "items": items})
@@ -291,8 +325,11 @@ def _extract_page_blocks(page, pdf_bytes: bytes | None = None, page_num: int = 1
             flush_paragraph(para_buffer)
             para_buffer = []
             items: List[str] = []
-            while i < len(lines) and _is_numbered_item(lines[i]):
-                items.append(_clean_line(re.sub(r"^\d+[\)\.]\s+", "", lines[i])))
+            while i < len(raw_lines):
+                row = _clean_line(raw_lines[i])
+                if not row or not _is_numbered_item(row):
+                    break
+                items.append(_clean_line(re.sub(r"^\d+[\)\.]\s+", "", row)))
                 i += 1
             if items:
                 blocks.append({"type": "numbered_list", "items": items})
@@ -345,5 +382,5 @@ def extract_docx_bytes(docx_bytes: bytes) -> Tuple[List[Dict[str, Any]], str]:
         if text:
             paragraphs.append(text)
 
-    text = "\n\n".join(paragraphs).strip()
+    text = sanitize_extracted_text("\n\n".join(paragraphs).strip())
     return _paragraph_blocks_from_text(text), text

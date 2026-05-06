@@ -757,7 +757,7 @@ const EditorPage = ({
       console.debug('[OCR] metadata received', imported.metadata || imported.response?.sop_metadata || {})
       // Yield one frame so UI can paint loading state before heavy content insert.
       await new Promise((resolve) => window.requestAnimationFrame(resolve))
-      editor.commands.setContent(imported.html, false)
+      editor.commands.setContent(imported.docJson || imported.html, false)
 
       const ui = imported.metadata || {}
       if (ui && typeof ui === 'object') {

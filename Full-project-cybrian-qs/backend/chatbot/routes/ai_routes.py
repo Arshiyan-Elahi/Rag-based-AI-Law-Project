@@ -1,12 +1,3 @@
-"""
-Compatibility shim.
-
-The chatbot code is being consolidated under `backend/chatbot/`.
-Keep this module so existing imports (`app.ai_routes`) continue to work.
-"""
-
-from chatbot.routes.ai_routes import *  # noqa: F401,F403
-
 from html import escape
 import re
 import os
@@ -28,9 +19,9 @@ from action.prompts import (
 from action.runtime import create_action_runtime
 from action.utils import format_chunks, parse_with_retry
 from schemas.sop_actions import ActionRequest, GapCheckResponse, ImproveResponse, RewriteResponse
-from .schemas import AIActionRequest, AIActionResponse
-from .database import SessionLocal
-from .models import SOP, SOPVersion, Deviation, Capa, AuditFinding, Decision
+from app.schemas import AIActionRequest, AIActionResponse
+from app.database import SessionLocal
+from app.models import SOP, SOPVersion, Deviation, Capa, AuditFinding, Decision
 
 # RAG-specific imports are lazy-loaded inside _get_smart_rag_chain()
 # to avoid ModuleNotFoundError when running without the RAG chatbot modules.
@@ -81,14 +72,7 @@ def _get_smart_rag_chain() -> Any:
 
         client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
         embedder = get_embedder()
-        reranker = None
-        try:
-            reranker = CrossEncoderReranker(top_n=5)
-        except Exception as reranker_exc:
-            print(
-                f"[startup] Reranker cache missing, continuing without reranker: {reranker_exc}",
-                flush=True,
-            )
+        reranker = CrossEncoderReranker(top_n=5)
 
         if rag_unified_enabled():
             ucol = unified_semantic_collection()
