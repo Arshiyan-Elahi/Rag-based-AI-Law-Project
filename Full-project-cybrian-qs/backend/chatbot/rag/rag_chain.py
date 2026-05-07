@@ -501,9 +501,9 @@ def _looks_like_sop_generation_query(query: str) -> bool:
         r"\b(generate|create|draft|write|prepare|convert|format|structure|"
         r"make this|turn this|build)\b"
     )
-    # Treat rich free-form notes as generation requests when SOP intent is explicit.
-    has_multiline_notes = ("\n" in q and len(q) > 180) or len(q) > 420
-    return bool(re.search(sop_terms, q)) and (bool(re.search(intent_terms, q)) or has_multiline_notes)
+    # Generation mode should only trigger on explicit create/draft intent.
+    # Multiline/context-heavy assistant prompts can otherwise cause false positives.
+    return bool(re.search(sop_terms, q)) and bool(re.search(intent_terms, q))
 
 
 def _build_sop_generation_prompt(raw_input: str) -> str:
@@ -607,6 +607,16 @@ def _classify_sop_inventory_query(query: str) -> Optional[Literal["count", "list
     return None
 
 
+def _looks_cross_domain_query(query: str) -> bool:
+    q = (query or "").lower()
+    return bool(
+        re.search(
+            r"\b(deviation|deviations|dev-|capa|capas|audit|audits|finding|findings|decision|decisions|linked|related)\b",
+            q,
+        )
+    )
+
+
 def _strict_sop_inventory_response(
     docs: List[Document],
     query: str,
@@ -679,16 +689,14 @@ def _strict_sop_inventory_response(
     if mode == "count":
         if total == 0:
             count_answer = (
-                "Summary: No SOPs were found in the current search index. "
-                "The index may be empty or SOPs may not be embedded yet.\n\n"
-                "If you need a list, ask: “List all SOPs” after indexing has completed."
+                "No active SOP records were found in the current indexed dataset.\n\n"
+                "If SOPs were recently added, run indexing and ask again."
             )
         else:
+            sample = ", ".join(f"{ref} ({title})" for ref, title, _ in rows[:5])
             count_answer = (
-                f"Summary: The search index currently contains {total} distinct SOP(s). "
-                f"That number is a count of unique SOP record references (SOP id / number) "
-                f"in the indexed SOP data, not the number of text chunks.\n\n"
-                f"If you need the full list with titles, ask: “List all SOPs”."
+                f"There are {total} active SOP record(s) in the indexed dataset.\n\n"
+                f"Top matches: {sample}."
             )
         return {
         "answer": count_answer,
@@ -739,9 +747,9 @@ def _strict_sop_inventory_response(
     ]
 
     answer = (
-        f"Summary: There are {total} unique SOP record(s) in the indexed SOP data.\n\n"
-        f"List:\n{key_points if key_points else 'No SOPs found in the current index.'}\n\n"
-        f"Documents:\n{sources_lines if sources_lines else 'None.'}"
+        f"Found {total} active SOP record(s).\n\n"
+        f"SOP list:\n{key_points if key_points else 'No SOPs found in the current index.'}\n\n"
+        f"Sources:\n{sources_lines if sources_lines else 'None.'}"
     )
 
     return {
@@ -892,6 +900,7 @@ class SmartRAGChain:
             }
 
         cat_norm = (category or "").strip().lower()
+        route_data = self.router.route(query)
         sop_inventory_mode: Optional[Literal["count", "list"]] = None
         if (not cat_norm) or cat_norm == "sops":
             sop_inventory_mode = _classify_sop_inventory_query(query)
@@ -916,20 +925,20 @@ class SmartRAGChain:
         )
 
         # ── Step 1: Route query using LLM Router (Prompt 3) ──
-        if category and category.strip().lower() in {
+        forced_category = category and category.strip().lower() in {
             "sops",
             "deviations",
             "capas",
             "audits",
             "decisions",
-        }:
+        }
+        if forced_category and not _looks_cross_domain_query(query):
             target_sections = [category.strip().lower()]
             route_data = {"collections": target_sections, "exact_filters": dict(metadata_filters)}
         elif sop_inventory_mode:
             target_sections = ["sops"]
             route_data = {"collections": ["sops"], "exact_filters": dict(metadata_filters)}
         else:
-            route_data = self.router.route(query)
             target_sections = route_data.get("collections", [])
             metadata_filters.update(route_data.get("exact_filters", {}))
 

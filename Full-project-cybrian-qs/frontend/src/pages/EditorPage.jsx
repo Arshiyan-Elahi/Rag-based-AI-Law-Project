@@ -32,6 +32,7 @@ import {
   createDocument,
   createVersion,
   getDocument,
+  getRelatedContext,
   getVersion,
   getVersions,
   updateDocument,
@@ -78,6 +79,7 @@ const EMPTY_DOC = {
 }
 
 const STORAGE_KEY = 'current_document_id'
+const KL_EDITOR_CONTEXT_KEY = 'kl_assistant_editor_state_v1'
 
 const EditorShortcuts = Extension.create({
   name: 'editorShortcuts',
@@ -276,6 +278,7 @@ const EditorPage = ({
   const [compareTargetVersionId, setCompareTargetVersionId] = useState('')
   const [diffVersions, setDiffVersions] = useState({ oldVersion: null, newVersion: null })
   const [relatedContextRefreshToken, setRelatedContextRefreshToken] = useState(0)
+  const [relatedContextSnapshot, setRelatedContextSnapshot] = useState(null)
   const hydrationRef = useRef(false)
   const saveInFlightRef = useRef(false)
   const [isEditorMounted, setIsEditorMounted] = useState(false)
@@ -493,6 +496,57 @@ const EditorPage = ({
         console.error('Failed to load editor document:', error)
       })
   }, [editor, isEditorMounted, initialDocId, urlDocId, hydrateFromDocument])
+
+  useEffect(() => {
+    if (!documentId) {
+      setRelatedContextSnapshot(null)
+      return
+    }
+    let cancelled = false
+    getRelatedContext(documentId)
+      .then((ctx) => {
+        if (!cancelled) {
+          setRelatedContextSnapshot(ctx)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setRelatedContextSnapshot(null)
+        }
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [documentId, relatedContextRefreshToken])
+
+  useEffect(() => {
+    const linked = {
+      deviations: Array.isArray(relatedContextSnapshot?.related_deviations) ? relatedContextSnapshot.related_deviations : [],
+      capas: Array.isArray(relatedContextSnapshot?.related_capas) ? relatedContextSnapshot.related_capas : [],
+      audits: Array.isArray(relatedContextSnapshot?.related_audit_findings) ? relatedContextSnapshot.related_audit_findings : [],
+      decisions: Array.isArray(relatedContextSnapshot?.related_decisions) ? relatedContextSnapshot.related_decisions : [],
+      related_sops: Array.isArray(relatedContextSnapshot?.related_sops) ? relatedContextSnapshot.related_sops : [],
+    }
+    const payload = {
+      updated_at: new Date().toISOString(),
+      sop: {
+        id: documentId || '',
+        sop_number: metadata?.documentId || '',
+        documentId: metadata?.documentId || '',
+        title: metadata?.title || '',
+        version: metadata?.sopVersion || '',
+        status: sopStatus || '',
+        references: Array.isArray(metadata?.references) ? metadata.references : [],
+      },
+      linked,
+      editor_text: editor?.getText?.() || '',
+    }
+    try {
+      localStorage.setItem(KL_EDITOR_CONTEXT_KEY, JSON.stringify(payload))
+    } catch {
+      // ignore storage failures
+    }
+  }, [documentId, metadata, sopStatus, editor, relatedContextSnapshot])
 
   const persistDocument = useCallback(async ({ showSavingIndicator = true } = {}) => {
     if (!editor || !isEditorMounted || editor.isDestroyed || isHistoricalView || hydrationRef.current) return

@@ -1,4 +1,5 @@
 import { queryAI } from '../api/editorApi'
+import { getKLAssistantContext } from './assistantContext'
 
 const ROUTE_CONFIG = {
   '/sops': {
@@ -180,11 +181,19 @@ export function getAssistantRouteMeta(pathname = '/') {
   return matchRouteConfig(pathname)
 }
 
-export async function runUnifiedAssistantQuery({ question, pathname = '/', chatHistory = [] }) {
+export async function runUnifiedAssistantQuery({
+  question,
+  pathname = '/',
+  chatHistory = [],
+  assistantActionConfirmation = null,
+}) {
   const routeMeta = matchRouteConfig(pathname)
   const contextualQuestion = buildContextualQuestion(question, pathname)
+  const assistantContext = getKLAssistantContext(pathname)
   return queryAI(contextualQuestion, {
     chat_history: chatHistory,
     category: routeMeta.category,
+    assistant_context: assistantContext,
+    assistant_action_confirmation: assistantActionConfirmation,
   })
 }

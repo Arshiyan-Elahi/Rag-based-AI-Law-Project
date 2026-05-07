@@ -4,9 +4,10 @@ import { Send, Zap } from 'lucide-react'
 import { nowTime, runUnifiedAssistantQuery, getAssistantRouteMeta, toHtml } from '../../utils/chatAssistant'
 import { createDocument } from '../../api/editorApi'
 import { htmlToPlainText, deriveSopTitleFromText, plainTextToTiptapDoc } from '../../utils/chatSopSave'
+import { getAssistantContextStorageKeys } from '../../utils/assistantContext'
 import './DashboardComponents.css'
 
-const STORAGE_KEY_BY_PATH = 'ai_widget_messages_by_path_v2_reset'
+const STORAGE_KEY_BY_PATH = 'ai_widget_messages_by_path_v3_reset'
 
 export default function AIWidget() {
   const location = useLocation()
@@ -33,9 +34,40 @@ export default function AIWidget() {
   })
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
+  const [pendingDeleteAction, setPendingDeleteAction] = useState(null)
+  const [actionToast, setActionToast] = useState('')
   const chatEndRef = useRef(null)
   const messagesRef = useRef(messages)
   const suggestions = routeMeta.suggestions
+
+  const emitSOPRefresh = useCallback((reason, sopId) => {
+    if (typeof window === 'undefined') return
+    window.dispatchEvent(
+      new CustomEvent('sops-refresh-request', {
+        detail: { reason, sop_id: sopId || null },
+      }),
+    )
+  }, [])
+
+  const showToast = useCallback((text) => {
+    setActionToast(text)
+    window.setTimeout(() => setActionToast(''), 2400)
+  }, [])
+  const clearAssistantActiveContext = useCallback(() => {
+    const keys = getAssistantContextStorageKeys()
+    localStorage.removeItem('current_document_id')
+    try {
+      const editorRaw = localStorage.getItem(keys.editor)
+      if (editorRaw) {
+        const parsed = JSON.parse(editorRaw)
+        const next = { ...(parsed || {}), sop: {}, linked: {}, editor_text: '' }
+        localStorage.setItem(keys.editor, JSON.stringify(next))
+      }
+    } catch {
+      // ignore storage parse failures
+    }
+    console.info('[assistant-delete-ui] cleared active assistant context')
+  }, [])
 
   useEffect(() => {
     messagesRef.current = messages
@@ -80,7 +112,7 @@ export default function AIWidget() {
     ])
   }, [location.pathname])
 
-  const sendMessage = useCallback(async (text) => {
+  const sendMessage = useCallback(async (text, opts = {}) => {
     const trimmed = text.trim()
     if (!trimmed || sending) return
 
@@ -102,7 +134,35 @@ export default function AIWidget() {
         question: trimmed,
         pathname: location.pathname,
         chatHistory: chatHistoryPayload,
+        assistantActionConfirmation: opts.assistantActionConfirmation || null,
       })
+      const action = result?.assistant_action
+      if (action?.requires_confirmation && action?.type === 'delete_sop') {
+        setPendingDeleteAction({
+          question: trimmed,
+          action,
+        })
+      } else {
+        setPendingDeleteAction(null)
+      }
+      if (action?.ok && action?.type === 'create_sop' && action?.sop_id) {
+        emitSOPRefresh('create', action.sop_id)
+        showToast('SOP created successfully')
+        navigate(`/editor/${action.sop_id}`)
+      }
+      if (action?.ok && action?.type === 'update_sop') {
+        showToast('SOP updated successfully')
+      }
+      if (action?.ok && action?.type === 'delete_sop') {
+        emitSOPRefresh('delete', action.sop_id)
+        showToast('SOP deleted successfully')
+        console.info('[assistant-delete-ui] delete success', action)
+        const activeId = localStorage.getItem('current_document_id')
+        if (activeId && action?.sop_id && String(activeId) === String(action.sop_id)) {
+          clearAssistantActiveContext()
+          navigate('/sops')
+        }
+      }
       const aiMsg = {
         id: Date.now() + 1,
         role: 'ai',
@@ -124,7 +184,7 @@ export default function AIWidget() {
     } finally {
       setSending(false)
     }
-  }, [sending, location.pathname])
+  }, [sending, location.pathname, navigate, emitSOPRefresh, showToast, clearAssistantActiveContext])
 
   const handleSend = () => sendMessage(input)
 
@@ -177,8 +237,23 @@ export default function AIWidget() {
 
   const contextLabel = routeMeta.contextLabel
 
+  const confirmDelete = async () => {
+    if (!pendingDeleteAction) return
+    await sendMessage(pendingDeleteAction.question, {
+      assistantActionConfirmation: {
+        action: 'delete_sop',
+        confirmed: true,
+      },
+    })
+  }
+
   return (
     <div className="ai-widget-container">
+      {actionToast ? (
+        <div className="assistant-action-toast" role="status" aria-live="polite">
+          {actionToast}
+        </div>
+      ) : null}
       {/* Header (n_93fb9) */}
       <div className="ai-widget-header-section">
         {/* Title row with status dot, title, and Aktiv badge (n_00925, n_93f3c, n_36ff5, n_a93c8, n_cf5e4) */}
@@ -323,6 +398,35 @@ export default function AIWidget() {
           </button>
         </div>
       </div>
+
+      {pendingDeleteAction ? (
+        <div className="sop-delete-modal-overlay" role="presentation">
+          <div className="sop-delete-modal" role="dialog" aria-modal="true" aria-labelledby="assistant-delete-title">
+            <h3 id="assistant-delete-title" className="sop-delete-title">SOP wirklich löschen?</h3>
+            <p className="sop-delete-message">
+              Diese Aktion blendet die aktuell aktive SOP aus dem Workspace aus. Sie können den Löschvorgang jetzt bestätigen oder abbrechen.
+            </p>
+            <div className="sop-delete-actions">
+              <button
+                type="button"
+                className="sop-delete-btn sop-delete-btn-cancel"
+                onClick={() => setPendingDeleteAction(null)}
+                disabled={sending}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="sop-delete-btn sop-delete-btn-confirm"
+                onClick={confirmDelete}
+                disabled={sending}
+              >
+                {sending ? 'Deleting...' : 'OK'}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   )
 }

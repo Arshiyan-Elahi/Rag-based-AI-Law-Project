@@ -12,10 +12,11 @@ import {
   toHtml,
 } from '../utils/chatAssistant'
 import { deriveSopTitleFromText, htmlToPlainText, plainTextToTiptapDoc } from '../utils/chatSopSave'
+import { getAssistantContextStorageKeys } from '../utils/assistantContext'
 import './ChatPage.css'
 
-const CHAT_STORAGE_KEY = 'chat_page_conversations_v2_reset'
-const CHAT_ACTIVE_STORAGE_KEY = 'chat_page_active_conversation_v2_reset'
+const CHAT_STORAGE_KEY = 'chat_page_conversations_v3_reset'
+const CHAT_ACTIVE_STORAGE_KEY = 'chat_page_active_conversation_v3_reset'
 
 function createInitialConversation() {
   return {
@@ -60,6 +61,37 @@ export default function ChatPage() {
   const [activeConvId, setActiveConvId] = useState(() => localStorage.getItem(CHAT_ACTIVE_STORAGE_KEY) || 'live-chat')
   const [showChat, setShowChat] = useState(false)
   const [isSending, setIsSending] = useState(false)
+  const [pendingDeleteAction, setPendingDeleteAction] = useState(null)
+  const [actionToast, setActionToast] = useState('')
+
+  const emitSOPRefresh = useCallback((reason, sopId) => {
+    if (typeof window === 'undefined') return
+    window.dispatchEvent(
+      new CustomEvent('sops-refresh-request', {
+        detail: { reason, sop_id: sopId || null },
+      }),
+    )
+  }, [])
+
+  const showToast = useCallback((text) => {
+    setActionToast(text)
+    window.setTimeout(() => setActionToast(''), 2400)
+  }, [])
+  const clearAssistantActiveContext = useCallback(() => {
+    const keys = getAssistantContextStorageKeys()
+    localStorage.removeItem('current_document_id')
+    try {
+      const editorRaw = localStorage.getItem(keys.editor)
+      if (editorRaw) {
+        const parsed = JSON.parse(editorRaw)
+        const next = { ...(parsed || {}), sop: {}, linked: {}, editor_text: '' }
+        localStorage.setItem(keys.editor, JSON.stringify(next))
+      }
+    } catch {
+      // ignore storage parse failures
+    }
+    console.info('[assistant-delete-ui] cleared active assistant context')
+  }, [])
 
   React.useEffect(() => {
     localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(conversations))
@@ -113,7 +145,7 @@ export default function ChatPage() {
   }, [])
 
   const handleSendMessage = useCallback(
-    async (text) => {
+    async (text, opts = {}) => {
       if (!activeConvId || !text?.trim() || isSending) return
       setIsSending(true)
 
@@ -152,7 +184,35 @@ export default function ChatPage() {
           question: text.trim(),
           pathname: location.pathname,
           chatHistory: chatHistoryPayload,
+          assistantActionConfirmation: opts.assistantActionConfirmation || null,
         })
+        const action = result?.assistant_action
+        if (action?.requires_confirmation && action?.type === 'delete_sop') {
+          setPendingDeleteAction({
+            question: text.trim(),
+            conversationId: activeConvId,
+          })
+        } else {
+          setPendingDeleteAction(null)
+        }
+        if (action?.ok && action?.type === 'create_sop' && action?.sop_id) {
+          emitSOPRefresh('create', action.sop_id)
+          showToast('SOP created successfully')
+          navigate(`/editor/${action.sop_id}`)
+        }
+        if (action?.ok && action?.type === 'update_sop') {
+          showToast('SOP updated successfully')
+        }
+        if (action?.ok && action?.type === 'delete_sop') {
+          emitSOPRefresh('delete', action.sop_id)
+          showToast('SOP deleted successfully')
+          console.info('[assistant-delete-ui] delete success', action)
+          const activeId = localStorage.getItem('current_document_id')
+          if (activeId && action?.sop_id && String(activeId) === String(action.sop_id)) {
+            clearAssistantActiveContext()
+            navigate('/sops')
+          }
+        }
         const sourceTags = (result.sources || []).slice(0, 5).map((s, idx) => ({
           id: `src-${Date.now()}-${idx}`,
           label: s.label || s.id || `Quelle ${idx + 1}`,
@@ -199,8 +259,27 @@ export default function ChatPage() {
         setIsSending(false)
       }
     },
-    [activeConvId, activeConversation?.messages, isSending, location.pathname],
+    [
+      activeConvId,
+      activeConversation?.messages,
+      isSending,
+      location.pathname,
+      navigate,
+      emitSOPRefresh,
+      showToast,
+      clearAssistantActiveContext,
+    ],
   )
+
+  const confirmDeleteViaAssistant = useCallback(async () => {
+    if (!pendingDeleteAction) return
+    await handleSendMessage(pendingDeleteAction.question, {
+      assistantActionConfirmation: {
+        action: 'delete_sop',
+        confirmed: true,
+      },
+    })
+  }, [pendingDeleteAction, handleSendMessage])
 
   const handleMessageAction = useCallback(async (action, message) => {
     try {
@@ -281,6 +360,11 @@ export default function ChatPage() {
 
   return (
     <div className={`chat-page ${mobileClass}`}>
+      {actionToast ? (
+        <div className="assistant-action-toast" role="status" aria-live="polite">
+          {actionToast}
+        </div>
+      ) : null}
       <ConversationList
         conversations={conversations}
         activeId={activeConvId}
@@ -316,6 +400,34 @@ export default function ChatPage() {
           onMessageAction={handleMessageAction}
         />
       </div>
+      {pendingDeleteAction ? (
+        <div className="sop-delete-modal-overlay" role="presentation">
+          <div className="sop-delete-modal" role="dialog" aria-modal="true" aria-labelledby="chat-delete-title">
+            <h3 id="chat-delete-title" className="sop-delete-title">SOP wirklich löschen?</h3>
+            <p className="sop-delete-message">
+              Der KL Assistant wird die aktive SOP nach Ihrer Bestätigung sicher entfernen (Soft Delete).
+            </p>
+            <div className="sop-delete-actions">
+              <button
+                type="button"
+                className="sop-delete-btn sop-delete-btn-cancel"
+                onClick={() => setPendingDeleteAction(null)}
+                disabled={isSending}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="sop-delete-btn sop-delete-btn-confirm"
+                onClick={confirmDeleteViaAssistant}
+                disabled={isSending}
+              >
+                {isSending ? 'Deleting...' : 'OK'}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   )
 }

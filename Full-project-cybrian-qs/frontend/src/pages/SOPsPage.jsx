@@ -14,6 +14,7 @@ import SOPTable from '../components/SOPs/SOPTable'
 import StatusBadge from '../components/Common/StatusBadge'
 import './SOPsPage.css'
 const EditorPage = lazy(() => import('./EditorPage'))
+const KL_WORKSPACE_CONTEXT_KEY = 'kl_assistant_workspace_state_v1'
 
 // ── Quick filter suggestions (UI labels only — not mock data) ──────────────
 const quickFilters = [
@@ -210,6 +211,29 @@ export default function SOPsPage() {
   ])
   const [activeTabId, setActiveTabId] = useState('sops-list')
 
+  useEffect(() => {
+    const openedTabs = tabs.map((tab) => ({
+      id: tab.id,
+      label: tab.label,
+      type: tab.type,
+      docId: tab.docId || null,
+    }))
+    const activeTab = tabs.find((tab) => tab.id === activeTabId) || null
+    try {
+      localStorage.setItem(
+        KL_WORKSPACE_CONTEXT_KEY,
+        JSON.stringify({
+          updated_at: new Date().toISOString(),
+          active_tab_id: activeTabId,
+          active_tab_label: activeTab?.label || '',
+          opened_tabs: openedTabs,
+        }),
+      )
+    } catch {
+      // ignore storage failures
+    }
+  }, [tabs, activeTabId])
+
   const openNewSOPTab = useCallback(() => {
     const tabId = 'editor-new'
     setTabs(prev => {
@@ -308,6 +332,22 @@ export default function SOPsPage() {
 
   useEffect(() => {
     loadSOPs()
+  }, [loadSOPs])
+
+  useEffect(() => {
+    const onRefreshRequest = (event) => {
+      const sopId = event?.detail?.sop_id ? String(event.detail.sop_id) : null
+      console.info('[sops-refresh-request]', event?.detail || {})
+      loadSOPs()
+      if (event?.detail?.reason === 'delete' && sopId) {
+        setTabs((prev) => prev.filter((tab) => String(tab.docId || '') !== sopId))
+        setActiveTabId((prevActiveId) => (
+          String(prevActiveId).includes(sopId) ? 'sops-list' : prevActiveId
+        ))
+      }
+    }
+    window.addEventListener('sops-refresh-request', onRefreshRequest)
+    return () => window.removeEventListener('sops-refresh-request', onRefreshRequest)
   }, [loadSOPs])
 
   // ── Filtering ─────────────────────────────────────────────────────────────

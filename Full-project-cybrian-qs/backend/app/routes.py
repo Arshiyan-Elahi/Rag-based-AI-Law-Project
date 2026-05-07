@@ -142,16 +142,22 @@ def _tenant_scoped_query(db: Session, model):
     return db.query(model)
 
 
-def _resolve_sop_lookup(db: Session, sop_ref: str):
+def _resolve_sop_lookup(db: Session, sop_ref: str, *, include_inactive: bool = False):
     """
     Resolve SOP by UUID or SOP number while respecting tenant fallback logic.
     """
     base_query = _tenant_scoped_query(db, SOP)
     try:
         id_val = uuid.UUID(sop_ref)
-        return base_query.filter(SOP.id == id_val).first()
+        q = base_query.filter(SOP.id == id_val)
+        if not include_inactive:
+            q = q.filter(SOP.is_active == True)  # noqa: E712
+        return q.first()
     except ValueError:
-        return base_query.filter(SOP.sop_number == sop_ref).first()
+        q = base_query.filter(SOP.sop_number == sop_ref)
+        if not include_inactive:
+            q = q.filter(SOP.is_active == True)  # noqa: E712
+        return q.first()
 
 
 def _truncate_field(value: str | None, max_len: int) -> str:
@@ -1132,9 +1138,9 @@ def get_document(doc_id: str, db: Session = Depends(get_db)):
     sop = None
     try:
         id_val = uuid.UUID(doc_id)
-        sop = db.query(SOP).filter(SOP.id == id_val).first()
+        sop = db.query(SOP).filter(SOP.id == id_val, SOP.is_active == True).first()  # noqa: E712
     except ValueError:
-        sop = db.query(SOP).filter(SOP.sop_number == doc_id).first()
+        sop = db.query(SOP).filter(SOP.sop_number == doc_id, SOP.is_active == True).first()  # noqa: E712
 
     if not sop:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -1163,9 +1169,9 @@ def update_document(
     sop = None
     try:
         id_val = uuid.UUID(doc_id)
-        sop = db.query(SOP).filter(SOP.id == id_val).first()
+        sop = db.query(SOP).filter(SOP.id == id_val, SOP.is_active == True).first()  # noqa: E712
     except ValueError:
-        sop = db.query(SOP).filter(SOP.sop_number == doc_id).first()
+        sop = db.query(SOP).filter(SOP.sop_number == doc_id, SOP.is_active == True).first()  # noqa: E712
 
     if not sop:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -1352,7 +1358,7 @@ def list_versions(doc_id: str, db: Session = Depends(get_db)):
     doc_id     <- sop_id
     status     <- external_status
     """
-    sop = db.query(SOP).filter(SOP.id == doc_id).first()
+    sop = db.query(SOP).filter(SOP.id == doc_id, SOP.is_active == True).first()  # noqa: E712
     if not sop:
         raise HTTPException(status_code=404, detail="Document not found")
 
@@ -1376,7 +1382,7 @@ def create_version(
     """
     Create a new version row. Uses TRUE sequential integer calculation.
     """
-    sop = db.query(SOP).filter(SOP.id == doc_id).first()
+    sop = db.query(SOP).filter(SOP.id == doc_id, SOP.is_active == True).first()  # noqa: E712
     if not sop:
         raise HTTPException(status_code=404, detail="Document not found")
 
@@ -1443,6 +1449,10 @@ def get_version(doc_id: str, version_id: str, db: Session = Depends(get_db)):
     Fetch a specific version by doc_id (= sop_id) and version_id.
     Returns old editor field names.
     """
+    sop = db.query(SOP).filter(SOP.id == doc_id, SOP.is_active == True).first()  # noqa: E712
+    if not sop:
+        raise HTTPException(status_code=404, detail="Document not found")
+
     version = (
         db.query(SOPVersion)
         .filter(SOPVersion.sop_id == doc_id, SOPVersion.id == version_id)
@@ -1465,7 +1475,7 @@ def duplicate_document(
     """
     Duplicate an existing SOP. Reset to version 1.
     """
-    source_sop = db.query(SOP).filter(SOP.id == doc_id).first()
+    source_sop = db.query(SOP).filter(SOP.id == doc_id, SOP.is_active == True).first()  # noqa: E712
     if not source_sop:
         raise HTTPException(status_code=404, detail="Source document not found")
 
@@ -1533,6 +1543,10 @@ def update_version_status(
             detail=f"Invalid status '{payload.status}'. Must be one of: {', '.join(sorted(VALID_STATUSES))}"
         )
 
+    sop = db.query(SOP).filter(SOP.id == doc_id, SOP.is_active == True).first()  # noqa: E712
+    if not sop:
+        raise HTTPException(status_code=404, detail="Document not found")
+
     version = (
         db.query(SOPVersion)
         .filter(SOPVersion.sop_id == doc_id, SOPVersion.id == version_id)
@@ -1562,7 +1576,8 @@ def get_all_sops(db: Session = Depends(get_db)):
     Return all SOPs for the fixed tenant.
     Each entry includes current_version embedded summary for convenience.
     """
-    sops = _tenant_scoped_query(db, SOP).all()
+    sops = _tenant_scoped_query(db, SOP).filter(SOP.is_active == True).all()  # noqa: E712
+    logger.info("[api/sops] returning active SOPs count=%s", len(sops))
     if not sops:
         return []
 
@@ -1606,7 +1621,7 @@ def get_sop_by_id(id: str, db: Session = Depends(get_db)):
     Return one SOP by id, with current_version embedded as a nested object.
     Uses native DB field names: content_json, external_status.
     """
-    sop = _resolve_sop_lookup(db, id)
+    sop = _resolve_sop_lookup(db, id, include_inactive=False)
 
     if not sop:
         raise HTTPException(status_code=404, detail="SOP not found")
@@ -1620,7 +1635,7 @@ def get_sop_versions(id: str, db: Session = Depends(get_db)):
     Return all sop_versions rows where sop_id = {id}.
     Native field names preserved.
     """
-    sop = _resolve_sop_lookup(db, id)
+    sop = _resolve_sop_lookup(db, id, include_inactive=False)
 
     if not sop:
         raise HTTPException(status_code=404, detail="SOP not found")
@@ -1641,7 +1656,7 @@ def get_sop_related_context(id: str, db: Session = Depends(get_db)):
     Also resolves decision → sop back-links.
     """
     # Handle lookup by either UUID (id) or SOP Number
-    sop = _resolve_sop_lookup(db, id)
+    sop = _resolve_sop_lookup(db, id, include_inactive=False)
 
     if not sop:
         raise HTTPException(status_code=404, detail="SOP not found")

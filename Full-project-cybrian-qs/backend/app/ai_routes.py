@@ -13,6 +13,8 @@ import os
 import math
 import threading
 import asyncio
+import uuid
+import logging
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -51,6 +53,14 @@ DECISION_REF_PATTERN = re.compile(r"\bDEC-[A-Z0-9-]+\b", re.IGNORECASE)
 # Default is false so semantic RAG/Qdrant is used unless explicitly overridden.
 CHATBOT_USE_LOCAL_DB = os.getenv("CHATBOT_USE_LOCAL_DB", "false").strip().lower() == "true"
 CHATBOT_ALLOW_LOCAL_DB_PRIMARY = os.getenv("CHATBOT_ALLOW_LOCAL_DB_PRIMARY", "false").strip().lower() == "true"
+logger = logging.getLogger(__name__)
+ACTION_INTENT_CREATE = re.compile(r"\b(create|new|generate|draft)\b.*\b(sop)\b", re.IGNORECASE)
+ACTION_INTENT_DELETE = re.compile(r"\b(delete|remove)\b.*\b(sop|this sop|current sop)\b", re.IGNORECASE)
+ACTION_INTENT_UPDATE = re.compile(
+    r"\b(update|edit|modify|revise)\b.*\b(sop|this sop|current sop)\b|"
+    r"\b(add)\b.*\b(section)\b.*\b(current sop|this sop)\b",
+    re.IGNORECASE,
+)
 
 
 def _get_smart_rag_chain() -> Any:
@@ -914,6 +924,251 @@ def _extract_selected_text_html(action: str, structured_data: dict, suggested_te
     return suggested_text
 
 
+def _ctx_list(values: Any) -> list:
+    return values if isinstance(values, list) else []
+
+
+def _extract_refs(items: list, keys: list[str], limit: int = 8) -> list[str]:
+    refs: list[str] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        for key in keys:
+            value = str(item.get(key) or "").strip()
+            if value:
+                refs.append(value)
+                break
+        if len(refs) >= limit:
+            break
+    return refs
+
+
+def _query_intents(question: str) -> set[str]:
+    q = (question or "").lower()
+    intents: set[str] = set()
+    if re.search(r"\b(how many|count|number of|total)\b.*\b(sop|sops)\b", q):
+        intents.add("sop_count")
+    if re.search(r"\b(list|show|which|what)\b.*\b(sop|sops)\b", q):
+        intents.add("sop_list")
+    if re.search(r"\b(summarize|summary|brief|gist)\b", q):
+        intents.add("summary")
+    if re.search(r"\b(compare|difference|vs|versus)\b", q):
+        intents.add("compare")
+    if re.search(r"\b(linked|related)\b.*\b(capa|capas|audit|audits|decision|decisions|deviation|deviations)\b", q):
+        intents.add("linked")
+    if re.search(r"\b(this sop|current sop|active sop)\b", q):
+        intents.add("active_sop")
+    return intents
+
+
+def _summarize_live_context(assistant_context: dict | None, question: str = "") -> str:
+    ctx = assistant_context or {}
+    current = ctx.get("current_sop") if isinstance(ctx.get("current_sop"), dict) else {}
+    linked = ctx.get("linked_context") if isinstance(ctx.get("linked_context"), dict) else {}
+    tabs = _ctx_list(ctx.get("opened_tabs"))
+    text = str(ctx.get("editor_excerpt") or "").strip()
+    references = _ctx_list(current.get("references"))
+    intents = _query_intents(question)
+    linked_devs = _extract_refs(_ctx_list(linked.get("deviations")), ["deviation_number", "ref_number", "id"])
+    linked_capas = _extract_refs(_ctx_list(linked.get("capas")), ["capa_number", "ref_number", "id"])
+    linked_audits = _extract_refs(_ctx_list(linked.get("audits")), ["finding_number", "audit_number", "ref_number", "id"])
+    linked_decisions = _extract_refs(_ctx_list(linked.get("decisions")), ["decision_number", "ref_number", "id"])
+    related_sops = _extract_refs(_ctx_list(linked.get("related_sops")), ["sop_number", "ref_number", "id"])
+    open_sop_tabs = _extract_refs(tabs, ["docId", "label"], limit=10)
+    include_editor_excerpt = bool(text) and bool({"summary", "active_sop", "compare"} & intents)
+    excerpt = text[:1200] if include_editor_excerpt else ""
+    focus_note = ""
+    active_sop_ref = str(current.get("sop_number") or current.get("id") or "").strip()
+    if "summary" in intents and active_sop_ref:
+        focus_note = f"- Focus SOP for summary: {active_sop_ref}\n"
+    elif "compare" in intents and open_sop_tabs:
+        focus_note = f"- Compare candidates from open tabs: {', '.join(open_sop_tabs[:6])}\n"
+    return (
+        "LIVE_ASSISTANT_CONTEXT\n"
+        f"- Active SOP: {current.get('sop_number') or current.get('id') or 'unknown'} | "
+        f"title={current.get('title') or 'unknown'} | version={current.get('version') or 'unknown'} | "
+        f"status={current.get('status') or 'unknown'}\n"
+        f"- Linked deviations: {len(_ctx_list(linked.get('deviations')))} ({', '.join(linked_devs) or 'none'})\n"
+        f"- Linked CAPAs: {len(_ctx_list(linked.get('capas')))} ({', '.join(linked_capas) or 'none'})\n"
+        f"- Linked audits: {len(_ctx_list(linked.get('audits')))} ({', '.join(linked_audits) or 'none'})\n"
+        f"- Linked decisions: {len(_ctx_list(linked.get('decisions')))} ({', '.join(linked_decisions) or 'none'})\n"
+        f"- Related SOPs: {len(_ctx_list(linked.get('related_sops')))} ({', '.join(related_sops) or 'none'})\n"
+        f"- Open tabs: {len(tabs)}\n"
+        f"{focus_note}"
+        f"- References in editor metadata: {', '.join(str(r) for r in references[:10]) or 'none'}\n"
+        f"- Editor text excerpt: {excerpt if excerpt else 'not injected for this query intent'}"
+    )
+
+
+def _resolve_sop_from_context(db, assistant_context: dict | None, question: str) -> SOP | None:
+    ctx = assistant_context or {}
+    current = ctx.get("current_sop") if isinstance(ctx.get("current_sop"), dict) else {}
+    for raw_id in [current.get("id"), current.get("sop_number"), ctx.get("current_document_id")]:
+        value = str(raw_id or "").strip()
+        if not value:
+            continue
+        try:
+            doc_uuid = uuid.UUID(value)
+            sop = db.query(SOP).filter(SOP.id == doc_uuid, SOP.is_active == True).first()  # noqa: E712
+        except ValueError:
+            sop = db.query(SOP).filter(SOP.sop_number.ilike(value), SOP.is_active == True).first()  # noqa: E712
+        if sop:
+            return sop
+    match = SOP_REF_PATTERN.search(question or "")
+    if match:
+        return db.query(SOP).filter(
+            SOP.sop_number.ilike(match.group(0).upper()),
+            SOP.is_active == True,  # noqa: E712
+        ).first()
+    return None
+
+
+def _title_from_question(question: str) -> str:
+    q = (question or "").strip()
+    m = re.search(r"(?:title|named|called)\s*[:\-]?\s*([A-Za-z0-9 _\-/]{4,120})", q, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    for_match = re.search(r"\bfor\s+([A-Za-z0-9 _\-/]{3,120})", q, re.IGNORECASE)
+    if for_match:
+        core = for_match.group(1).strip(" .")
+        if core:
+            return f"{core.title()} SOP"
+    cleaned = re.sub(r"\b(create|new|add|generate|draft)\b", "", q, flags=re.IGNORECASE).strip(" :.-")
+    cleaned = re.sub(r"\b(an?|the)\b", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"\bsop\b", "", cleaned, flags=re.IGNORECASE).strip(" :.-")
+    return cleaned[:120] if cleaned else "Untitled SOP"
+
+
+def _build_minimal_tiptap_doc(text: str) -> dict:
+    content = str(text or "").strip()
+    lines = [line.strip() for line in re.split(r"\r?\n+", content) if line.strip()]
+    if not lines:
+        lines = ["New SOP draft"]
+    blocks = [
+        {"type": "paragraph", "content": [{"type": "text", "text": line[:1200]}]}
+        for line in lines[:80]
+    ]
+    return {
+        "type": "doc",
+        "content": blocks,
+    }
+
+
+def _plan_sop_action(question: str, assistant_context: dict | None) -> dict | None:
+    q = (question or "")
+    if ACTION_INTENT_DELETE.search(q):
+        preview_target = {}
+        ctx = assistant_context or {}
+        current = ctx.get("current_sop") if isinstance(ctx.get("current_sop"), dict) else {}
+        preview_target["sop_number"] = current.get("sop_number") or current.get("documentId") or ""
+        preview_target["title"] = current.get("title") or ""
+        return {"type": "delete_sop", "requires_confirmation": True, "target": preview_target}
+    if ACTION_INTENT_CREATE.search(q):
+        return {"type": "create_sop", "requires_confirmation": False}
+    if ACTION_INTENT_UPDATE.search(q):
+        mode = "append" if re.search(r"\badd\b.*\bsection\b", q, re.IGNORECASE) else "replace"
+        return {"type": "update_sop", "requires_confirmation": False, "mode": mode}
+    return None
+
+
+def _execute_sop_action(
+    action_type: str,
+    question: str,
+    assistant_context: dict | None,
+    generated_text: str = "",
+    mode: str = "replace",
+) -> dict | None:
+    if not action_type:
+        return None
+    db = SessionLocal()
+    try:
+        if action_type == "delete_sop":
+            sop = _resolve_sop_from_context(db, assistant_context, question)
+            if not sop:
+                return {"type": "delete_sop", "ok": False, "message": "No active SOP could be resolved for deletion."}
+            logger.info("[assistant-delete] requested sop_id=%s sop_number=%s current_is_active=%s", sop.id, sop.sop_number, sop.is_active)
+            sop.is_active = False
+            db.commit()
+            db.refresh(sop)
+            logger.info("[assistant-delete] committed sop_id=%s sop_number=%s persisted_is_active=%s", sop.id, sop.sop_number, sop.is_active)
+            return {
+                "type": "delete_sop",
+                "ok": True,
+                "sop_id": str(sop.id),
+                "sop_number": sop.sop_number,
+                "message": f"SOP {sop.sop_number} was soft deleted.",
+            }
+
+        if action_type == "update_sop":
+            sop = _resolve_sop_from_context(db, assistant_context, question)
+            if not sop:
+                return {"type": "update_sop", "ok": False, "message": "No active SOP could be resolved for update."}
+            current = (
+                db.query(SOPVersion).filter(SOPVersion.id == sop.current_version_id).first()
+                if sop.current_version_id else
+                db.query(SOPVersion).filter(SOPVersion.sop_id == sop.id).order_by(SOPVersion.created_at.desc()).first()
+            )
+            if not current:
+                return {"type": "update_sop", "ok": False, "message": "Current SOP version not found."}
+            current_text = _extract_text_from_tiptap((current.content_json or {}))
+            llm_text = str(generated_text or "").strip()
+            if mode == "append" and llm_text:
+                next_text = f"{current_text}\n\n{llm_text}".strip()
+            else:
+                next_text = llm_text or current_text
+            current.content_json = _build_minimal_tiptap_doc(next_text[:18000])
+            db.commit()
+            return {
+                "type": "update_sop",
+                "ok": True,
+                "sop_id": str(sop.id),
+                "sop_number": sop.sop_number,
+                "message": f"SOP {sop.sop_number} was updated.",
+            }
+
+        if action_type == "create_sop":
+            title = _title_from_question(question)
+            sop_number = f"SOP-{uuid.uuid4().hex[:8].upper()}"
+            while db.query(SOP).filter(SOP.sop_number == sop_number).first():
+                sop_number = f"SOP-{uuid.uuid4().hex[:8].upper()}"
+            sop_id = uuid.uuid4()
+            ver_id = uuid.uuid4()
+            tenant_row = db.query(SOP.tenant_id).first()
+            tenant_id = tenant_row[0] if tenant_row else uuid.UUID("00000000-0000-0000-0000-000000000000")
+            sop = SOP(
+                id=sop_id,
+                tenant_id=tenant_id,
+                sop_number=sop_number,
+                title=title,
+                department="Quality",
+                is_active=True,
+                current_version_id=ver_id,
+            )
+            draft_text = str(generated_text or "").strip()
+            version = SOPVersion(
+                id=ver_id,
+                sop_id=sop_id,
+                version_number="1",
+                external_status="draft",
+                content_json=_build_minimal_tiptap_doc(draft_text[:8000]),
+                metadata_json={"sopStatus": "draft", "sopMetadata": {"title": title, "documentId": sop_number}},
+            )
+            db.add(sop)
+            db.add(version)
+            db.commit()
+            return {
+                "type": "create_sop",
+                "ok": True,
+                "sop_id": str(sop_id),
+                "sop_number": sop_number,
+                "title": title,
+                "message": f"Created new SOP {sop_number}.",
+            }
+    finally:
+        db.close()
+    return None
+
+
 @ai_router.post("/api/ai/action", response_model=AIActionResponse)
 async def perform_ai_action(payload: AIActionRequest):
     """
@@ -952,6 +1207,42 @@ async def query_ai(payload: dict):
 
     category = payload.get("category")
     chat_history = payload.get("chat_history") or []
+    assistant_context = payload.get("assistant_context") or {}
+    assistant_action_confirmation = payload.get("assistant_action_confirmation") or {}
+    intents = _query_intents(question)
+    context_summary = _summarize_live_context(assistant_context, question)
+    action_plan = _plan_sop_action(question, assistant_context)
+    action_result = None
+    pending_confirmation = (
+        isinstance(action_plan, dict)
+        and action_plan.get("type") == "delete_sop"
+        and action_plan.get("requires_confirmation")
+    )
+    question_for_rag = f"{question}\n\n{context_summary}"
+    current_sop = assistant_context.get("current_sop") if isinstance(assistant_context.get("current_sop"), dict) else {}
+    active_ref = str(current_sop.get("sop_number") or current_sop.get("id") or "").strip()
+    if "summary" in intents and active_ref:
+        question_for_rag += (
+            f"\n\nRAG_FOCUS_INSTRUCTION: The user is asking a summary. "
+            f"Prioritize this active SOP only: {active_ref}. "
+            "If additional records are retrieved, treat them as secondary context."
+        )
+    if "linked" in intents:
+        question_for_rag += (
+            "\n\nRAG_FOCUS_INSTRUCTION: The user asked about linked entities. "
+            "Prioritize linked CAPA/Audit/Decision/Deviation evidence and return concrete linked records."
+        )
+    if "compare" in intents:
+        question_for_rag += (
+            "\n\nRAG_FOCUS_INSTRUCTION: The user asked for comparison. "
+            "Compare only explicitly referenced SOPs or open-tab SOP candidates from live context."
+        )
+    if action_plan:
+        question_for_rag = (
+            f"{question_for_rag}\n\n"
+            f"PLANNED_ASSISTANT_ACTION: {action_plan}\n"
+            "Use this planned action and live context while answering."
+        )
 
     # RAG is the default source of truth. Local DB primary mode is opt-in only
     # for diagnostics and should not be used in normal semantic chatbot flow.
@@ -959,10 +1250,10 @@ async def query_ai(payload: dict):
         # Run in a worker thread so SQLAlchemy work does not block the event loop
         # (avoids piling up slow requests, nginx timeouts, and a stuck-feeling UI).
         return await asyncio.to_thread(
-            _build_local_db_chat_response, question, chat_history, category
+            _build_local_db_chat_response, question_for_rag, chat_history, category
         )
 
-    db_fallback_response = _build_sop_db_fallback(question, chat_history)
+    db_fallback_response = _build_sop_db_fallback(question_for_rag, chat_history)
 
     fallback_answer = (
         "Chatbot is taking longer than expected to fetch knowledge context. "
@@ -978,7 +1269,7 @@ async def query_ai(payload: dict):
         result = await asyncio.wait_for(
             asyncio.to_thread(
                 rag.invoke,
-                question,
+                question_for_rag,
                 category,
                 chat_history,
             ),
@@ -1048,7 +1339,49 @@ async def query_ai(payload: dict):
         "suggestions": result.get("suggestions", []),
         "retrieval_stats": result.get("retrieval_stats", {}),
         "routed_to": result.get("routed_to", ""),
+        "assistant_action": action_result or action_plan,
     }
+
+    if pending_confirmation and not bool(assistant_action_confirmation.get("confirmed")):
+        response["assistant_action"] = {
+            **(action_plan or {}),
+            "requires_confirmation": True,
+        }
+        response["answer"] = (
+            "I can delete the active SOP, but I need your confirmation first. "
+            "Please confirm deletion in the in-app modal."
+        )
+        return response
+
+    if action_plan and action_plan.get("type") == "delete_sop" and bool(assistant_action_confirmation.get("confirmed")):
+        action_result = await asyncio.to_thread(
+            _execute_sop_action, "delete_sop", question, assistant_context, "", "replace"
+        )
+        response["assistant_action"] = action_result
+        if action_result and action_result.get("ok"):
+            response["answer"] = (
+                f"{response.get('answer', '')}\n\n"
+                f"Action completed: {action_result.get('message', 'SOP deleted.')}"
+            ).strip()
+        return response
+
+    if action_plan and action_plan.get("type") in {"create_sop", "update_sop"}:
+        llm_generated = result.get("answer", "")
+        mode = action_plan.get("mode", "replace")
+        action_result = await asyncio.to_thread(
+            _execute_sop_action,
+            action_plan["type"],
+            question,
+            assistant_context,
+            llm_generated,
+            mode,
+        )
+        response["assistant_action"] = action_result
+        if action_result and action_result.get("ok"):
+            response["answer"] = (
+                f"{response.get('answer', '')}\n\n"
+                f"Action completed: {action_result.get('message', 'Done.')}"
+            ).strip()
 
     answer_text = (response.get("answer") or "").strip().lower()
     rag_weak = (
