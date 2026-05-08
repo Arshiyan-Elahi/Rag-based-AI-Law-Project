@@ -4,10 +4,11 @@ import { Send, Zap } from 'lucide-react'
 import { nowTime, runUnifiedAssistantQuery, getAssistantRouteMeta, toHtml } from '../../utils/chatAssistant'
 import { createDocument } from '../../api/editorApi'
 import { htmlToPlainText, deriveSopTitleFromText, plainTextToTiptapDoc } from '../../utils/chatSopSave'
-import { getAssistantContextStorageKeys } from '../../utils/assistantContext'
+import { getAssistantContextStorageKeys, resetAssistantStateOnce } from '../../utils/assistantContext'
 import './DashboardComponents.css'
 
 const STORAGE_KEY_BY_PATH = 'ai_widget_messages_by_path_v3_reset'
+resetAssistantStateOnce()
 
 export default function AIWidget() {
   const location = useLocation()
@@ -135,6 +136,7 @@ export default function AIWidget() {
         pathname: location.pathname,
         chatHistory: chatHistoryPayload,
         assistantActionConfirmation: opts.assistantActionConfirmation || null,
+        surface: 'kl_assistant',
       })
       const action = result?.assistant_action
       if (action?.requires_confirmation && action?.type === 'delete_sop') {

@@ -1,6 +1,7 @@
 import React from 'react'
 import { AlertTriangle, Check, Info, Sparkles, Wand2, X } from 'lucide-react'
 import './AIAssistantUI.css'
+import { formatAiSuggestionForUi } from '../../utils/aiOutputFormatter'
 
 const TITLES = {
   gap_check: 'QA Gap Check',
@@ -9,7 +10,7 @@ const TITLES = {
 }
 
 const StructuredDetails = ({ action, structuredData, suggestedText }) => {
-  if (!structuredData) return null
+  if (!structuredData || typeof structuredData !== 'object') return null
 
   if (action === 'gap_check') {
     const gaps = Array.isArray(structuredData.gaps) ? structuredData.gaps : []
@@ -115,6 +116,12 @@ const AIComparisonModal = ({
   sopTitle,
 }) => {
   if (!isOpen) return null
+  const safeOriginalText = typeof originalText === 'string' ? originalText : String(originalText || '')
+  const safeSuggestedHtml = formatAiSuggestionForUi({
+    action,
+    suggestedText,
+    structuredData,
+  })
 
   return (
     <div className="ai-modal-overlay">
@@ -158,14 +165,14 @@ const AIComparisonModal = ({
             <div className="ai-diff-card">
               <div className="ai-diff-card__header">Before</div>
               <div className="ai-diff-card__content ai-diff-card__content--before">
-                {originalText || 'No original text available.'}
+                {safeOriginalText || 'No original text available.'}
               </div>
             </div>
             <div className="ai-diff-card">
               <div className="ai-diff-card__header ai-diff-card__header--after">After (AI Suggestion)</div>
               <div
                 className="ai-diff-card__content ai-diff-card__content--after tiptap"
-                dangerouslySetInnerHTML={{ __html: suggestedText || '<p>No suggestion returned.</p>' }}
+                dangerouslySetInnerHTML={{ __html: safeSuggestedHtml }}
               />
             </div>
           </div>

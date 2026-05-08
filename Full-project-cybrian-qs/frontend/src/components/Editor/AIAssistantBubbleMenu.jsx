@@ -4,6 +4,7 @@ import { Sparkles, ShieldAlert, Wand2 } from 'lucide-react'
 import { performAIAction } from '../../api/editorApi'
 import AIComparisonModal from './AIComparisonModal'
 import './AIAssistantUI.css'
+import { formatAiSuggestionForUi } from '../../utils/aiOutputFormatter'
 
 const buildStructuredSelectionText = (editor, from, to) =>
   editor.state.doc.textBetween(from, to, '\n').trim()
@@ -245,8 +246,15 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true }) => {
         section_type: sectionType,
       })
 
+      const safeSuggestedText = formatAiSuggestionForUi({
+        action: result?.action || action,
+        suggestedText: result?.suggested_text,
+        structuredData: result?.structured_data,
+      })
+
       setAIResult({
         ...result,
+        suggested_text: safeSuggestedText,
         section_name: sectionName,
       })
       setIsModalOpen(true)

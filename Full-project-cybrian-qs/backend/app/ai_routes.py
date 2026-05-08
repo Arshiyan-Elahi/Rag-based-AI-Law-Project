@@ -11,6 +11,7 @@ from html import escape
 import re
 import os
 import math
+import time
 import threading
 import asyncio
 import uuid
@@ -33,6 +34,7 @@ from schemas.sop_actions import ActionRequest, GapCheckResponse, ImproveResponse
 from .schemas import AIActionRequest, AIActionResponse
 from .database import SessionLocal
 from .models import SOP, SOPVersion, Deviation, Capa, AuditFinding, Decision
+from chatbot.llm.provider import get_local_llm_config, is_local_llm_unreachable_error
 
 # RAG-specific imports are lazy-loaded inside _get_smart_rag_chain()
 # to avoid ModuleNotFoundError when running without the RAG chatbot modules.
@@ -61,6 +63,17 @@ ACTION_INTENT_UPDATE = re.compile(
     r"\b(add)\b.*\b(section)\b.*\b(current sop|this sop)\b",
     re.IGNORECASE,
 )
+
+
+def _is_prompt_too_large_error(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    return (
+        "context length" in msg
+        or "n_keep" in msg
+        or "prompt is too long" in msg
+        or "maximum context length" in msg
+        or "too many tokens" in msg
+    )
 
 
 def _get_smart_rag_chain() -> Any:
@@ -711,28 +724,48 @@ def _action_output_token_budget(input_chars: int) -> int:
     """
     Long selected text needs a larger output budget; JSON + improved copy can exceed 1–2k tokens.
     """
-    cap = int(os.getenv("GEMINI_ACTION_MAX_OUTPUT_TOKENS_CAP", "8192"))
+    cap = int(os.getenv("ACTION_MAX_OUTPUT_TOKENS_CAP", "8192"))
     if input_chars <= 0:
-        return int(os.getenv("GEMINI_ACTION_MAX_OUTPUT_TOKENS") or "4096")
+        return int(os.getenv("ACTION_MAX_OUTPUT_TOKENS") or "4096")
     return min(cap, max(2048, int(input_chars * 0.45) + 1200))
 
 
 def _call_action_llm(runtime: Any, prompt: str, *, input_char_budget: int = 0) -> str:
     parser = StrOutputParser()
     n = _action_output_token_budget(input_char_budget) if input_char_budget else int(
-        os.getenv("GEMINI_ACTION_MAX_OUTPUT_TOKENS") or "4096"
+        os.getenv("ACTION_MAX_OUTPUT_TOKENS") or "4096"
     )
     try:
-        return (runtime.llm.bind(max_output_tokens=n) | parser).invoke(prompt)
+        return (runtime.llm.bind(max_tokens=n) | parser).invoke(prompt)
     except Exception:
-        return (runtime.fallback_llm.bind(max_output_tokens=n) | parser).invoke(prompt)
+        return (runtime.fallback_llm.bind(max_tokens=n) | parser).invoke(prompt)
 
 
 def _render_dynamic_text(text: str) -> str:
-    lines = [line.strip() for line in re.split(r"\r?\n+", text or "") if line.strip()]
+    cleaned = _normalize_gap_check_analysis_text(text or "")
+    lines = [line.strip() for line in re.split(r"\r?\n+", cleaned) if line.strip()]
     if not lines:
         return "<p>No suggestion returned.</p>"
     return "".join(f"<p>{escape(line)}</p>" for line in lines)
+
+
+def _normalize_gap_check_analysis_text(text: str) -> str:
+    t = text or ""
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+    t = re.sub(r"(?m)^\s*#+\s*", "", t)
+    t = t.replace("**", "")
+    t = re.sub(r"(?m)^\s*---+\s*$", "", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
+def _render_gap_check_analysis_html(analysis: str) -> str:
+    # Keep compatibility with chatbot.routes implementation so this shim
+    # never fails with NameError when gap_check is requested.
+    normalized = _normalize_gap_check_analysis_text(analysis)
+    if not normalized:
+        return "<p>No suggestion returned.</p>"
+    return _render_dynamic_text(normalized)
 
 
 def _render_dynamic_gap_check(gaps: list[dict[str, str]]) -> str:
@@ -840,7 +873,7 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
         return AIActionResponse(
             action="gap_check",
             original_text=request.section_text,
-            suggested_text=_render_dynamic_text(parsed.analysis),
+            suggested_text=_render_gap_check_analysis_html(parsed.analysis),
             explanation="Compliance-Lückenanalyse abgeschlossen / Compliance gap analysis completed.",
             structured_data={
                 "analysis": parsed.analysis,
@@ -866,7 +899,7 @@ def _fallback_gap_check(payload: AIActionRequest) -> AIActionResponse:
     return AIActionResponse(
         action="gap_check",
         original_text=_clean_text(payload.text),
-        suggested_text=_render_dynamic_text(parsed.analysis),
+        suggested_text=_render_gap_check_analysis_html(parsed.analysis),
         explanation="Compliance-Lückenanalyse abgeschlossen / Compliance gap analysis completed.",
         structured_data={"analysis": parsed.analysis},
     )
@@ -958,6 +991,8 @@ def _query_intents(question: str) -> set[str]:
         intents.add("linked")
     if re.search(r"\b(this sop|current sop|active sop)\b", q):
         intents.add("active_sop")
+    if re.search(r"\b(which|what)\b.*\b(sop)\b.*\b(currently open|open now|opened|active)\b", q):
+        intents.add("active_sop")
     return intents
 
 
@@ -998,6 +1033,38 @@ def _summarize_live_context(assistant_context: dict | None, question: str = "") 
         f"- References in editor metadata: {', '.join(str(r) for r in references[:10]) or 'none'}\n"
         f"- Editor text excerpt: {excerpt if excerpt else 'not injected for this query intent'}"
     )
+
+
+def _build_live_context_answer(intents: set[str], assistant_context: dict | None) -> str | None:
+    ctx = assistant_context or {}
+    current = ctx.get("current_sop") if isinstance(ctx.get("current_sop"), dict) else {}
+    linked = ctx.get("linked_context") if isinstance(ctx.get("linked_context"), dict) else {}
+
+    if "active_sop" in intents:
+        sop_ref = str(current.get("sop_number") or current.get("id") or "").strip()
+        if not sop_ref:
+            return None
+        title = str(current.get("title") or "unknown").strip() or "unknown"
+        version = str(current.get("version") or "unknown").strip() or "unknown"
+        status = str(current.get("status") or "unknown").strip() or "unknown"
+        return (
+            f"The currently open SOP is {sop_ref}. "
+            f"Title: {title}. Version: {version}. Status: {status}."
+        )
+
+    if "linked" in intents:
+        dev_refs = _extract_refs(_ctx_list(linked.get("deviations")), ["deviation_number", "ref_number", "id"], limit=12)
+        capa_refs = _extract_refs(_ctx_list(linked.get("capas")), ["capa_number", "ref_number", "id"], limit=12)
+        audit_refs = _extract_refs(_ctx_list(linked.get("audits")), ["finding_number", "audit_number", "ref_number", "id"], limit=12)
+        if not (dev_refs or capa_refs or audit_refs):
+            return None
+        return (
+            f"Linked Deviations ({len(dev_refs)}): {', '.join(dev_refs) if dev_refs else 'none'}.\n"
+            f"Linked CAPAs ({len(capa_refs)}): {', '.join(capa_refs) if capa_refs else 'none'}.\n"
+            f"Linked Audits ({len(audit_refs)}): {', '.join(audit_refs) if audit_refs else 'none'}."
+        )
+
+    return None
 
 
 def _resolve_sop_from_context(db, assistant_context: dict | None, question: str) -> SOP | None:
@@ -1207,6 +1274,23 @@ async def query_ai(payload: dict):
 
     category = payload.get("category")
     chat_history = payload.get("chat_history") or []
+    surface = str(payload.get("surface") or "unknown").strip().lower()
+    route = str(payload.get("route") or "").strip()
+    t0 = time.perf_counter()
+    cfg = get_local_llm_config()
+    logger.info(
+        "[chatbot-request] surface=%s route=%s provider=%s model=%s category=%s qlen=%s",
+        surface,
+        route,
+        cfg.provider,
+        cfg.model,
+        category or "auto",
+        len(question),
+    )
+    print(
+        f"[chatbot-request] surface={surface} route={route or '-'} provider={cfg.provider} model={cfg.model} category={category or 'auto'} qlen={len(question)}",
+        flush=True,
+    )
     assistant_context = payload.get("assistant_context") or {}
     assistant_action_confirmation = payload.get("assistant_action_confirmation") or {}
     intents = _query_intents(question)
@@ -1218,25 +1302,61 @@ async def query_ai(payload: dict):
         and action_plan.get("type") == "delete_sop"
         and action_plan.get("requires_confirmation")
     )
-    question_for_rag = f"{question}\n\n{context_summary}"
+    question_for_rag = question
+    context_hints: list[str] = []
     current_sop = assistant_context.get("current_sop") if isinstance(assistant_context.get("current_sop"), dict) else {}
     active_ref = str(current_sop.get("sop_number") or current_sop.get("id") or "").strip()
+    logger.info(
+        "[chatbot-intent] surface=%s intents=%s active_ref=%s",
+        surface,
+        sorted(intents),
+        active_ref or "none",
+    )
+    print(
+        f"[chatbot-intent] surface={surface} intents={sorted(intents)} active_ref={active_ref or 'none'}",
+        flush=True,
+    )
+    if ("active_sop" in intents) and active_ref:
+        category = "sops"
     if "summary" in intents and active_ref:
-        question_for_rag += (
-            f"\n\nRAG_FOCUS_INSTRUCTION: The user is asking a summary. "
-            f"Prioritize this active SOP only: {active_ref}. "
-            "If additional records are retrieved, treat them as secondary context."
-        )
+        context_hints.append(f"ACTIVE_SOP={active_ref}")
     if "linked" in intents:
-        question_for_rag += (
-            "\n\nRAG_FOCUS_INSTRUCTION: The user asked about linked entities. "
-            "Prioritize linked CAPA/Audit/Decision/Deviation evidence and return concrete linked records."
-        )
+        context_hints.append("INTENT=LINKED_ENTITIES")
     if "compare" in intents:
-        question_for_rag += (
-            "\n\nRAG_FOCUS_INSTRUCTION: The user asked for comparison. "
-            "Compare only explicitly referenced SOPs or open-tab SOP candidates from live context."
+        context_hints.append("INTENT=COMPARE_SOPS")
+    if ("active_sop" in intents) and active_ref:
+        context_hints.append(f"FOCUS_REF={active_ref}")
+    live_context_answer = _build_live_context_answer(intents, assistant_context)
+    if live_context_answer:
+        response = {
+            "answer": live_context_answer,
+            "sources": [],
+            "citations": [],
+            "retrieval_debug": [],
+            "suggestions": [],
+            "retrieval_stats": {
+                "provider": cfg.provider,
+                "model": cfg.model,
+                "source": "live_context",
+                "surface": surface,
+                "intents": sorted(intents),
+                "latency_ms_total": round((time.perf_counter() - t0) * 1000.0, 1),
+            },
+            "routed_to": "live-context",
+            "assistant_action": action_result or action_plan,
+        }
+        logger.info(
+            "[chatbot-response] source=live_context surface=%s intents=%s latency_ms=%.1f",
+            surface,
+            sorted(intents),
+            (time.perf_counter() - t0) * 1000.0,
         )
+        return response
+    if context_hints:
+        question_for_rag = f"{question_for_rag}\n\nRAG_HINTS: {' | '.join(context_hints)}"
+    elif action_plan:
+        # Include tiny context summary only for action-intent alignment.
+        question_for_rag = f"{question_for_rag}\n\n{context_summary[:500]}"
     if action_plan:
         question_for_rag = (
             f"{question_for_rag}\n\n"
@@ -1246,67 +1366,71 @@ async def query_ai(payload: dict):
 
     # RAG is the default source of truth. Local DB primary mode is opt-in only
     # for diagnostics and should not be used in normal semantic chatbot flow.
-    if CHATBOT_USE_LOCAL_DB and CHATBOT_ALLOW_LOCAL_DB_PRIMARY:
+    allow_local_db_bypass = bool(payload.get("allow_local_db_primary")) and CHATBOT_USE_LOCAL_DB and CHATBOT_ALLOW_LOCAL_DB_PRIMARY
+    if allow_local_db_bypass:
         # Run in a worker thread so SQLAlchemy work does not block the event loop
         # (avoids piling up slow requests, nginx timeouts, and a stuck-feeling UI).
-        return await asyncio.to_thread(
+        response = await asyncio.to_thread(
             _build_local_db_chat_response, question_for_rag, chat_history, category
         )
-
-    db_fallback_response = _build_sop_db_fallback(question_for_rag, chat_history)
-
-    fallback_answer = (
-        "Chatbot is taking longer than expected to fetch knowledge context. "
-        "Please try again in a few seconds, or ask a more specific question "
-        "(for example with an SOP/DEV/CAPA ID)."
-    )
+        logger.info(
+            "[chatbot-response] source=local-db-primary latency_ms=%.1f",
+            (time.perf_counter() - t0) * 1000.0,
+        )
+        return response
 
     try:
         rag = await asyncio.wait_for(
             asyncio.to_thread(_get_smart_rag_chain),
             timeout=CHAT_QUERY_TIMEOUT_SECONDS,
         )
-        result = await asyncio.wait_for(
-            asyncio.to_thread(
-                rag.invoke,
-                question_for_rag,
-                category,
-                chat_history,
-            ),
-            timeout=CHAT_QUERY_TIMEOUT_SECONDS,
-        )
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    rag.invoke,
+                    question_for_rag,
+                    category,
+                    chat_history,
+                ),
+                timeout=CHAT_QUERY_TIMEOUT_SECONDS,
+            )
+        except Exception as first_exc:
+            if _is_prompt_too_large_error(first_exc) and question_for_rag != question:
+                logger.warning(
+                    "[chatbot-request] prompt too large; retrying compact query path"
+                )
+                compact_history = (chat_history or [])[-4:]
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        rag.invoke,
+                        question,
+                        category,
+                        compact_history,
+                    ),
+                    timeout=CHAT_QUERY_TIMEOUT_SECONDS,
+                )
+            else:
+                raise
     except (TimeoutError, asyncio.TimeoutError):
-        if db_fallback_response is not None:
-            return db_fallback_response
-        return {
-            "answer": fallback_answer,
-            "sources": [],
-            "citations": [],
-            "retrieval_debug": [],
-            "suggestions": [
-                "Try again in a few seconds",
-                "Ask with an exact SOP/DEV/CAPA number",
-                "Use a shorter, specific question",
-            ],
-            "retrieval_stats": {"timeout": True},
-            "routed_to": "timeout-fallback",
-        }
-    except Exception:
-        if db_fallback_response is not None:
-            return db_fallback_response
-        return {
-            "answer": fallback_answer,
-            "sources": [],
-            "citations": [],
-            "retrieval_debug": [],
-            "suggestions": [
-                "Retry the same question",
-                "Check chatbot credentials in backend .env",
-                "Ask with a specific document ID",
-            ],
-            "retrieval_stats": {"error": True},
-            "routed_to": "error-fallback",
-        }
+        raise HTTPException(
+            status_code=504,
+            detail="RAG request timed out. Please retry with a shorter or more specific query.",
+        )
+    except Exception as exc:
+        if is_local_llm_unreachable_error(exc):
+            logger.error(
+                "[chatbot-response] source=error reason=llm_unreachable latency_ms=%.1f error=%s",
+                (time.perf_counter() - t0) * 1000.0,
+                str(exc),
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Local LLM server unreachable ({cfg.base_url}, model={cfg.model}). "
+                    "Please ensure the local model service is running."
+                ),
+            )
+        raise HTTPException(status_code=500, detail=f"Chatbot query failed: {exc}")
 
     def _json_safe_citations(cits: list) -> list:
         out = []
@@ -1389,7 +1513,31 @@ async def query_ai(payload: dict):
         or "no relevant information found" in answer_text
         or "do not contain sufficient detail" in answer_text
     )
-    if rag_weak and db_fallback_response is not None:
-        return db_fallback_response
+    if rag_weak:
+        response["answer"] = "Sorry, I do not have enough information about this."
+        response["citations"] = []
+        response["sources"] = []
+        response["retrieval_debug"] = []
 
+    response.setdefault("retrieval_stats", {})
+    response["retrieval_stats"].update(
+        {
+            "provider": cfg.provider,
+            "model": cfg.model,
+            "source": "rag",
+            "surface": surface,
+            "intents": sorted(intents),
+            "latency_ms_total": round((time.perf_counter() - t0) * 1000.0, 1),
+        }
+    )
+    logger.info(
+        "[chatbot-response] source=rag routed_to=%s citations=%s latency_ms=%.1f",
+        response.get("routed_to", ""),
+        len(citations),
+        (time.perf_counter() - t0) * 1000.0,
+    )
+    print(
+        f"[chatbot-response] source=rag routed_to={response.get('routed_to', '')} citations={len(citations)} latency_ms={(time.perf_counter() - t0) * 1000.0:.1f}",
+        flush=True,
+    )
     return response

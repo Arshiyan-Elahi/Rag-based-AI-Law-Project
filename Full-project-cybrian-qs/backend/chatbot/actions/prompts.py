@@ -130,17 +130,30 @@ KEINE JSON-Struktur — nur lesbaren Fließtext mit nummerierten Punkten.
 Write a clear, well-structured, human-readable analysis.
 NO JSON structure — only readable text with numbered points.
 
-Format deine Antwort so / Format your response like this:
+Format deine Antwort so / Format your response like this (PLAIN TEXT only; NO markdown tokens):
 
-**Compliance-Lückenanalyse: {request.section_title}**
+Rules:
+- Use exactly these headings (one heading per line): `Summary`, `Identified Gaps`, `Risk/Impact`, `Recommended Fixes`, `Suggested SOP Text`
+- After a heading line, write related content until the next heading.
+- Do NOT use markdown: no `###`, no `**`, no `---`, no bullet symbols like `•`.
+- Use numbered items for lists (e.g. `1. ...`, `2. ...`). Keep spacing tight: at most one empty line between sections.
+- Language: write the content in the same language as the input, but keep the headings exactly as written above (English).
 
-[Für jede gefundene Lücke / For each gap found:]
-**N. [Lückentitel / Gap Title]**
-Problem: [Kurze Erklärung warum dies eine GMP/regulatorische Anforderung verletzt]
-Empfehlung: [Konkreter, einfügbereiter SOP-Text zur Behebung der Lücke]
+Template:
+Summary:
+<1 short paragraph with overall compliance gap status>
 
-[Falls keine Lücken gefunden / If no gaps found:]
-✅ Keine Compliance-Lücken identifiziert. Der Text entspricht den GMP/QA-Anforderungen.
+Identified Gaps:
+1. <Gap title + what is missing/unclear>
+
+Risk/Impact:
+1. <Risk/impact tied to Identified Gaps item 1>
+
+Recommended Fixes:
+1. <Concrete remediation direction tied to Identified Gaps item 1>
+
+Suggested SOP Text:
+<If applicable: SOP-ready replacement/addition text. If not applicable: write `N/A`>
 
 Gib NUR eine gültige JSON-Antwort zurück / Return ONLY a valid JSON:
 {{

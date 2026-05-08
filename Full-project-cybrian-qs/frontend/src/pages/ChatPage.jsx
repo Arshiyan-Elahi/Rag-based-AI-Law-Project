@@ -12,11 +12,12 @@ import {
   toHtml,
 } from '../utils/chatAssistant'
 import { deriveSopTitleFromText, htmlToPlainText, plainTextToTiptapDoc } from '../utils/chatSopSave'
-import { getAssistantContextStorageKeys } from '../utils/assistantContext'
+import { getAssistantContextStorageKeys, resetAssistantStateOnce } from '../utils/assistantContext'
 import './ChatPage.css'
 
 const CHAT_STORAGE_KEY = 'chat_page_conversations_v3_reset'
 const CHAT_ACTIVE_STORAGE_KEY = 'chat_page_active_conversation_v3_reset'
+resetAssistantStateOnce()
 
 function createInitialConversation() {
   return {
@@ -185,6 +186,7 @@ export default function ChatPage() {
           pathname: location.pathname,
           chatHistory: chatHistoryPayload,
           assistantActionConfirmation: opts.assistantActionConfirmation || null,
+          surface: 'global_chatbot',
         })
         const action = result?.assistant_action
         if (action?.requires_confirmation && action?.type === 'delete_sop') {

@@ -79,7 +79,7 @@ const EMPTY_DOC = {
 }
 
 const STORAGE_KEY = 'current_document_id'
-const KL_EDITOR_CONTEXT_KEY = 'kl_assistant_editor_state_v1'
+const KL_EDITOR_CONTEXT_KEY = 'kl_assistant_editor_state_v2'
 
 const EditorShortcuts = Extension.create({
   name: 'editorShortcuts',
@@ -265,6 +265,7 @@ const EditorPage = ({
   const [versionNote, setVersionNote] = useState('')
   const [isSaving, setIsSaving] = useState(false)
   const [lastSaved, setLastSaved] = useState(null)
+  const [saveNotice, setSaveNotice] = useState('')
   const [isLinkModalOpen, setIsLinkModalOpen] = useState(false)
   const [isLinkingModalOpen, setIsLinkingModalOpen] = useState(false)
   const [linkModalInitialUrl, setLinkModalInitialUrl] = useState('')
@@ -595,6 +596,8 @@ const EditorPage = ({
       }
     } catch (error) {
       console.error('Save failed:', error)
+      setSaveNotice(error?.message || 'Save failed. Please try again.')
+      window.setTimeout(() => setSaveNotice(''), 2600)
       if (error?.status === 409) {
         window.alert(
           error.message ||
@@ -647,13 +650,27 @@ const EditorPage = ({
       if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 's') return
       event.preventDefault()
       if (isHistoricalView) return
+      if (!editor || !isEditorMounted || editor.isDestroyed) {
+        setSaveNotice('Editor is not ready yet.')
+        window.setTimeout(() => setSaveNotice(''), 1800)
+        return
+      }
+      if (!documentId && !metadata?.title && !editor.getText().trim()) {
+        setSaveNotice('Nothing to save yet.')
+        window.setTimeout(() => setSaveNotice(''), 1800)
+        return
+      }
       debouncedSave.cancel()
-      persistDocument({ showSavingIndicator: true })
+      persistDocument({ showSavingIndicator: true }).catch((error) => {
+        console.error('Ctrl+S save failed:', error)
+        setSaveNotice(error?.message || 'Save failed.')
+        window.setTimeout(() => setSaveNotice(''), 2400)
+      })
     }
 
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [debouncedSave, persistDocument, isHistoricalView])
+  }, [debouncedSave, persistDocument, isHistoricalView, editor, isEditorMounted, documentId, metadata?.title])
 
   useEffect(() => {
     document.body.style.overflow = aiWidgetOpen ? 'hidden' : ''
@@ -955,6 +972,12 @@ const EditorPage = ({
                 <section className="figma-import-notice" role="status" aria-live="polite">
                   <CheckCircle2 size={15} />
                   <span>{importNotice}</span>
+                </section>
+              ) : null}
+              {saveNotice ? (
+                <section className="figma-import-notice" role="status" aria-live="polite">
+                  <CheckCircle2 size={15} />
+                  <span>{saveNotice}</span>
                 </section>
               ) : null}
               <section className="figma-editor-canvas">

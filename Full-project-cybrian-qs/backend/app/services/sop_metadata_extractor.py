@@ -913,21 +913,15 @@ def _needs_llm(d: Dict[str, str], text: str) -> bool:
 
 
 def _llm_extract(text: str) -> Optional[Dict[str, str]]:
-    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        return None
     try:
-        from langchain_google_genai import ChatGoogleGenerativeAI
-    except ImportError:
+        from chatbot.llm.provider import create_openai_client, get_local_llm_config
+    except Exception:
         return None
 
     snippet = text.strip()[:14000]
-    model = os.getenv("GEMINI_METADATA_MODEL") or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-    llm = ChatGoogleGenerativeAI(
-        model=model,
-        temperature=0,
-        max_output_tokens=1024,
-    )
+    cfg = get_local_llm_config()
+    model = os.getenv("LOCAL_LLM_METADATA_MODEL") or cfg.model
+    client = create_openai_client()
     prompt = (
         "You extract structured metadata from SOP (Standard Operating Procedure) document text. "
         "The text may be German or English. Return ONLY a compact JSON object with these keys:\n"
@@ -942,8 +936,12 @@ def _llm_extract(text: str) -> Optional[Dict[str, str]]:
         "Do not wrap in markdown. No explanation.\n\n---\n" + snippet
     )
     try:
-        msg = llm.invoke(prompt)
-        raw = (msg.content or "").strip()
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+        )
+        raw = ((response.choices[0].message.content if response.choices else "") or "").strip()
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```\s*$", "", raw)
         data = json.loads(raw)

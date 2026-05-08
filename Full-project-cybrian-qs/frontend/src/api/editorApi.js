@@ -241,6 +241,12 @@ export async function queryAI(question, options = {}) {
   if (options.assistant_action_confirmation && typeof options.assistant_action_confirmation === 'object') {
     payload.assistant_action_confirmation = options.assistant_action_confirmation
   }
+  if (options.surface) {
+    payload.surface = options.surface
+  }
+  if (options.route) {
+    payload.route = options.route
+  }
 
   const controller = new AbortController()
   const timeoutMs = 70000

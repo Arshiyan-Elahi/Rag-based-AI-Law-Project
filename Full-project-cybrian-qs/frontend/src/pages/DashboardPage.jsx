@@ -65,7 +65,7 @@ export default function DashboardPage() {
     setAiError(null)
     setAiResponse(null)
     try {
-      const result = await queryAI(query.trim())
+      const result = await queryAI(query.trim(), { surface: 'global_chatbot', route: '/dashboard' })
       setAiResponse({
         query: query.trim(),
         text: result.answer || result.text || result.response || '',

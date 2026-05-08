@@ -14,7 +14,7 @@ import SOPTable from '../components/SOPs/SOPTable'
 import StatusBadge from '../components/Common/StatusBadge'
 import './SOPsPage.css'
 const EditorPage = lazy(() => import('./EditorPage'))
-const KL_WORKSPACE_CONTEXT_KEY = 'kl_assistant_workspace_state_v1'
+const KL_WORKSPACE_CONTEXT_KEY = 'kl_assistant_workspace_state_v2'
 
 // ── Quick filter suggestions (UI labels only — not mock data) ──────────────
 const quickFilters = [
@@ -431,7 +431,7 @@ export default function SOPsPage() {
     if (!text) return
     setIsKIAnalyzing(true)
     setKIError('')
-    queryAI(text, { category: 'sop' })
+    queryAI(text, { category: 'sop', surface: 'knowledge_search', route: '/knowledge' })
       .then((res) => {
         setKISummaryText(res?.answer || 'Keine Antwort vom Backend erhalten.')
         setKISources(Array.isArray(res?.sources) ? res.sources : [])

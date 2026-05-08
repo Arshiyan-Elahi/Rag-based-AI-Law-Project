@@ -1,10 +1,11 @@
 import json
 import logging
 import os
-from typing import Dict, List, Optional
-from langchain_google_genai import ChatGoogleGenerativeAI
+import re
+from typing import Dict, List, Optional, Any
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from chatbot.llm.provider import create_chat_llm
 from retrieval.query_router import route_query
 
 ROUTER_PROMPT_TEMPLATE = """\
@@ -55,17 +56,14 @@ Routing rules (apply in order):
 """
 
 class LLMRouter:
-    def __init__(self, llm: Optional[ChatGoogleGenerativeAI] = None):
+    def __init__(self, llm: Optional[Any] = None):
         if llm:
             self.llm = llm
         else:
-            # Fallback to creating a fresh LLM instance if none provided
-            self.llm = ChatGoogleGenerativeAI(
-                model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+            self.llm = create_chat_llm(
                 temperature=0.0, # Zero temperature for precise classification
-                max_output_tokens=int(os.getenv("GEMINI_ROUTER_MAX_OUTPUT_TOKENS", "256")),
-                google_api_key=os.getenv("GOOGLE_API_KEY"),
-                max_retries=3,
+                max_output_tokens=int(os.getenv("ROUTER_MAX_OUTPUT_TOKENS", "256")),
+                max_retries=1,
             )
         
         self.prompt = ChatPromptTemplate.from_template(ROUTER_PROMPT_TEMPLATE)
@@ -75,9 +73,21 @@ class LLMRouter:
         """
         Routes the query using LLM and returns a dictionary with collections and filters.
         """
+        limited_query = (query or "").strip()
+        # Fast-path: deterministic keyword routing avoids an extra LLM call
+        # for most operational queries and improves response latency.
+        keyword_collections = route_query(limited_query)
+        has_explicit_id = bool(re.search(r"\b(SOP|DEV|CAPA|AUDIT|DEC)-[A-Z0-9-]+\b", limited_query, re.IGNORECASE))
+        if has_explicit_id or len(keyword_collections) == 1:
+            return {
+                "collections": keyword_collections,
+                "exact_filters": {},
+                "language": "en",
+                "query_type": "lookup" if has_explicit_id else "summarize",
+            }
+
         try:
-            limited_query = (query or "").strip()
-            max_query_chars = int(os.getenv("GEMINI_ROUTER_MAX_QUERY_CHARS", "2000"))
+            max_query_chars = int(os.getenv("ROUTER_MAX_QUERY_CHARS", "2000"))
             if max_query_chars > 0 and len(limited_query) > max_query_chars:
                 limited_query = limited_query[: max_query_chars - 1].rstrip() + "…"
             response_text = self.chain.invoke({"user_question": limited_query})
@@ -98,7 +108,7 @@ class LLMRouter:
             logging.error(f"LLM Routing failed: {e}")
             # Robust fallback to keyword-based scanner
             return {
-                "collections": route_query(query),
+                "collections": keyword_collections,
                 "exact_filters": {},
                 "language": "en",
                 "query_type": "summarize"

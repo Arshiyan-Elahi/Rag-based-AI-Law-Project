@@ -7,11 +7,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 
 from embeddings.embedder import get_embedder
+from chatbot.llm.provider import create_chat_llm
 from retrieval.hybrid_retriever import (
     HybridRetriever,
     rag_unified_enabled,
@@ -46,25 +46,19 @@ class _NoopReranker:
         return docs
 
 
-def _get_action_llm(temperature: float = 0.2) -> ChatGoogleGenerativeAI:
-    return ChatGoogleGenerativeAI(
-        model=os.getenv("GEMINI_ACTION_MODEL", os.getenv("GEMINI_MODEL", "gemini-2.5-flash")),
+def _get_action_llm(temperature: float = 0.2):
+    return create_chat_llm(
         temperature=temperature,
-        max_output_tokens=int(os.getenv("GEMINI_ACTION_MAX_OUTPUT_TOKENS") or "4096"),
-        google_api_key=os.getenv("GOOGLE_API_KEY"),
-        max_retries=3,
-        thinking_budget=int(os.getenv("GEMINI_ACTION_THINKING_BUDGET", "128")),
+        max_output_tokens=int(os.getenv("ACTION_MAX_OUTPUT_TOKENS") or "4096"),
+        max_retries=1,
     )
 
 
-def _get_action_fallback_llm(temperature: float = 0.2) -> ChatGoogleGenerativeAI:
-    return ChatGoogleGenerativeAI(
-        model=os.getenv("GEMINI_ACTION_FALLBACK_MODEL", os.getenv("GEMINI_FALLBACK_MODEL", "gemini-1.5-flash")),
+def _get_action_fallback_llm(temperature: float = 0.2):
+    return create_chat_llm(
         temperature=temperature,
-        max_output_tokens=int(os.getenv("GEMINI_ACTION_MAX_OUTPUT_TOKENS") or "4096"),
-        google_api_key=os.getenv("GOOGLE_API_KEY"),
-        max_retries=2,
-        thinking_budget=int(os.getenv("GEMINI_ACTION_FALLBACK_THINKING_BUDGET", "64")),
+        max_output_tokens=int(os.getenv("ACTION_MAX_OUTPUT_TOKENS") or "4096"),
+        max_retries=0,
     )
 
 

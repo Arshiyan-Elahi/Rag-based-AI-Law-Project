@@ -11,11 +11,11 @@ import time
 import re
 import json
 import math
+import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Literal
 
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate, HumanMessagePromptTemplate, MessagesPlaceholder
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.output_parsers import StrOutputParser
@@ -28,6 +28,7 @@ from retrieval.federated_retriever import FederatedRetriever
 from retrieval.hybrid_retriever import rag_unified_enabled
 from retrieval.query_router import route_query, describe_route
 from retrieval.llm_router import LLMRouter
+from chatbot.llm.provider import create_chat_llm, get_local_llm_config, is_local_llm_unreachable_error
 import os
 from dotenv import load_dotenv
 from app.database import SessionLocal
@@ -36,12 +37,14 @@ from app.models import SOP, Deviation, Capa, AuditFinding, Decision
 load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
 
 
-MAX_QUERY_CHARS = int(os.getenv("GEMINI_MAX_QUERY_CHARS", "4000"))
-MAX_CONTEXT_CHARS = int(os.getenv("GEMINI_MAX_CONTEXT_CHARS", "12000"))
-MAX_HISTORY_MESSAGE_CHARS = int(os.getenv("GEMINI_MAX_HISTORY_MESSAGE_CHARS", "800"))
-MAX_HISTORY_MESSAGES = int(os.getenv("GEMINI_MAX_HISTORY_MESSAGES", "8"))
-RAG_DEBUG_RETRIEVAL = os.getenv("RAG_DEBUG_RETRIEVAL", "true").strip().lower() == "true"
+MAX_QUERY_CHARS = int(os.getenv("RAG_MAX_QUERY_CHARS", "4000"))
+MAX_CONTEXT_CHARS = int(os.getenv("RAG_MAX_CONTEXT_CHARS", "12000"))
+MAX_HISTORY_MESSAGE_CHARS = int(os.getenv("RAG_MAX_HISTORY_MESSAGE_CHARS", "800"))
+MAX_HISTORY_MESSAGES = int(os.getenv("RAG_MAX_HISTORY_MESSAGES", "8"))
+RAG_DEBUG_RETRIEVAL = os.getenv("RAG_DEBUG_RETRIEVAL", "false").strip().lower() == "true"
 RAG_DEBUG_MAX_CHUNKS = int(os.getenv("RAG_DEBUG_MAX_CHUNKS", "8"))
+logger = logging.getLogger(__name__)
+RAG_STRICT_INVENTORY_MODE = os.getenv("RAG_STRICT_INVENTORY_MODE", "false").strip().lower() == "true"
 
 
 def _json_safe_float(v, default: float = 0.0) -> float:
@@ -108,28 +111,21 @@ def _build_retrieval_debug_rows(docs: List[Document], limit: int = 20) -> List[d
 # ─────────────────────────────────────────────
 # Shared LLM
 # ─────────────────────────────────────────────
-def get_llm(temperature: float = 0.2) -> ChatGoogleGenerativeAI:
-    max_tokens = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "4096"))
-    return ChatGoogleGenerativeAI(
-        model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+def get_llm(temperature: float = 0.2):
+    max_tokens = int(os.getenv("RAG_MAX_OUTPUT_TOKENS", "4096"))
+    return create_chat_llm(
         temperature=temperature,
         max_output_tokens=max_tokens,
-        google_api_key=os.getenv("GOOGLE_API_KEY"),
-        max_retries=6,
-        thinking_budget=1024,
+        max_retries=1,
     )
 
 
-def get_fallback_llm(temperature: float = 0.2) -> ChatGoogleGenerativeAI:
-    max_tokens = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "4096"))
-    fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-1.5-flash")
-    return ChatGoogleGenerativeAI(
-        model=fallback_model,
+def get_fallback_llm(temperature: float = 0.2):
+    max_tokens = int(os.getenv("RAG_MAX_OUTPUT_TOKENS", "4096"))
+    return create_chat_llm(
         temperature=temperature,
         max_output_tokens=max_tokens,
-        google_api_key=os.getenv("GOOGLE_API_KEY"),
-        max_retries=3,
-        thinking_budget=1024,
+        max_retries=0,
     )
 
 
@@ -766,7 +762,7 @@ def _strict_sop_inventory_response(
             "routing": ["sops"],
             "latency_ms": 0.0,
             "timestamp": time.time(),
-            "model": os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
+            "model": get_local_llm_config().model,
             "strict_mode": "sop_inventory",
         },
     }
@@ -895,14 +891,14 @@ class SmartRAGChain:
                     "routing": ["sop-generation"],
                     "latency_ms": round((time.time() - t0) * 1000, 1),
                     "timestamp": time.time(),
-                    "model": os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
+                    "model": get_local_llm_config().model,
                 },
             }
 
         cat_norm = (category or "").strip().lower()
         route_data = self.router.route(query)
         sop_inventory_mode: Optional[Literal["count", "list"]] = None
-        if (not cat_norm) or cat_norm == "sops":
+        if RAG_STRICT_INVENTORY_MODE and ((not cat_norm) or cat_norm == "sops"):
             sop_inventory_mode = _classify_sop_inventory_query(query)
 
         # ── Step 0: Extract Metadata Filters & Active Doc ID ──
@@ -920,8 +916,10 @@ class SmartRAGChain:
         ):
             metadata_filters.pop("ref_number", None)
 
-        print(
-            f"  [filters] extracted: {metadata_filters} | sop_inventory_mode: {sop_inventory_mode}"
+        logger.info(
+            "[rag-routing] filters=%s sop_inventory_mode=%s",
+            metadata_filters,
+            sop_inventory_mode,
         )
 
         # ── Step 1: Route query using LLM Router (Prompt 3) ──
@@ -943,7 +941,16 @@ class SmartRAGChain:
             metadata_filters.update(route_data.get("exact_filters", {}))
 
         routed_label = describe_route(target_sections)
-        print(f"  [router] '{query[:60]}' -> {target_sections} | filters: {metadata_filters}")
+        logger.info(
+            "[rag-routing] query='%s' sections=%s filters=%s",
+            (query or "")[:120],
+            target_sections,
+            metadata_filters,
+        )
+        print(
+            f"[rag-routing] sections={target_sections} filters={metadata_filters}",
+            flush=True,
+        )
 
         if sop_inventory_mode:
             sop_retriever = self.federated.retrievers.get("sops")
@@ -1027,6 +1034,20 @@ class SmartRAGChain:
                     d.metadata["_section"] = section
                 all_docs.extend(ranked)
                 per_section_counts[section] = len(ranked)
+                if ranked:
+                    top_preview = [
+                        {
+                            "ref": str((d.metadata or {}).get("ref_number") or (d.metadata or {}).get("source_id") or ""),
+                            "score": round(_json_safe_float((d.metadata or {}).get("rerank_score", 0.0)), 4),
+                            "section": str((d.metadata or {}).get("_section") or section),
+                        }
+                        for d in ranked[:5]
+                    ]
+                    logger.info("[rag-retrieval] section=%s top_chunks=%s", section, top_preview)
+                    print(
+                        f"[rag-retrieval] section={section} top_chunks={top_preview}",
+                        flush=True,
+                    )
                 if RAG_DEBUG_RETRIEVAL and ranked:
                     for i, doc in enumerate(ranked[:RAG_DEBUG_MAX_CHUNKS], 1):
                         print(_debug_chunk_summary(doc, i), flush=True)
@@ -1051,7 +1072,7 @@ class SmartRAGChain:
                 }
                 return strict_resp
             return {
-                "answer": "No relevant information found in the knowledge base for your query.",
+                "answer": "Sorry, I do not have enough information about this.",
                 "citations": [],
                 "suggestions": [
                     "Ask about a specific SOP number",
@@ -1104,6 +1125,17 @@ class SmartRAGChain:
         # ── Step 4: LLM generation ──
         query = _truncate_text(query, MAX_QUERY_CHARS)
         context_str = _truncate_text(context_str, MAX_CONTEXT_CHARS)
+        logger.info(
+            "[rag-prompt] sections=%s context_chars=%s context_preview=%s",
+            target_sections,
+            len(context_str),
+            context_str[:600].replace("\n", " "),
+        )
+        print(
+            f"[rag-prompt] sections={target_sections} context_chars={len(context_str)} preview={context_str[:350].replace(chr(10), ' ')}",
+            flush=True,
+        )
+        llm_source = "primary"
         try:
             history_focus = f"HISTORY FOCUS: Priority should be given to {active_doc_id} as it was discussed recently." if active_doc_id else ""
             raw_answer = (self.prompt | self.llm | StrOutputParser()).invoke({
@@ -1113,9 +1145,12 @@ class SmartRAGChain:
                 "history_focus": history_focus,
             })
         except Exception as e:
+            if is_local_llm_unreachable_error(e):
+                raise
             err = str(e).lower()
             if "503" in err or "unavailable" in err or "high demand" in err:
                 fallback_llm = get_fallback_llm()
+                llm_source = "fallback"
                 raw_answer = (self.prompt | fallback_llm | StrOutputParser()).invoke({
                     "context":      context_str,
                     "question":     query,
@@ -1173,6 +1208,14 @@ class SmartRAGChain:
                 seen_docs.add(source_id)
 
         latency_ms = round((time.time() - t0) * 1000, 1)
+        logger.info(
+            "[rag-answer] model=%s llm_source=%s routed_to=%s docs=%s latency_ms=%s",
+            get_local_llm_config().model,
+            llm_source,
+            routed_label,
+            len(all_docs),
+            latency_ms,
+        )
 
         return {
             "answer":      answer,
@@ -1197,7 +1240,8 @@ class SmartRAGChain:
                 "routing": target_sections,
                 "latency_ms": latency_ms,
                 "timestamp": time.time(),
-                "model": os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+                "model": get_local_llm_config().model,
+                "llm_source": llm_source,
             }
         }
 

@@ -169,7 +169,7 @@ class SOPActionService:
             "retrieval_query": retrieval_query[:500],
             "fusion_weights": {"dense": self.runtime.retriever.dense_weight, "bm25": self.runtime.retriever.bm25_weight},
             "reranker": "cross-encoder/ms-marco-MiniLM-L-6-v2",
-            "llm_model": getattr(self.runtime.llm, "model", None),
+            "llm_model": getattr(self.runtime.llm, "model_name", None) or getattr(self.runtime.llm, "model", None),
         }
         suggestion = await self._save_suggestion(
             db=db,
@@ -242,7 +242,7 @@ class SOPActionService:
             "collection_name": None,
             "fusion_weights": None,
             "reranker": None,
-            "llm_model": getattr(self.runtime.llm, "model", None),
+            "llm_model": getattr(self.runtime.llm, "model_name", None) or getattr(self.runtime.llm, "model", None),
         }
         suggestion = await self._save_suggestion(
             db=db,
@@ -283,7 +283,7 @@ class SOPActionService:
             "collection_name": None,
             "fusion_weights": None,
             "reranker": None,
-            "llm_model": getattr(self.runtime.llm, "model", None),
+            "llm_model": getattr(self.runtime.llm, "model_name", None) or getattr(self.runtime.llm, "model", None),
             "change_type": request.change_type,
         }
         suggestion = await self._save_suggestion(

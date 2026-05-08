@@ -186,6 +186,7 @@ export async function runUnifiedAssistantQuery({
   pathname = '/',
   chatHistory = [],
   assistantActionConfirmation = null,
+  surface = 'global_chatbot',
 }) {
   const routeMeta = matchRouteConfig(pathname)
   const contextualQuestion = buildContextualQuestion(question, pathname)
@@ -195,5 +196,7 @@ export async function runUnifiedAssistantQuery({
     category: routeMeta.category,
     assistant_context: assistantContext,
     assistant_action_confirmation: assistantActionConfirmation,
+    surface,
+    route: pathname,
   })
 }

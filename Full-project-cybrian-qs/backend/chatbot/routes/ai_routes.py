@@ -2,6 +2,8 @@ from html import escape
 import re
 import os
 import math
+import time
+import logging
 import threading
 import asyncio
 from typing import Any
@@ -22,6 +24,7 @@ from schemas.sop_actions import ActionRequest, GapCheckResponse, ImproveResponse
 from app.schemas import AIActionRequest, AIActionResponse
 from app.database import SessionLocal
 from app.models import SOP, SOPVersion, Deviation, Capa, AuditFinding, Decision
+from chatbot.llm.provider import get_local_llm_config, is_local_llm_unreachable_error
 
 # RAG-specific imports are lazy-loaded inside _get_smart_rag_chain()
 # to avoid ModuleNotFoundError when running without the RAG chatbot modules.
@@ -42,6 +45,18 @@ DECISION_REF_PATTERN = re.compile(r"\bDEC-[A-Z0-9-]+\b", re.IGNORECASE)
 # Default is false so semantic RAG/Qdrant is used unless explicitly overridden.
 CHATBOT_USE_LOCAL_DB = os.getenv("CHATBOT_USE_LOCAL_DB", "false").strip().lower() == "true"
 CHATBOT_ALLOW_LOCAL_DB_PRIMARY = os.getenv("CHATBOT_ALLOW_LOCAL_DB_PRIMARY", "false").strip().lower() == "true"
+logger = logging.getLogger(__name__)
+
+
+def _is_prompt_too_large_error(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    return (
+        "context length" in msg
+        or "n_keep" in msg
+        or "prompt is too long" in msg
+        or "maximum context length" in msg
+        or "too many tokens" in msg
+    )
 
 
 def _get_smart_rag_chain() -> Any:
@@ -685,28 +700,218 @@ def _action_output_token_budget(input_chars: int) -> int:
     """
     Long selected text needs a larger output budget; JSON + improved copy can exceed 1–2k tokens.
     """
-    cap = int(os.getenv("GEMINI_ACTION_MAX_OUTPUT_TOKENS_CAP", "8192"))
+    cap = int(os.getenv("ACTION_MAX_OUTPUT_TOKENS_CAP", "8192"))
     if input_chars <= 0:
-        return int(os.getenv("GEMINI_ACTION_MAX_OUTPUT_TOKENS") or "4096")
+        return int(os.getenv("ACTION_MAX_OUTPUT_TOKENS") or "4096")
     return min(cap, max(2048, int(input_chars * 0.45) + 1200))
 
 
 def _call_action_llm(runtime: Any, prompt: str, *, input_char_budget: int = 0) -> str:
     parser = StrOutputParser()
     n = _action_output_token_budget(input_char_budget) if input_char_budget else int(
-        os.getenv("GEMINI_ACTION_MAX_OUTPUT_TOKENS") or "4096"
+        os.getenv("ACTION_MAX_OUTPUT_TOKENS") or "4096"
     )
     try:
-        return (runtime.llm.bind(max_output_tokens=n) | parser).invoke(prompt)
+        return (runtime.llm.bind(max_tokens=n) | parser).invoke(prompt)
     except Exception:
-        return (runtime.fallback_llm.bind(max_output_tokens=n) | parser).invoke(prompt)
+        return (runtime.fallback_llm.bind(max_tokens=n) | parser).invoke(prompt)
 
 
 def _render_dynamic_text(text: str) -> str:
-    lines = [line.strip() for line in re.split(r"\r?\n+", text or "") if line.strip()]
+    cleaned = _normalize_gap_check_analysis_text(text or "")
+    lines = [line.strip() for line in re.split(r"\r?\n+", cleaned) if line.strip()]
     if not lines:
         return "<p>No suggestion returned.</p>"
     return "".join(f"<p>{escape(line)}</p>" for line in lines)
+
+
+def _normalize_gap_check_analysis_text(text: str) -> str:
+    """
+    Gap Check sometimes returns markdown-ish formatting (###, **, ---).
+    Normalize the raw analysis so we can render clean HTML.
+    """
+    t = text or ""
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Remove common markdown tokens from headings/bold.
+    t = re.sub(r"(?m)^\s*#+\s*", "", t)  # e.g. "### Heading" -> "Heading"
+    t = t.replace("**", "")
+    t = re.sub(r"(?m)^\s*---+\s*$", "", t)
+
+    # Collapse excessive blank lines.
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
+def _render_gap_check_analysis_html(analysis: str) -> str:
+    """
+    Render Gap Check analysis into clean, consistently structured HTML.
+    """
+    normalized = _normalize_gap_check_analysis_text(analysis)
+    if not normalized:
+        return "<p>No suggestion returned.</p>"
+
+    canonical_headings = [
+        "Summary",
+        "Identified Gaps",
+        "Risk/Impact",
+        "Recommended Fixes",
+        "Suggested SOP Text",
+    ]
+
+    heading_re = re.compile(
+        r"^\s*(Summary|Identified Gaps|Risk/Impact|Recommended Fixes|Suggested SOP Text)\s*:?\s*$",
+        re.IGNORECASE,
+    )
+
+    lines = [ln.rstrip() for ln in normalized.split("\n")]
+    sections: dict[str, list[str]] = {}
+    order: list[str] = []
+    current: str | None = None
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            if current:
+                sections.setdefault(current, []).append("")
+            continue
+
+        m = heading_re.match(line)
+        if m:
+            matched = m.group(1)
+            # Preserve canonical heading casing.
+            current = next((h for h in canonical_headings if h.lower() == matched.lower()), matched)
+            if current not in sections:
+                sections[current] = []
+                order.append(current)
+            continue
+
+        if not current:
+            current = "Summary"
+            if current not in sections:
+                sections[current] = []
+                order.append(current)
+
+        sections.setdefault(current, []).append(line)
+
+    def render_paragraphs(block_lines: list[str]) -> str:
+        paragraphs: list[list[str]] = []
+        buf: list[str] = []
+        for ln in block_lines:
+            if ln == "":
+                if buf:
+                    paragraphs.append(buf)
+                    buf = []
+                continue
+            buf.append(ln)
+        if buf:
+            paragraphs.append(buf)
+
+        if not paragraphs:
+            return ""
+
+        rendered_paras = []
+        for para in paragraphs:
+            text = "\n".join(para)
+            rendered_paras.append(f"<p>{escape(text).replace(chr(10), '<br />')}</p>")
+        return "".join(rendered_paras)
+
+    num_re = re.compile(r"^\s*(\d+)[\)\.]\s+(.*)$")
+    bullet_re = re.compile(r"^\s*([-*•])\s+(.*)$")
+
+    def render_body(block_lines: list[str]) -> str:
+        html_parts: list[str] = []
+        i = 0
+
+        while i < len(block_lines):
+            ln = block_lines[i]
+            if ln == "":
+                i += 1
+                continue
+
+            m_num = num_re.match(ln)
+            m_bul = bullet_re.match(ln)
+            if m_num or m_bul:
+                is_ordered = bool(m_num)
+                tag = "ol" if is_ordered else "ul"
+                items: list[list[str]] = []
+                current_item: list[str] = []
+
+                def flush_item():
+                    nonlocal current_item
+                    if current_item:
+                        items.append(current_item)
+                        current_item = []
+
+                while i < len(block_lines):
+                    cur = block_lines[i]
+                    if cur == "":
+                        flush_item()
+                        i += 1
+                        break
+
+                    m2_num = num_re.match(cur)
+                    m2_bul = bullet_re.match(cur)
+
+                    if is_ordered and m2_num:
+                        flush_item()
+                        current_item = [m2_num.group(2).strip()]
+                        i += 1
+                        continue
+                    if (not is_ordered) and m2_bul:
+                        flush_item()
+                        current_item = [m2_bul.group(2).strip()]
+                        i += 1
+                        continue
+
+                    # If the line looks like a *different* list type, stop the current list.
+                    if is_ordered and m2_bul:
+                        break
+                    if (not is_ordered) and m2_num:
+                        break
+
+                    # Otherwise treat as continuation.
+                    if current_item:
+                        current_item.append(cur.strip())
+                    i += 1
+
+                flush_item()
+
+                li_html = []
+                for item_lines in items:
+                    if not any(x.strip() for x in item_lines):
+                        continue
+                    text = "\n".join(item_lines)
+                    li_html.append(f"<li>{escape(text).replace(chr(10), '<br />')}</li>")
+                html_parts.append(f"<{tag}>" + "".join(li_html) + f"</{tag}>")
+                continue
+
+            # Paragraph lines until next blank line.
+            para_lines: list[str] = []
+            while i < len(block_lines) and block_lines[i] != "":
+                para_lines.append(block_lines[i])
+                i += 1
+            html_parts.append(
+                f"<p>{escape('\n'.join(para_lines)).replace(chr(10), '<br />')}</p>"
+            )
+
+        return "".join(html_parts) if html_parts else render_paragraphs(block_lines)
+
+    rendered: list[str] = []
+    for heading in canonical_headings:
+        if heading not in sections:
+            continue
+        block = sections[heading]
+        if not any((ln or "").strip() for ln in block):
+            continue
+
+        rendered.append(f"<h3>{escape(heading)}</h3>")
+        rendered.append(render_body(block))
+
+    if not rendered:
+        return render_paragraphs(lines)
+
+    return "".join(rendered)
 
 
 def _render_dynamic_gap_check(gaps: list[dict[str, str]]) -> str:
@@ -814,7 +1019,7 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
         return AIActionResponse(
             action="gap_check",
             original_text=request.section_text,
-            suggested_text=_render_dynamic_text(parsed.analysis),
+            suggested_text=_render_gap_check_analysis_html(parsed.analysis),
             explanation="Compliance-Lückenanalyse abgeschlossen / Compliance gap analysis completed.",
             structured_data={
                 "analysis": parsed.analysis,
@@ -840,7 +1045,7 @@ def _fallback_gap_check(payload: AIActionRequest) -> AIActionResponse:
     return AIActionResponse(
         action="gap_check",
         original_text=_clean_text(payload.text),
-        suggested_text=_render_dynamic_text(parsed.analysis),
+        suggested_text=_render_gap_check_analysis_html(parsed.analysis),
         explanation="Compliance-Lückenanalyse abgeschlossen / Compliance gap analysis completed.",
         structured_data={"analysis": parsed.analysis},
     )
@@ -936,70 +1141,160 @@ async def query_ai(payload: dict):
 
     category = payload.get("category")
     chat_history = payload.get("chat_history") or []
+    assistant_context = payload.get("assistant_context") or {}
+    surface = str(payload.get("surface") or "unknown").strip().lower()
+    route = str(payload.get("route") or "").strip()
+    t0 = time.perf_counter()
+    cfg = get_local_llm_config()
+    logger.info(
+        "[chatbot-request] surface=%s route=%s provider=%s model=%s category=%s qlen=%s",
+        surface,
+        route,
+        cfg.provider,
+        cfg.model,
+        category or "auto",
+        len(question),
+    )
+    print(
+        f"[chatbot-request] surface={surface} route={route or '-'} provider={cfg.provider} model={cfg.model} category={category or 'auto'} qlen={len(question)}",
+        flush=True,
+    )
+    q = question.lower()
+    intents: set[str] = set()
+    if re.search(r"\b(this sop|current sop|active sop)\b", q) or re.search(
+        r"\b(which|what)\b.*\b(sop)\b.*\b(currently open|open now|opened|active)\b", q
+    ):
+        intents.add("active_sop")
+    if re.search(r"\b(linked|related)\b.*\b(capa|capas|audit|audits|deviation|deviations)\b", q):
+        intents.add("linked_entities")
+    current = assistant_context.get("current_sop") if isinstance(assistant_context.get("current_sop"), dict) else {}
+    linked = assistant_context.get("linked_context") if isinstance(assistant_context.get("linked_context"), dict) else {}
+    active_ref = str(current.get("sop_number") or current.get("id") or "").strip()
+    logger.info("[chatbot-intent] surface=%s intents=%s active_ref=%s", surface, sorted(intents), active_ref or "none")
+    if "active_sop" in intents and active_ref:
+        response = {
+            "answer": (
+                f"The currently open SOP is {active_ref}. "
+                f"Title: {str(current.get('title') or 'unknown').strip() or 'unknown'}. "
+                f"Version: {str(current.get('version') or 'unknown').strip() or 'unknown'}. "
+                f"Status: {str(current.get('status') or 'unknown').strip() or 'unknown'}."
+            ),
+            "sources": [],
+            "citations": [],
+            "retrieval_debug": [],
+            "suggestions": [],
+            "retrieval_stats": {
+                "provider": cfg.provider,
+                "model": cfg.model,
+                "source": "live_context",
+                "surface": surface,
+                "intents": sorted(intents),
+                "latency_ms_total": round((time.perf_counter() - t0) * 1000.0, 1),
+            },
+            "routed_to": "live-context",
+        }
+        return response
+    if "linked_entities" in intents:
+        devs = [str((x or {}).get("deviation_number") or (x or {}).get("ref_number") or (x or {}).get("id") or "").strip() for x in (linked.get("deviations") or [])]
+        capas = [str((x or {}).get("capa_number") or (x or {}).get("ref_number") or (x or {}).get("id") or "").strip() for x in (linked.get("capas") or [])]
+        audits = [str((x or {}).get("finding_number") or (x or {}).get("audit_number") or (x or {}).get("ref_number") or (x or {}).get("id") or "").strip() for x in (linked.get("audits") or [])]
+        devs = [x for x in devs if x][:12]
+        capas = [x for x in capas if x][:12]
+        audits = [x for x in audits if x][:12]
+        if devs or capas or audits:
+            response = {
+                "answer": (
+                    f"Linked Deviations ({len(devs)}): {', '.join(devs) if devs else 'none'}.\n"
+                    f"Linked CAPAs ({len(capas)}): {', '.join(capas) if capas else 'none'}.\n"
+                    f"Linked Audits ({len(audits)}): {', '.join(audits) if audits else 'none'}."
+                ),
+                "sources": [],
+                "citations": [],
+                "retrieval_debug": [],
+                "suggestions": [],
+                "retrieval_stats": {
+                    "provider": cfg.provider,
+                    "model": cfg.model,
+                    "source": "live_context",
+                    "surface": surface,
+                    "intents": sorted(intents),
+                    "latency_ms_total": round((time.perf_counter() - t0) * 1000.0, 1),
+                },
+                "routed_to": "live-context",
+            }
+            return response
 
     # RAG is the default source of truth. Local DB primary mode is opt-in only
     # for diagnostics and should not be used in normal semantic chatbot flow.
-    if CHATBOT_USE_LOCAL_DB and CHATBOT_ALLOW_LOCAL_DB_PRIMARY:
+    allow_local_db_bypass = bool(payload.get("allow_local_db_primary")) and CHATBOT_USE_LOCAL_DB and CHATBOT_ALLOW_LOCAL_DB_PRIMARY
+    if allow_local_db_bypass:
         # Run in a worker thread so SQLAlchemy work does not block the event loop
         # (avoids piling up slow requests, nginx timeouts, and a stuck-feeling UI).
-        return await asyncio.to_thread(
+        response = await asyncio.to_thread(
             _build_local_db_chat_response, question, chat_history, category
         )
-
-    db_fallback_response = _build_sop_db_fallback(question, chat_history)
-
-    fallback_answer = (
-        "Chatbot is taking longer than expected to fetch knowledge context. "
-        "Please try again in a few seconds, or ask a more specific question "
-        "(for example with an SOP/DEV/CAPA ID)."
-    )
+        logger.info(
+            "[chatbot-response] source=local-db-primary latency_ms=%.1f",
+            (time.perf_counter() - t0) * 1000.0,
+        )
+        return response
 
     try:
         rag = await asyncio.wait_for(
             asyncio.to_thread(_get_smart_rag_chain),
             timeout=CHAT_QUERY_TIMEOUT_SECONDS,
         )
-        result = await asyncio.wait_for(
-            asyncio.to_thread(
-                rag.invoke,
-                question,
-                category,
-                chat_history,
-            ),
-            timeout=CHAT_QUERY_TIMEOUT_SECONDS,
-        )
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    rag.invoke,
+                    question,
+                    category,
+                    chat_history,
+                ),
+                timeout=CHAT_QUERY_TIMEOUT_SECONDS,
+            )
+        except Exception as first_exc:
+            if _is_prompt_too_large_error(first_exc):
+                logger.warning(
+                    "[chatbot-request] prompt too large; retrying compact query path"
+                )
+                compact_history = (chat_history or [])[-4:]
+                compact_question = question[:1200]
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        rag.invoke,
+                        compact_question,
+                        category,
+                        compact_history,
+                    ),
+                    timeout=CHAT_QUERY_TIMEOUT_SECONDS,
+                )
+            else:
+                raise
     except (TimeoutError, asyncio.TimeoutError):
-        if db_fallback_response is not None:
-            return db_fallback_response
-        return {
-            "answer": fallback_answer,
-            "sources": [],
-            "citations": [],
-            "retrieval_debug": [],
-            "suggestions": [
-                "Try again in a few seconds",
-                "Ask with an exact SOP/DEV/CAPA number",
-                "Use a shorter, specific question",
-            ],
-            "retrieval_stats": {"timeout": True},
-            "routed_to": "timeout-fallback",
-        }
-    except Exception:
-        if db_fallback_response is not None:
-            return db_fallback_response
-        return {
-            "answer": fallback_answer,
-            "sources": [],
-            "citations": [],
-            "retrieval_debug": [],
-            "suggestions": [
-                "Retry the same question",
-                "Check chatbot credentials in backend .env",
-                "Ask with a specific document ID",
-            ],
-            "retrieval_stats": {"error": True},
-            "routed_to": "error-fallback",
-        }
+        raise HTTPException(
+            status_code=504,
+            detail="RAG request timed out. Please retry with a shorter or more specific query.",
+        )
+    except Exception as exc:
+        if is_local_llm_unreachable_error(exc):
+            logger.error(
+                "[chatbot-response] source=error reason=llm_unreachable latency_ms=%.1f error=%s",
+                (time.perf_counter() - t0) * 1000.0,
+                str(exc),
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Local LLM server unreachable ({cfg.base_url}, model={cfg.model}). "
+                    "Please ensure the local model service is running."
+                ),
+            )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Chatbot query failed: {exc}",
+        )
 
     def _json_safe_citations(cits: list) -> list:
         out = []
@@ -1040,7 +1335,30 @@ async def query_ai(payload: dict):
         or "no relevant information found" in answer_text
         or "do not contain sufficient detail" in answer_text
     )
-    if rag_weak and db_fallback_response is not None:
-        return db_fallback_response
+    if rag_weak:
+        response["answer"] = "Sorry, I do not have enough information about this."
+        response["citations"] = []
+        response["sources"] = []
+        response["retrieval_debug"] = []
 
+    response.setdefault("retrieval_stats", {})
+    response["retrieval_stats"].update(
+        {
+            "provider": cfg.provider,
+            "model": cfg.model,
+            "source": "rag",
+            "surface": surface,
+            "latency_ms_total": round((time.perf_counter() - t0) * 1000.0, 1),
+        }
+    )
+    logger.info(
+        "[chatbot-response] source=rag routed_to=%s citations=%s latency_ms=%.1f",
+        response.get("routed_to", ""),
+        len(citations),
+        (time.perf_counter() - t0) * 1000.0,
+    )
+    print(
+        f"[chatbot-response] source=rag routed_to={response.get('routed_to', '')} citations={len(citations)} latency_ms={(time.perf_counter() - t0) * 1000.0:.1f}",
+        flush=True,
+    )
     return response
