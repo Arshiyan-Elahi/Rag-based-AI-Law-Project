@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -115,6 +115,29 @@ def list_messages(
         }
         for m in messages
     ]
+
+
+@router.delete("/sessions/{session_id}", status_code=status.HTTP_200_OK)
+def delete_session(
+    session_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Soft-delete a chat session (sets is_active=False). Messages remain for audit."""
+    session = (
+        db.query(ChatSession)
+        .filter(
+            ChatSession.id == session_id,
+            ChatSession.user_id == current_user.id,
+            ChatSession.is_active == True,  # noqa: E712
+        )
+        .first()
+    )
+    if not session:
+        raise HTTPException(status_code=404, detail="Chat session not found")
+    session.is_active = False
+    db.commit()
+    return {"ok": True, "id": str(session_id)}
 
 
 @router.post("/sessions/{session_id}/messages")

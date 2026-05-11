@@ -8,9 +8,9 @@ import threading
 import asyncio
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import or_
-from langchain_core.output_parsers import StrOutputParser
+from langchain_core.messages import AIMessage
 
 from action.prompts import (
     IMPROVE_REWRITE_NO_RAG_CONTEXT,
@@ -19,12 +19,30 @@ from action.prompts import (
     build_rewrite_prompt,
 )
 from action.runtime import create_action_runtime
-from action.utils import format_chunks, parse_with_retry
+from action.utils import (
+    ACTION_LLM_EMPTY_RETRY_SUFFIX,
+    format_chunks,
+    normalize_action_input_text,
+    parse_with_retry,
+    truncate_prompt_for_llm,
+)
 from schemas.sop_actions import ActionRequest, GapCheckResponse, ImproveResponse, RewriteResponse
+from pydantic import ValidationError
+
 from app.schemas import AIActionRequest, AIActionResponse
 from app.database import SessionLocal
 from app.models import SOP, SOPVersion, Deviation, Capa, AuditFinding, Decision
-from chatbot.llm.provider import get_local_llm_config, is_local_llm_unreachable_error
+try:
+    from openai import BadRequestError
+except Exception:  # pragma: no cover - import fallback for older envs
+    BadRequestError = Exception  # type: ignore[misc,assignment]
+from chatbot.llm.provider import (
+    check_local_llm_api_health,
+    get_chat_pipeline_timeout_seconds,
+    get_local_llm_config,
+    get_local_llm_timeout_seconds,
+    is_local_llm_unreachable_error,
+)
 
 # RAG-specific imports are lazy-loaded inside _get_smart_rag_chain()
 # to avoid ModuleNotFoundError when running without the RAG chatbot modules.
@@ -35,7 +53,6 @@ _smart_rag_lock = threading.Lock()
 _smart_rag_chain = None
 _action_runtime_lock = threading.Lock()
 _action_runtime = None
-CHAT_QUERY_TIMEOUT_SECONDS = int(os.getenv("CHAT_QUERY_TIMEOUT_SECONDS", "60"))
 SOP_REF_PATTERN = re.compile(r"\bSOP-[A-Z0-9-]+\b", re.IGNORECASE)
 DEV_REF_PATTERN = re.compile(r"\bDEV-[A-Z0-9-]+\b", re.IGNORECASE)
 CAPA_REF_PATTERN = re.compile(r"\bCAPA-[A-Z0-9-]+\b", re.IGNORECASE)
@@ -697,24 +714,265 @@ def _render_improve(structured_data: dict) -> str:
 
 
 def _action_output_token_budget(input_chars: int) -> int:
-    """
-    Long selected text needs a larger output budget; JSON + improved copy can exceed 1–2k tokens.
-    """
-    cap = int(os.getenv("ACTION_MAX_OUTPUT_TOKENS_CAP", "8192"))
-    if input_chars <= 0:
-        return int(os.getenv("ACTION_MAX_OUTPUT_TOKENS") or "4096")
-    return min(cap, max(2048, int(input_chars * 0.45) + 1200))
-
-
-def _call_action_llm(runtime: Any, prompt: str, *, input_char_budget: int = 0) -> str:
-    parser = StrOutputParser()
-    n = _action_output_token_budget(input_char_budget) if input_char_budget else int(
-        os.getenv("ACTION_MAX_OUTPUT_TOKENS") or "4096"
+    """Target output budget before context-aware clamping."""
+    base = int(
+        os.getenv("ACTION_LLM_MAX_TOKENS")
+        or os.getenv("ACTION_MAX_OUTPUT_TOKENS")
+        or "4096"
     )
+    cap = int(os.getenv("ACTION_MAX_OUTPUT_TOKENS_CAP", "32768"))
+    if input_chars <= 0:
+        return min(cap, base)
+    return min(cap, max(2048, min(base, int(input_chars * 0.45) + 1200)))
+
+
+def _action_model_context_tokens() -> int:
     try:
-        return (runtime.llm.bind(max_tokens=n) | parser).invoke(prompt)
-    except Exception:
-        return (runtime.fallback_llm.bind(max_tokens=n) | parser).invoke(prompt)
+        return max(4096, int(os.getenv("ACTION_MODEL_CONTEXT_TOKENS", "32768")))
+    except (TypeError, ValueError):
+        return 32768
+
+
+def _action_prompt_soft_limit_chars() -> int:
+    raw = os.getenv("ACTION_PROMPT_SOFT_LIMIT")
+    if raw and raw.strip():
+        try:
+            return max(4000, int(raw))
+        except (TypeError, ValueError):
+            pass
+    # Conservative char/token for unknown tokenization.
+    return max(8000, int(_action_model_context_tokens() * 0.75))
+
+
+def _is_context_length_error_text(text: str) -> bool:
+    msg = (text or "").lower()
+    return (
+        ("n_keep" in msg and "n_ctx" in msg)
+        or "context length" in msg
+        or "prompt is greater than context" in msg
+        or "prompt is too long" in msg
+        or "maximum context length" in msg
+    )
+
+
+def _extract_n_ctx_from_error(text: str) -> int | None:
+    m = re.search(r"n_ctx\s*:\s*(\d+)", text or "", flags=re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_action_max_tokens(base_tokens: int, prompt_chars: int, *, n_ctx: int | None = None) -> int:
+    # Conservative estimate for unknown local tokenization.
+    prompt_est_tokens = max(1, int(prompt_chars / 4.0))
+    ctx = n_ctx or _action_model_context_tokens()
+    reserve = int(os.getenv("ACTION_CONTEXT_RESPONSE_RESERVE", "256"))
+    safe_by_ctx = max(128, ctx - prompt_est_tokens - reserve)
+    safe_cap = int(os.getenv("ACTION_SAFE_MAX_TOKENS_CAP", "32768"))
+    return max(128, min(int(base_tokens), safe_by_ctx, safe_cap))
+
+
+def _context_error_http_exception(err_txt: str) -> HTTPException:
+    cfg = get_local_llm_config()
+    n_ctx = _extract_n_ctx_from_error(err_txt)
+    return HTTPException(
+        status_code=422,
+        detail={
+            "message": (
+                "Selected text is too long for the local model context. Please select a smaller section "
+                "or load the model with larger context length."
+            ),
+            "validation_or_parse_error": err_txt,
+            "hint": "Reduce selection length (especially Gap Check), or increase LM Studio model context.",
+            "llm_model": cfg.model,
+            "llm_base_url": cfg.base_url,
+            "n_ctx": n_ctx,
+        },
+    )
+
+
+def _trim_large_selection_for_fallback(text: str) -> str:
+    s = (text or "").strip()
+    if not s:
+        return ""
+    try:
+        lim = int(os.getenv("ACTION_FALLBACK_TEXT_LIMIT", "3200"))
+    except (TypeError, ValueError):
+        lim = 3200
+    if len(s) <= lim:
+        return s
+    head = max(1200, int(lim * 0.6))
+    tail = max(600, lim - head - 24)
+    return s[:head] + "\n\n[... trimmed ...]\n\n" + s[-tail:]
+
+
+def _extract_text_and_meta(message: Any) -> tuple[str, dict[str, Any]]:
+    if isinstance(message, AIMessage):
+        content = message.content
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    t = item.get("text")
+                    if isinstance(t, str):
+                        parts.append(t)
+            text = "".join(parts)
+        else:
+            text = str(content or "")
+        meta = dict(message.response_metadata or {})
+        usage = meta.get("token_usage") or meta.get("usage") or {}
+        usage_meta = getattr(message, "usage_metadata", None) or {}
+        if isinstance(usage_meta, dict):
+            usage = {**usage, **usage_meta}
+        meta["usage"] = usage
+        return text, meta
+    return str(message or ""), {}
+
+
+def _response_looks_cut(text: str) -> bool:
+    s = (text or "").rstrip()
+    if not s:
+        return False
+    return s[-1].isalnum() and not s.endswith((".", "!", "?", "}", "]", '"'))
+
+
+def _call_action_llm(runtime: Any, prompt: str, *, input_char_budget: int = 0, action: str = "unknown") -> str:
+    base_n = _action_output_token_budget(input_char_budget) if input_char_budget else int(
+        os.getenv("ACTION_LLM_MAX_TOKENS") or os.getenv("ACTION_MAX_OUTPUT_TOKENS") or "4096"
+    )
+    soft = _action_prompt_soft_limit_chars()
+
+    cfg = get_local_llm_config()
+    budgets: list[int] = []
+    for b in (soft, int(soft * 0.75), int(soft * 0.5)):
+        if b > 0 and b not in budgets:
+            budgets.append(b)
+
+    def _invoke_once(p: str, max_tokens: int) -> tuple[str, dict[str, Any]]:
+        msg = runtime.llm.bind(max_tokens=max_tokens).invoke(p)
+        return _extract_text_and_meta(msg)
+
+    def _invoke_fallback_once(p: str, max_tokens: int) -> tuple[str, dict[str, Any]]:
+        msg = runtime.fallback_llm.bind(max_tokens=max_tokens).invoke(p)
+        return _extract_text_and_meta(msg)
+
+    last_context_error: str | None = None
+    n_ctx_hint: int | None = None
+    out = ""
+    used_budget = len(prompt)
+    used_tokens = base_n
+    last_meta: dict[str, Any] = {}
+    length_limited_seen = False
+
+    for budget in budgets:
+        work = truncate_prompt_for_llm(prompt, budget) if len(prompt) > budget else prompt
+        used_budget = len(work)
+        used_tokens = _safe_action_max_tokens(base_n, used_budget, n_ctx=n_ctx_hint)
+        try:
+            out, last_meta = _invoke_once(work, used_tokens)
+            finish_reason = str(last_meta.get("finish_reason") or "").lower()
+            usage = last_meta.get("usage") or {}
+            logger.info(
+                "[ai-action-llm-meta] action=%s prompt_chars=%s output_chars=%s max_tokens=%s finish_reason=%s prompt_tokens=%s completion_tokens=%s total_tokens=%s",
+                action,
+                len(work),
+                len(out or ""),
+                used_tokens,
+                finish_reason or "unknown",
+                usage.get("prompt_tokens"),
+                usage.get("completion_tokens"),
+                usage.get("total_tokens"),
+            )
+            if finish_reason == "length":
+                length_limited_seen = True
+                raise ValueError("llm_finish_reason_length")
+            if (out or "").strip():
+                break
+            out, last_meta = _invoke_once(work + ACTION_LLM_EMPTY_RETRY_SUFFIX, used_tokens)
+            if (out or "").strip():
+                break
+        except BadRequestError as exc:
+            err_txt = str(exc)
+            if _is_context_length_error_text(err_txt):
+                last_context_error = err_txt
+                n_ctx_hint = _extract_n_ctx_from_error(err_txt) or n_ctx_hint
+                logger.warning(
+                    "[ai-action-context-error] prompt_chars=%s max_tokens=%s model=%s base_url=%s n_ctx=%s error=%s",
+                    len(work),
+                    used_tokens,
+                    cfg.model,
+                    cfg.base_url,
+                    n_ctx_hint,
+                    err_txt,
+                )
+                continue
+            try:
+                out, last_meta = _invoke_fallback_once(work, used_tokens)
+                if (out or "").strip():
+                    break
+            except BadRequestError as fb_exc:
+                fb_txt = str(fb_exc)
+                if _is_context_length_error_text(fb_txt):
+                    last_context_error = fb_txt
+                    n_ctx_hint = _extract_n_ctx_from_error(fb_txt) or n_ctx_hint
+                    logger.warning(
+                        "[ai-action-context-error] prompt_chars=%s max_tokens=%s model=%s base_url=%s n_ctx=%s error=%s",
+                        len(work),
+                        used_tokens,
+                        cfg.model,
+                        cfg.base_url,
+                        n_ctx_hint,
+                        fb_txt,
+                    )
+                    continue
+                raise
+        except Exception:
+            out, last_meta = _invoke_fallback_once(work, used_tokens)
+            finish_reason = str(last_meta.get("finish_reason") or "").lower()
+            if finish_reason == "length":
+                length_limited_seen = True
+                continue
+            if (out or "").strip():
+                break
+
+    if last_context_error and not (out or "").strip():
+        raise _context_error_http_exception(last_context_error)
+
+    finish_reason = str(last_meta.get("finish_reason") or "").lower()
+    if finish_reason == "length" or length_limited_seen or _response_looks_cut(out):
+        logger.warning(
+            "[ai-action-llm-truncated] prompt_chars=%s output_chars=%s max_tokens=%s model=%s base_url=%s finish_reason=%s",
+            used_budget,
+            len(out or ""),
+            used_tokens,
+            cfg.model,
+            cfg.base_url,
+            finish_reason or "unknown",
+        )
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "AI response was truncated due to model/output limit.",
+                "validation_or_parse_error": f"finish_reason={finish_reason or 'unknown'}",
+                "hint": "Increase ACTION_LLM_MAX_TOKENS, shorten selection, or increase ACTION_MODEL_CONTEXT_TOKENS.",
+            },
+        )
+
+    preview = (out or "").replace("\n", "\\n").replace("\r", "\\r")[:900]
+    logger.info(
+        "[ai-action-llm-raw] raw_len=%s max_tokens=%s preview=%s",
+        len(out or ""),
+        used_tokens,
+        preview,
+    )
+    return out
 
 
 def _render_dynamic_text(text: str) -> str:
@@ -948,10 +1206,93 @@ def _build_gap_check_retrieval_query(request: ActionRequest) -> str:
     return "\n".join(part.strip() for part in parts if part and part.strip())
 
 
+def _try_client_structured_ai_response(
+    payload: AIActionRequest,
+    action: str,
+    request: ActionRequest,
+) -> AIActionResponse | None:
+    data = getattr(payload, "client_structured_json", None)
+    if not isinstance(data, dict) or not data:
+        return None
+    try:
+        if action == "improve":
+            txt = str(data.get("improved_text") or data.get("improved_version") or "").strip()
+            if len(txt) < 2:
+                return None
+            ImproveResponse.model_validate({"improved_text": txt})
+            return AIActionResponse(
+                action="improve",
+                original_text=request.section_text,
+                suggested_text=_render_dynamic_text(txt),
+                explanation="Applied structured improvement from client (validated; no new LLM call).",
+                structured_data={"improved_text": txt, "improved_version": txt, "client_supplied": True},
+            )
+        if action == "rewrite":
+            txt = str(data.get("rewritten_text") or "").strip()
+            if len(txt) < 2:
+                return None
+            RewriteResponse.model_validate({"rewritten_text": txt})
+            return AIActionResponse(
+                action="rewrite",
+                original_text=request.section_text,
+                suggested_text=_render_dynamic_text(txt),
+                explanation="Applied structured rewrite from client (validated; no new LLM call).",
+                structured_data={"rewritten_text": txt, "client_supplied": True},
+            )
+        if action == "gap_check":
+            txt = str(data.get("analysis") or "").strip()
+            if len(txt) < 10:
+                return None
+            GapCheckResponse.model_validate({"analysis": txt})
+            return AIActionResponse(
+                action="gap_check",
+                original_text=request.section_text,
+                suggested_text=_render_gap_check_analysis_html(txt),
+                explanation="Applied structured gap analysis from client (validated; no new LLM call).",
+                structured_data={"analysis": txt, "client_supplied": True},
+            )
+    except ValidationError as ve:
+        logger.warning("[ai-action] client_structured_json rejected: %s", ve)
+        return None
+    return None
+
+
 def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionResponse:
     runtime = _get_action_runtime()
     request = _build_action_request(payload)
     ch_budget = len(request.section_text or "")
+
+    bypass = _try_client_structured_ai_response(payload, action, request)
+    if bypass is not None:
+        logger.info("[ai-action] using client_structured_json bypass action=%s", action)
+        return bypass
+
+    nlp_block = ""
+    nlp_summary: dict[str, Any] = {}
+    try:
+        from app.services.nlp.editor_action_nlp import (
+            build_nlp_bundle_for_action,
+            log_nlp_detected,
+            nlp_action_summary,
+        )
+
+        # Avoid importing app.ai_routes here (circular / heavy). Selection-only SOP context; upload NLP
+        # still applies when requests go through app.ai_routes (main API).
+        sop_ctx: dict[str, Any] = {
+            "detected": False,
+            "text": "",
+            "nlp_analysis": None,
+            "version_metadata_compact": {},
+            "version_metadata_keys": [],
+        }
+        style_profile: dict[str, Any] = {}
+        nlp_bundle, nlp_block = build_nlp_bundle_for_action(action, request, sop_ctx, style_profile)
+        log_nlp_detected(action, nlp_bundle)
+        nlp_summary = nlp_action_summary(nlp_bundle)
+    except Exception as exc:
+        logger.warning("[nlp-detected] chatbot_ai_route skipped err=%s", exc)
+
+    cfg = get_local_llm_config()
 
     if action == "gap_check":
         retrieval_query = _build_gap_check_retrieval_query(request)
@@ -962,16 +1303,31 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
         # improve / rewrite: no RAG — system prompt + rules + document fields + section text only
         context = IMPROVE_REWRITE_NO_RAG_CONTEXT
 
+    logger.info(
+        "[ai-action-prompt] action=%s prompt_type=%s_json_nlp_v1 provider=%s model=%s nlp_block_chars=%s",
+        action,
+        action,
+        cfg.provider,
+        cfg.model,
+        len(nlp_block or ""),
+    )
+
     if action == "improve":
-        prompt = build_improve_prompt(request, context)
+        prompt = build_improve_prompt(request, context, nlp_block)
         parsed = parse_with_retry(
-            raw=_call_action_llm(runtime, prompt, input_char_budget=ch_budget),
+            raw=_call_action_llm(runtime, prompt, input_char_budget=ch_budget, action=action),
             schema=ImproveResponse,
             prompt=prompt,
             call_llm=lambda rp: _call_action_llm(
-                runtime, rp, input_char_budget=ch_budget
+                runtime, rp, input_char_budget=ch_budget, action=action
             ),
             audit_log=[],
+        )
+        logger.info(
+            "[ai-action-result] action=improve ok=1 provider=%s model=%s suggested_chars=%s",
+            cfg.provider,
+            cfg.model,
+            len(parsed.improved_text or ""),
         )
         return AIActionResponse(
             action="improve",
@@ -981,19 +1337,26 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
             structured_data={
                 "improved_text": parsed.improved_text,
                 "improved_version": parsed.improved_text,
+                "nlp_action_summary": nlp_summary,
             },
         )
 
     if action == "rewrite":
-        prompt = build_rewrite_prompt(request, context)
+        prompt = build_rewrite_prompt(request, context, nlp_block)
         parsed = parse_with_retry(
-            raw=_call_action_llm(runtime, prompt, input_char_budget=ch_budget),
+            raw=_call_action_llm(runtime, prompt, input_char_budget=ch_budget, action=action),
             schema=RewriteResponse,
             prompt=prompt,
             call_llm=lambda rp: _call_action_llm(
-                runtime, rp, input_char_budget=ch_budget
+                runtime, rp, input_char_budget=ch_budget, action=action
             ),
             audit_log=[],
+        )
+        logger.info(
+            "[ai-action-result] action=rewrite ok=1 provider=%s model=%s suggested_chars=%s",
+            cfg.provider,
+            cfg.model,
+            len(parsed.rewritten_text or ""),
         )
         return AIActionResponse(
             action="rewrite",
@@ -1002,19 +1365,26 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
             explanation="Text neu formuliert / Text rewritten.",
             structured_data={
                 "rewritten_text": parsed.rewritten_text,
+                "nlp_action_summary": nlp_summary,
             },
         )
 
     if action == "gap_check":
-        prompt = build_gap_check_prompt(request, context)
+        prompt = build_gap_check_prompt(request, context, nlp_block)
         parsed = parse_with_retry(
-            raw=_call_action_llm(runtime, prompt, input_char_budget=ch_budget),
+            raw=_call_action_llm(runtime, prompt, input_char_budget=ch_budget, action=action),
             schema=GapCheckResponse,
             prompt=prompt,
             call_llm=lambda rp: _call_action_llm(
-                runtime, rp, input_char_budget=ch_budget
+                runtime, rp, input_char_budget=ch_budget, action=action
             ),
             audit_log=[],
+        )
+        logger.info(
+            "[ai-action-result] action=gap_check ok=1 provider=%s model=%s analysis_chars=%s",
+            cfg.provider,
+            cfg.model,
+            len(parsed.analysis or ""),
         )
         return AIActionResponse(
             action="gap_check",
@@ -1023,6 +1393,7 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
             explanation="Compliance-Lückenanalyse abgeschlossen / Compliance gap analysis completed.",
             structured_data={
                 "analysis": parsed.analysis,
+                "nlp_action_summary": nlp_summary,
             },
         )
 
@@ -1032,14 +1403,15 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
 def _fallback_gap_check(payload: AIActionRequest) -> AIActionResponse:
     runtime = _get_action_runtime()
     request = _build_action_request(payload)
+    request.section_text = _trim_large_selection_for_fallback(request.section_text)
     ch_budget = len(request.section_text or "")
     prompt = build_gap_check_prompt(request, "Kein relevanter Kontext verfügbar. / No relevant context found.")
-    raw = _call_action_llm(runtime, prompt, input_char_budget=ch_budget)
+    raw = _call_action_llm(runtime, prompt, input_char_budget=ch_budget, action="gap_check")
     parsed = parse_with_retry(
         raw=raw,
         schema=GapCheckResponse,
         prompt=prompt,
-        call_llm=lambda rp: _call_action_llm(runtime, rp, input_char_budget=ch_budget),
+        call_llm=lambda rp: _call_action_llm(runtime, rp, input_char_budget=ch_budget, action="gap_check"),
         audit_log=[],
     )
     return AIActionResponse(
@@ -1056,12 +1428,12 @@ def _fallback_rewrite(payload: AIActionRequest) -> AIActionResponse:
     request = _build_action_request(payload)
     ch_budget = len(request.section_text or "")
     prompt = build_rewrite_prompt(request, IMPROVE_REWRITE_NO_RAG_CONTEXT)
-    raw = _call_action_llm(runtime, prompt, input_char_budget=ch_budget)
+    raw = _call_action_llm(runtime, prompt, input_char_budget=ch_budget, action="rewrite")
     parsed = parse_with_retry(
         raw=raw,
         schema=RewriteResponse,
         prompt=prompt,
-        call_llm=lambda rp: _call_action_llm(runtime, rp, input_char_budget=ch_budget),
+        call_llm=lambda rp: _call_action_llm(runtime, rp, input_char_budget=ch_budget, action="rewrite"),
         audit_log=[],
     )
     return AIActionResponse(
@@ -1078,12 +1450,12 @@ def _fallback_improve(payload: AIActionRequest) -> AIActionResponse:
     request = _build_action_request(payload)
     ch_budget = len(request.section_text or "")
     prompt = build_improve_prompt(request, IMPROVE_REWRITE_NO_RAG_CONTEXT)
-    raw = _call_action_llm(runtime, prompt, input_char_budget=ch_budget)
+    raw = _call_action_llm(runtime, prompt, input_char_budget=ch_budget, action="improve")
     parsed = parse_with_retry(
         raw=raw,
         schema=ImproveResponse,
         prompt=prompt,
-        call_llm=lambda rp: _call_action_llm(runtime, rp, input_char_budget=ch_budget),
+        call_llm=lambda rp: _call_action_llm(runtime, rp, input_char_budget=ch_budget, action="improve"),
         audit_log=[],
     )
     return AIActionResponse(
@@ -1111,9 +1483,18 @@ async def perform_ai_action(payload: AIActionRequest):
     frontend can reliably support compare-and-confirm workflows.
     """
     action = _normalize_action(payload.action)
-    payload.text = _clean_text(payload.text)
+    raw_in = (payload.text or "").strip()
+    payload.text = normalize_action_input_text(payload.text)
     if not payload.text:
         raise HTTPException(status_code=422, detail="Selected text is required.")
+
+    logger.info(
+        "[ai-action-request] action=%s text_in_len=%s text_norm_len=%s preview=%s",
+        action,
+        len(raw_in),
+        len(payload.text),
+        (raw_in.replace("\n", " ")[:220] + ("…" if len(raw_in) > 220 else "")),
+    )
 
     try:
         return await asyncio.to_thread(_run_dynamic_ai_action, payload, action)
@@ -1128,6 +1509,11 @@ async def perform_ai_action(payload: AIActionRequest):
             return _fallback_improve(payload)
 
     raise HTTPException(status_code=400, detail=f"Action '{payload.action}' is not supported.")
+
+
+@ai_router.get("/api/ai/llm-health")
+async def llm_health(chat_probe: bool = Query(False)):
+    return await asyncio.to_thread(check_local_llm_api_health, chat_probe=chat_probe)
 
 
 @ai_router.post("/api/ai/query")
@@ -1168,61 +1554,33 @@ async def query_ai(payload: dict):
     if re.search(r"\b(linked|related)\b.*\b(capa|capas|audit|audits|deviation|deviations)\b", q):
         intents.add("linked_entities")
     current = assistant_context.get("current_sop") if isinstance(assistant_context.get("current_sop"), dict) else {}
-    linked = assistant_context.get("linked_context") if isinstance(assistant_context.get("linked_context"), dict) else {}
     active_ref = str(current.get("sop_number") or current.get("id") or "").strip()
     logger.info("[chatbot-intent] surface=%s intents=%s active_ref=%s", surface, sorted(intents), active_ref or "none")
+
+    question_for_rag = question
+    context_hints: list[str] = []
     if "active_sop" in intents and active_ref:
-        response = {
-            "answer": (
-                f"The currently open SOP is {active_ref}. "
-                f"Title: {str(current.get('title') or 'unknown').strip() or 'unknown'}. "
-                f"Version: {str(current.get('version') or 'unknown').strip() or 'unknown'}. "
-                f"Status: {str(current.get('status') or 'unknown').strip() or 'unknown'}."
-            ),
-            "sources": [],
-            "citations": [],
-            "retrieval_debug": [],
-            "suggestions": [],
-            "retrieval_stats": {
-                "provider": cfg.provider,
-                "model": cfg.model,
-                "source": "live_context",
-                "surface": surface,
-                "intents": sorted(intents),
-                "latency_ms_total": round((time.perf_counter() - t0) * 1000.0, 1),
-            },
-            "routed_to": "live-context",
-        }
-        return response
+        if not category:
+            category = "sops"
+        context_hints.append(f"ACTIVE_SOP={active_ref}")
+        context_hints.append(f"FOCUS_REF={active_ref}")
     if "linked_entities" in intents:
-        devs = [str((x or {}).get("deviation_number") or (x or {}).get("ref_number") or (x or {}).get("id") or "").strip() for x in (linked.get("deviations") or [])]
-        capas = [str((x or {}).get("capa_number") or (x or {}).get("ref_number") or (x or {}).get("id") or "").strip() for x in (linked.get("capas") or [])]
-        audits = [str((x or {}).get("finding_number") or (x or {}).get("audit_number") or (x or {}).get("ref_number") or (x or {}).get("id") or "").strip() for x in (linked.get("audits") or [])]
-        devs = [x for x in devs if x][:12]
-        capas = [x for x in capas if x][:12]
-        audits = [x for x in audits if x][:12]
-        if devs or capas or audits:
-            response = {
-                "answer": (
-                    f"Linked Deviations ({len(devs)}): {', '.join(devs) if devs else 'none'}.\n"
-                    f"Linked CAPAs ({len(capas)}): {', '.join(capas) if capas else 'none'}.\n"
-                    f"Linked Audits ({len(audits)}): {', '.join(audits) if audits else 'none'}."
-                ),
-                "sources": [],
-                "citations": [],
-                "retrieval_debug": [],
-                "suggestions": [],
-                "retrieval_stats": {
-                    "provider": cfg.provider,
-                    "model": cfg.model,
-                    "source": "live_context",
-                    "surface": surface,
-                    "intents": sorted(intents),
-                    "latency_ms_total": round((time.perf_counter() - t0) * 1000.0, 1),
-                },
-                "routed_to": "live-context",
-            }
-            return response
+        context_hints.append("INTENT=LINKED_ENTITIES")
+
+    try:
+        from app import ai_routes as _app_ai_routes
+
+        context_summary = _app_ai_routes._summarize_live_context(assistant_context, question)
+    except Exception:
+        context_summary = ""
+
+    if context_hints:
+        question_for_rag = f"{question_for_rag}\n\nRAG_HINTS: {' | '.join(context_hints)}"
+
+    live_block = (context_summary or "").strip()
+    live_ctx_chars = len(live_block)
+    if live_ctx_chars > 60:
+        question_for_rag = f"{question_for_rag}\n\n{live_block[:3200]}"
 
     # RAG is the default source of truth. Local DB primary mode is opt-in only
     # for diagnostics and should not be used in normal semantic chatbot flow.
@@ -1231,7 +1589,7 @@ async def query_ai(payload: dict):
         # Run in a worker thread so SQLAlchemy work does not block the event loop
         # (avoids piling up slow requests, nginx timeouts, and a stuck-feeling UI).
         response = await asyncio.to_thread(
-            _build_local_db_chat_response, question, chat_history, category
+            _build_local_db_chat_response, question_for_rag, chat_history, category
         )
         logger.info(
             "[chatbot-response] source=local-db-primary latency_ms=%.1f",
@@ -1239,28 +1597,42 @@ async def query_ai(payload: dict):
         )
         return response
 
+    pipeline_timeout = get_chat_pipeline_timeout_seconds()
+    logger.info(
+        "[chatbot-timeout] pipeline_seconds=%s local_llm_seconds=%s",
+        pipeline_timeout,
+        get_local_llm_timeout_seconds(),
+    )
+
     try:
         rag = await asyncio.wait_for(
             asyncio.to_thread(_get_smart_rag_chain),
-            timeout=CHAT_QUERY_TIMEOUT_SECONDS,
+            timeout=pipeline_timeout,
+        )
+        logger.info(
+            "[chatbot-rag-call] intents=%s category=%s live_ctx_chars=%s q_preview=%s",
+            sorted(intents),
+            category or "auto",
+            live_ctx_chars,
+            (question[:200] or ""),
         )
         try:
             result = await asyncio.wait_for(
                 asyncio.to_thread(
                     rag.invoke,
-                    question,
+                    question_for_rag,
                     category,
                     chat_history,
                 ),
-                timeout=CHAT_QUERY_TIMEOUT_SECONDS,
+                timeout=pipeline_timeout,
             )
         except Exception as first_exc:
-            if _is_prompt_too_large_error(first_exc):
+            if _is_prompt_too_large_error(first_exc) and question_for_rag != question:
                 logger.warning(
                     "[chatbot-request] prompt too large; retrying compact query path"
                 )
                 compact_history = (chat_history or [])[-4:]
-                compact_question = question[:1200]
+                compact_question = (question_for_rag or question)[:1200]
                 result = await asyncio.wait_for(
                     asyncio.to_thread(
                         rag.invoke,
@@ -1268,28 +1640,53 @@ async def query_ai(payload: dict):
                         category,
                         compact_history,
                     ),
-                    timeout=CHAT_QUERY_TIMEOUT_SECONDS,
+                    timeout=pipeline_timeout,
                 )
             else:
                 raise
+        if not isinstance(result, dict):
+            logger.error(
+                "[chatbot-response] invalid rag result type=%s; coercing empty response",
+                type(result).__name__,
+            )
+            result = {}
     except (TimeoutError, asyncio.TimeoutError):
+        elapsed = round((time.perf_counter() - t0) * 1000.0, 1)
+        logger.error("[chatbot-response] failure_stage=pipeline_timeout elapsed_ms=%s", elapsed)
         raise HTTPException(
             status_code=504,
-            detail="RAG request timed out. Please retry with a shorter or more specific query.",
+            detail={
+                "message": "The chat pipeline exceeded its asyncio time budget (chain load + retrieval + LLM).",
+                "failure_stage": "pipeline_timeout",
+                "elapsed_ms": elapsed,
+                "chat_pipeline_timeout_seconds": pipeline_timeout,
+                "local_llm_timeout_seconds": get_local_llm_timeout_seconds(),
+                "llm_base_url": cfg.base_url,
+                "llm_model": cfg.model,
+                "hint": "Increase CHAT_QUERY_TIMEOUT_SECONDS or reduce RAG context; confirm GET /api/ai/llm-health.",
+            },
         )
     except Exception as exc:
+        elapsed = round((time.perf_counter() - t0) * 1000.0, 1)
         if is_local_llm_unreachable_error(exc):
             logger.error(
-                "[chatbot-response] source=error reason=llm_unreachable latency_ms=%.1f error=%s",
-                (time.perf_counter() - t0) * 1000.0,
+                "[chatbot-response] failure_stage=llm_unreachable elapsed_ms=%.1f error=%s",
+                elapsed,
                 str(exc),
             )
             raise HTTPException(
                 status_code=503,
-                detail=(
-                    f"Local LLM server unreachable ({cfg.base_url}, model={cfg.model}). "
-                    "Please ensure the local model service is running."
-                ),
+                detail={
+                    "message": "The local OpenAI-compatible LLM could not complete a request (connection, timeout, or HTTP error).",
+                    "failure_stage": "llm_unreachable",
+                    "error": str(exc),
+                    "elapsed_ms": elapsed,
+                    "llm_base_url": cfg.base_url,
+                    "llm_model": cfg.model,
+                    "llm_provider": cfg.provider,
+                    "local_llm_timeout_seconds": get_local_llm_timeout_seconds(),
+                    "hint": "Run GET /api/ai/llm-health and ensure LOCAL_LLM_MODEL matches a model id from /v1/models.",
+                },
             )
         raise HTTPException(
             status_code=500,
@@ -1311,7 +1708,13 @@ async def query_ai(payload: dict):
             out.append(d)
         return out
 
-    citations = _json_safe_citations(result.get("citations", []))
+    citations = _json_safe_citations((result or {}).get("citations", []))
+    try:
+        from chatbot.rag.rag_chain import _dedupe_citations_by_ref
+
+        citations = _dedupe_citations_by_ref(citations)
+    except Exception:
+        pass
     sources = []
     for idx, c in enumerate(citations):
         ref = c.get("ref") or c.get("title") or f"source-{idx+1}"
@@ -1319,46 +1722,95 @@ async def query_ai(payload: dict):
         source_type = (c.get("type") or "doc").lower()
         sources.append({"id": ref, "type": source_type, "label": label})
 
+    base_stats = dict((result or {}).get("retrieval_stats") or {})
     response = {
-        "answer": result.get("answer", ""),
+        "answer": (result or {}).get("answer", ""),
         "sources": sources,
         "citations": citations,
-        "retrieval_debug": result.get("retrieval_debug", []),
-        "suggestions": result.get("suggestions", []),
-        "retrieval_stats": result.get("retrieval_stats", {}),
-        "routed_to": result.get("routed_to", ""),
+        "retrieval_debug": (result or {}).get("retrieval_debug", []),
+        "suggestions": (result or {}).get("suggestions", []),
+        "retrieval_stats": {**base_stats},
+        "routed_to": (result or {}).get("routed_to", ""),
     }
+    if (result or {}).get("failure_stage") is not None:
+        response["failure_stage"] = (result or {}).get("failure_stage")
+    if (result or {}).get("llm_error"):
+        response["llm_error"] = (result or {}).get("llm_error")
 
-    answer_text = (response.get("answer") or "").strip().lower()
-    rag_weak = (
-        not answer_text
-        or "no relevant information found" in answer_text
-        or "do not contain sufficient detail" in answer_text
+    response.setdefault("retrieval_stats", {})
+    retrieval_total = int(response["retrieval_stats"].get("total_docs") or 0)
+    had_evidence = retrieval_total > 0 or len(citations) > 0
+    answer_raw = (response.get("answer") or "").strip()
+    answer_lower = answer_raw.lower()
+    boilerplate_unreachable = (
+        "no relevant information found" in answer_lower
+        or "the available records do not contain sufficient detail" in answer_lower
     )
-    if rag_weak:
+    dbg_rows = response.get("retrieval_debug") or []
+    dbg_preview = str(dbg_rows[0])[:480] if dbg_rows else ""
+
+    if not had_evidence and (not answer_raw or boilerplate_unreachable):
         response["answer"] = "Sorry, I do not have enough information about this."
         response["citations"] = []
         response["sources"] = []
         response["retrieval_debug"] = []
+        rr = (
+            (result or {}).get("refusal_reason")
+            or (result or {}).get("retrieval_stats", {}).get("refusal_reason")
+            or "no_retrieval"
+        )
+        response["refusal_reason"] = rr
+        logger.info(
+            "[chatbot-refusal] reason=%s intents=%s routed_to=%s q_preview=%s",
+            rr,
+            sorted(intents),
+            response.get("routed_to", ""),
+            (question[:220] or ""),
+        )
+    elif had_evidence and boilerplate_unreachable:
+        logger.warning(
+            "[chatbot-refusal-skipped] refusal-like phrasing but total_docs=%s citations=%s",
+            retrieval_total,
+            len(citations),
+        )
 
-    response.setdefault("retrieval_stats", {})
+    try:
+        from chatbot.rag.rag_chain import (
+            _strip_sources_footer_from_answer,
+            _strip_sources_lines_from_answer,
+        )
+
+        if not bool((response.get("retrieval_stats") or {}).get("strict_mode")):
+            response["answer"] = _strip_sources_footer_from_answer(
+                _strip_sources_lines_from_answer(response.get("answer") or "")
+            )
+    except Exception:
+        pass
+
     response["retrieval_stats"].update(
         {
             "provider": cfg.provider,
             "model": cfg.model,
             "source": "rag",
             "surface": surface,
+            "intents": sorted(intents),
             "latency_ms_total": round((time.perf_counter() - t0) * 1000.0, 1),
+            "llm_base_url": cfg.base_url,
         }
     )
+    response["elapsed_ms_total"] = round((time.perf_counter() - t0) * 1000.0, 1)
+    response["retrieval_stats"]["elapsed_ms_total"] = response["elapsed_ms_total"]
     logger.info(
-        "[chatbot-response] source=rag routed_to=%s citations=%s latency_ms=%.1f",
+        "[chatbot-response] source=rag routed_to=%s total_docs=%s citations=%s intents=%s dbg_preview=%s latency_ms=%.1f",
         response.get("routed_to", ""),
+        retrieval_total,
         len(citations),
+        sorted(intents),
+        dbg_preview.replace("\n", " ")[:500],
         (time.perf_counter() - t0) * 1000.0,
     )
     print(
-        f"[chatbot-response] source=rag routed_to={response.get('routed_to', '')} citations={len(citations)} latency_ms={(time.perf_counter() - t0) * 1000.0:.1f}",
+        f"[chatbot-response] source=rag routed_to={response.get('routed_to', '')} total_docs={retrieval_total} citations={len(citations)} latency_ms={(time.perf_counter() - t0) * 1000.0:.1f}",
         flush=True,
     )
     return response

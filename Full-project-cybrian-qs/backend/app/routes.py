@@ -42,6 +42,7 @@ from .schemas import (
     LinkSuggestionResponse,
     SemanticStatusResponse,
 )
+from .services.profile_detection_store import persist_profile_detection_for_sop_version
 from .services.semantic_pipeline import (
     SemanticPipelineService,
     ENTITY_TYPES,
@@ -263,6 +264,8 @@ def _create_new_version_for_existing_sop(
     db.refresh(existing)
     db.refresh(new_version)
 
+    _persist_nlp_analysis_for_version(db, new_version)
+
     _upsert_import_context_entities(db, existing, new_version, background_tasks)
     if background_tasks:
         _schedule_semantic_job(background_tasks, "sop", existing.id, new_version.id)
@@ -371,6 +374,11 @@ def _extract_plain_text_from_tiptap(doc_json: dict | None) -> str:
 
     walk(doc_json)
     return " ".join(out).strip()
+
+
+def _persist_nlp_analysis_for_version(db: Session, version: SOPVersion) -> None:
+    """Run NLP and persist to `profile_detections` (current SOP only; no legacy document fields)."""
+    persist_profile_detection_for_sop_version(db, version)
 
 
 def _parse_uuid_or_400(value: str, field_name: str = "id") -> uuid.UUID:
@@ -1123,6 +1131,8 @@ def create_document(
     db.refresh(sop)
     db.refresh(initial_version)
 
+    _persist_nlp_analysis_for_version(db, initial_version)
+
     _upsert_import_context_entities(db, sop, initial_version, background_tasks)
 
     return _build_editor_doc_response(sop, initial_version)
@@ -1216,6 +1226,8 @@ def update_document(
     db.commit()
     db.refresh(sop)
     db.refresh(current_version)
+
+    _persist_nlp_analysis_for_version(db, current_version)
 
     _upsert_import_context_entities(db, sop, current_version, background_tasks)
 
@@ -1438,6 +1450,8 @@ def create_version(
     db.refresh(version)
     db.refresh(sop)
 
+    _persist_nlp_analysis_for_version(db, version)
+
     if background_tasks:
         _schedule_semantic_job(background_tasks, "sop", sop.id, version.id)
     return _build_editor_version_response(version)
@@ -1519,6 +1533,8 @@ def duplicate_document(
     
     db.commit()
     db.refresh(new_sop)
+    db.refresh(new_version)
+    _persist_nlp_analysis_for_version(db, new_version)
     if background_tasks:
         _schedule_semantic_job(background_tasks, "sop", new_sop.id, new_version.id)
     return _build_editor_doc_response(new_sop, new_version)

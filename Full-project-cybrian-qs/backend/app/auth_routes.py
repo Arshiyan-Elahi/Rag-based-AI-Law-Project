@@ -17,6 +17,7 @@ load_dotenv()
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "change-me-in-production")
@@ -75,6 +76,26 @@ def get_current_user(
     if not user:
         raise credentials_exception
     return user
+
+
+def get_current_user_optional(
+    token: str | None = Depends(oauth2_scheme_optional),
+    db: Session = Depends(get_db),
+) -> User | None:
+    """
+    Same validation as get_current_user, but returns None when no/invalid token.
+    Used for endpoints that work anonymously but gain extra behavior when authenticated.
+    """
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        user_id = payload.get("sub")
+        if not user_id:
+            return None
+    except JWTError:
+        return None
+    return db.query(User).filter(User.id == user_id, User.is_active == True).first()
 
 
 @router.post("/register", response_model=AuthResponse)

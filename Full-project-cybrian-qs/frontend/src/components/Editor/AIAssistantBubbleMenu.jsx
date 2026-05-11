@@ -5,6 +5,10 @@ import { performAIAction } from '../../api/editorApi'
 import AIComparisonModal from './AIComparisonModal'
 import './AIAssistantUI.css'
 import { formatAiSuggestionForUi } from '../../utils/aiOutputFormatter'
+import {
+  selectionLooksLikeFormattedAiReport,
+  selectionMatchesLastAiSuggestion,
+} from '../../utils/aiActionSelection'
 
 const buildStructuredSelectionText = (editor, from, to) =>
   editor.state.doc.textBetween(from, to, '\n').trim()
@@ -43,15 +47,29 @@ const buildAcceptedContent = (aiResult, selectionMeta) => {
 const isEditorViewReady = (editor) =>
   Boolean(editor && editor.view && editor.view.dom && !editor.isDestroyed)
 
-const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true }) => {
+const ACTION_TEXT_WARNING_CHARS = 7000
+
+const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true, onPreviewSessionChange }) => {
   const [isAILoading, setIsAILoading] = useState(false)
   const [aiResult, setAIResult] = useState(null)
   const [isModalOpen, setIsModalOpen] = useState(false)
   const [menuPosition, setMenuPosition] = useState(null)
   const selectionRef = useRef(null)
+  /** Last successful /api/ai/action response for re-apply without re-parsing formatted UI text. */
+  const lastAiReplyRef = useRef(null)
   const menuRef = useRef(null)
   const isPointerSelectingRef = useRef(false)
   const [isEditorReady, setIsEditorReady] = useState(false)
+  /** Suppresses bubble reposition updates while an AI request runs or the result modal is open (avoids render storms). */
+  const pauseBubblePositioningRef = useRef(false)
+  const actionInFlightRef = useRef(false)
+  const lastMenuPositionRef = useRef(null)
+
+  const notifyPreviewSession = (active) => {
+    if (typeof onPreviewSessionChange === 'function') {
+      onPreviewSessionChange(active)
+    }
+  }
 
   useEffect(() => {
     if (!editor || !isEditable) return undefined
@@ -73,8 +91,10 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true }) => {
     if (!editor || !isEditable || !isEditorReady) return undefined
 
     const updatePosition = () => {
+      if (pauseBubblePositioningRef.current) return
       if (!isEditorViewReady(editor)) {
         selectionRef.current = null
+        lastMenuPositionRef.current = null
         setMenuPosition(null)
         return
       }
@@ -85,6 +105,7 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true }) => {
         const activeElement = document.activeElement
         if (!menuRef.current?.contains(activeElement)) {
           selectionRef.current = null
+          lastMenuPositionRef.current = null
           setMenuPosition(null)
         }
         return
@@ -96,6 +117,7 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true }) => {
 
         if (!selectedText) {
           selectionRef.current = null
+          lastMenuPositionRef.current = null
           setMenuPosition(null)
           return
         }
@@ -143,22 +165,39 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true }) => {
 
         const selectedFraction = Math.abs(to - from) / Math.max(1, editor.state.doc.content.size)
         selectionRef.current = { from, to, selectedText, structuredText, selectedFraction }
-        setMenuPosition({
-          top,
-          left,
-          placement,
-        })
+        const nextPos = { top, left, placement }
+        const prev = lastMenuPositionRef.current
+        if (
+          prev &&
+          prev.top === nextPos.top &&
+          prev.left === nextPos.left &&
+          prev.placement === nextPos.placement
+        ) {
+          return
+        }
+        lastMenuPositionRef.current = nextPos
+        setMenuPosition(nextPos)
       } catch {
         selectionRef.current = null
+        lastMenuPositionRef.current = null
         setMenuPosition(null)
       }
     }
 
-    editor.on('selectionUpdate', updatePosition)
-    editor.on('transaction', updatePosition)
-    const delayedUpdate = () => window.requestAnimationFrame(updatePosition)
+    // Coalesce to one layout pass per frame. Do not subscribe to every ProseMirror `transaction`
+    // (decorations, plugins, etc.) — that caused repeated setState and visible editor flicker.
+    let positionRafId = null
+    const delayedUpdate = () => {
+      if (positionRafId != null) return
+      positionRafId = window.requestAnimationFrame(() => {
+        positionRafId = null
+        updatePosition()
+      })
+    }
+    editor.on('selectionUpdate', delayedUpdate)
     const startPointerSelection = () => {
       isPointerSelectingRef.current = true
+      lastMenuPositionRef.current = null
       setMenuPosition(null)
     }
     const endPointerSelection = () => {
@@ -187,8 +226,11 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true }) => {
     updatePosition()
 
     return () => {
-      editor.off('selectionUpdate', updatePosition)
-      editor.off('transaction', updatePosition)
+      if (positionRafId != null) {
+        window.cancelAnimationFrame(positionRafId)
+        positionRafId = null
+      }
+      editor.off('selectionUpdate', delayedUpdate)
       if (dom) {
         dom.removeEventListener('mousedown', startPointerSelection)
       }
@@ -209,6 +251,26 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true }) => {
     const selectedText = savedSelection?.selectedText || ''
 
     if (!selectedText) return
+
+    const structuredForCheck = savedSelection.structuredText || selectedText
+    if (
+      (action === 'improve' || action === 'rewrite') &&
+      selectionLooksLikeFormattedAiReport(structuredForCheck)
+    ) {
+      const last = lastAiReplyRef.current
+      const canReapplyStructured =
+        last &&
+        last.action === action &&
+        last.structured &&
+        selectionMatchesLastAiSuggestion(structuredForCheck, last.suggestedPlain)
+      if (!canReapplyStructured) {
+        alert(
+          'This selection looks like a formatted AI report (for example a prior gap check or review output), not plain SOP text. Those actions need raw procedure text.\n\n' +
+            'Tip: use “Accept and Insert” in the review dialog to apply a suggestion you already generated, or select the original SOP paragraph before running Improve or Rewrite.',
+        )
+        return
+      }
+    }
 
     let sectionName = 'Selected text'
     let sectionType = 'Paragraph'
@@ -234,16 +296,41 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true }) => {
       // Best-effort section inference only.
     }
 
+    const structuredPayload = savedSelection.structuredText || selectedText
+    const lastReply = lastAiReplyRef.current
+    let textForApi = structuredPayload
+    let clientStructured = null
+    if (
+      lastReply &&
+      lastReply.action === action &&
+      lastReply.structured &&
+      selectionMatchesLastAiSuggestion(structuredPayload, lastReply.suggestedPlain)
+    ) {
+      clientStructured = lastReply.structured
+      textForApi = lastReply.originalText || structuredPayload
+    }
+    if ((textForApi || '').length > ACTION_TEXT_WARNING_CHARS) {
+      const proceed = window.confirm(
+        'This selection may be too long for the local model and can fail with context-limit errors.\n\nPlease select a smaller section if possible.\n\nContinue anyway?',
+      )
+      if (!proceed) return
+    }
+
+    if (actionInFlightRef.current) return
+    actionInFlightRef.current = true
+    pauseBubblePositioningRef.current = true
+    notifyPreviewSession(true)
     setIsAILoading(true)
     try {
       const result = await performAIAction({
         action,
-        text: savedSelection.structuredText || selectedText,
+        text: textForApi,
         document_id: sopMetadata?.documentId || null,
         section_id: `${savedSelection.from}-${savedSelection.to}`,
         sop_title: sopMetadata?.title || 'Untitled SOP',
         section_name: sectionName,
         section_type: sectionType,
+        client_structured_json: clientStructured,
       })
 
       const safeSuggestedText = formatAiSuggestionForUi({
@@ -252,17 +339,35 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true }) => {
         structuredData: result?.structured_data,
       })
 
+      lastAiReplyRef.current = {
+        action: result?.action || action,
+        structured: result?.structured_data || null,
+        suggestedPlain: stripHtml(safeSuggestedText),
+        originalText: result?.original_text || structuredPayload,
+      }
+
       setAIResult({
         ...result,
         suggested_text: safeSuggestedText,
         section_name: sectionName,
       })
       setIsModalOpen(true)
+      lastMenuPositionRef.current = null
       setMenuPosition(null)
     } catch (err) {
+      pauseBubblePositioningRef.current = false
+      notifyPreviewSession(false)
       console.error('AI action failed:', err)
-      alert(err.message || 'AI action failed. Please try again.')
+      const lines = [err.message || 'AI action failed. Please try again.']
+      if (err.validationOrParseError) {
+        lines.push('Technical detail (validation / parse):', err.validationOrParseError)
+      }
+      if (err.hint) {
+        lines.push('Hint:', err.hint)
+      }
+      alert(lines.join('\n\n'))
     } finally {
+      actionInFlightRef.current = false
       setIsAILoading(false)
     }
   }
@@ -277,7 +382,10 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true }) => {
 
     setIsModalOpen(false)
     setAIResult(null)
+    pauseBubblePositioningRef.current = false
+    notifyPreviewSession(false)
     selectionRef.current = null
+    lastAiReplyRef.current = null
   }
 
   return (
@@ -335,6 +443,8 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true }) => {
       <AIComparisonModal
         isOpen={isModalOpen}
         onClose={() => {
+          pauseBubblePositioningRef.current = false
+          notifyPreviewSession(false)
           setIsModalOpen(false)
           setAIResult(null)
         }}

@@ -187,6 +187,7 @@ export async function runUnifiedAssistantQuery({
   chatHistory = [],
   assistantActionConfirmation = null,
   surface = 'global_chatbot',
+  sessionId = null,
 }) {
   const routeMeta = matchRouteConfig(pathname)
   const contextualQuestion = buildContextualQuestion(question, pathname)
@@ -198,5 +199,6 @@ export async function runUnifiedAssistantQuery({
     assistant_action_confirmation: assistantActionConfirmation,
     surface,
     route: pathname,
+    session_id: sessionId || undefined,
   })
 }

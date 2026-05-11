@@ -122,6 +122,9 @@ class SOP(Base):
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
 
     versions = relationship("SOPVersion", back_populates="sop", cascade="all, delete-orphan")
+    profile_detections = relationship(
+        "ProfileDetection", back_populates="sop", cascade="all, delete-orphan"
+    )
 
 
 class SOPVersion(Base):
@@ -142,6 +145,46 @@ class SOPVersion(Base):
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
 
     sop = relationship("SOP", back_populates="versions")
+    profile_detections = relationship(
+        "ProfileDetection",
+        back_populates="sop_version_row",
+        cascade="all, delete-orphan",
+    )
+
+
+class ProfileDetection(Base):
+    """
+    NLP / style snapshot for a current SOP version (editor AI actions).
+    One logical active profile per (sop_id, sop_version_id); history kept via is_active.
+    """
+
+    __tablename__ = "profile_detections"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    sop_id = Column(UUID(as_uuid=True), ForeignKey("sops.id", ondelete="CASCADE"), nullable=False, index=True)
+    sop_version_id = Column(
+        UUID(as_uuid=True), ForeignKey("sop_versions.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    sop_version = Column(String(50), nullable=True)
+    profile_type = Column(String(80), nullable=False, default="nlp_action_profile")
+    source_hash = Column(String(64), nullable=False, index=True)
+    language = Column(String(32), nullable=True)
+    tone = Column(String(120), nullable=True)
+    formality = Column(String(80), nullable=True)
+    avg_sentence_words = Column(Float, nullable=True)
+    readability_score = Column(Float, nullable=True)
+    structure_json = Column(JSONB, nullable=True)
+    parameters_json = Column(JSONB, nullable=True)
+    detected_entities_json = Column(JSONB, nullable=True)
+    nlp_analysis_json = Column(JSONB, nullable=True)
+    prompt_block = Column(Text, nullable=True)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    sop = relationship("SOP", back_populates="profile_detections")
+    sop_version_row = relationship("SOPVersion", back_populates="profile_detections")
+
 
 class Deviation(Base):
     __tablename__ = "deviations"

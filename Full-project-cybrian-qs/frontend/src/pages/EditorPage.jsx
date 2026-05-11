@@ -275,6 +275,8 @@ const EditorPage = ({
   const [isLoadingDocument, setIsLoadingDocument] = useState(false)
   const [isSidebarOpen, setIsSidebarOpen] = useState(false)
   const [aiWidgetOpen, setAiWidgetOpen] = useState(false)
+  /** While the bubble AI action is in-flight or the comparison modal is open, skip autosave triggers. */
+  const [aiPreviewSessionActive, setAiPreviewSessionActive] = useState(false)
   const [compareBaseVersionId, setCompareBaseVersionId] = useState('')
   const [compareTargetVersionId, setCompareTargetVersionId] = useState('')
   const [diffVersions, setDiffVersions] = useState({ oldVersion: null, newVersion: null })
@@ -346,6 +348,7 @@ const EditorPage = ({
     extensions: editorExtensions,
     content: EMPTY_DOC,
     immediatelyRender: false,
+    shouldRerenderOnTransaction: false,
     onCreate: () => setIsEditorMounted(true),
     onDestroy: () => setIsEditorMounted(false),
     editorProps: {
@@ -354,6 +357,10 @@ const EditorPage = ({
       },
     },
   })
+
+  const handleAiPreviewSessionChange = useCallback((active) => {
+    setAiPreviewSessionActive(Boolean(active))
+  }, [])
 
   const currentVersion = versions.find((item) => item.id === currentVersionId) || null
   const isHistoricalView = Boolean(latestVersionId && currentVersionId && latestVersionId !== currentVersionId)
@@ -623,7 +630,7 @@ const EditorPage = ({
     if (!editor || !isEditorMounted || editor.isDestroyed) return
 
     const handleUpdate = () => {
-      if (hydrationRef.current || isHistoricalView) return
+      if (hydrationRef.current || isHistoricalView || aiPreviewSessionActive) return
       debouncedSave()
     }
 
@@ -633,12 +640,12 @@ const EditorPage = ({
       editor.off('update', handleUpdate)
       debouncedSave.cancel()
     }
-  }, [editor, isEditorMounted, debouncedSave, isHistoricalView])
+  }, [editor, isEditorMounted, debouncedSave, isHistoricalView, aiPreviewSessionActive])
 
   useEffect(() => {
-    if (hydrationRef.current || isHistoricalView) return
+    if (hydrationRef.current || isHistoricalView || aiPreviewSessionActive) return
     debouncedSave()
-  }, [metadata, sopStatus, auditTrail, versionNote, debouncedSave, isHistoricalView])
+  }, [metadata, sopStatus, auditTrail, versionNote, debouncedSave, isHistoricalView, aiPreviewSessionActive])
 
   useEffect(() => {
     if (!editor || !isEditorMounted || editor.isDestroyed) return
@@ -987,7 +994,12 @@ const EditorPage = ({
                   <div className="figma-paper">
                     <EditorContent editor={editor} />
                     <Suspense fallback={null}>
-                      <AIAssistantBubbleMenu editor={editor} sopMetadata={aiSopContext} isEditable={!isHistoricalView && isEditorMounted} />
+                      <AIAssistantBubbleMenu
+                        editor={editor}
+                        sopMetadata={aiSopContext}
+                        isEditable={!isHistoricalView && isEditorMounted}
+                        onPreviewSessionChange={handleAiPreviewSessionChange}
+                      />
                     </Suspense>
                   </div>
                 </EditorSurfaceErrorBoundary>

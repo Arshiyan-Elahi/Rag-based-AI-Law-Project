@@ -306,6 +306,8 @@ class AIActionRequest(BaseModel):
     sop_title: Optional[str] = None
     section_name: Optional[str] = None
     section_type: Optional[str] = None
+    # When the client already holds a validated structured result (e.g. re-apply), skip LLM.
+    client_structured_json: Optional[dict] = None
 
 class AIActionResponse(BaseModel):
     action: str

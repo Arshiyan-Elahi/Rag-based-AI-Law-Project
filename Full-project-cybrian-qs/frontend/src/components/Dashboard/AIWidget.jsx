@@ -39,6 +39,7 @@ export default function AIWidget() {
   const [actionToast, setActionToast] = useState('')
   const chatEndRef = useRef(null)
   const messagesRef = useRef(messages)
+  const serverSessionIdRef = useRef(null)
   const suggestions = routeMeta.suggestions
 
   const emitSOPRefresh = useCallback((reason, sopId) => {
@@ -91,6 +92,7 @@ export default function AIWidget() {
   }, [location.pathname, messages])
 
   useEffect(() => {
+    serverSessionIdRef.current = null
     try {
       const raw = localStorage.getItem(STORAGE_KEY_BY_PATH)
       const parsed = raw ? JSON.parse(raw) : {}
@@ -137,6 +139,7 @@ export default function AIWidget() {
         chatHistory: chatHistoryPayload,
         assistantActionConfirmation: opts.assistantActionConfirmation || null,
         surface: 'kl_assistant',
+        sessionId: serverSessionIdRef.current,
       })
       const action = result?.assistant_action
       if (action?.requires_confirmation && action?.type === 'delete_sop') {
@@ -171,6 +174,9 @@ export default function AIWidget() {
         text: result.answer || result.text || result.response || '—',
         tags: result.sources?.map(s => s.label) ?? [],
         time: nowTime(),
+      }
+      if (result.session_id) {
+        serverSessionIdRef.current = result.session_id
       }
       setMessages(prev => [...prev, aiMsg])
     } catch (err) {

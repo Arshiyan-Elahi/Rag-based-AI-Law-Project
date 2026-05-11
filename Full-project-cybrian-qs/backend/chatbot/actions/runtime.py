@@ -46,7 +46,7 @@ class _NoopReranker:
         return docs
 
 
-def _get_action_llm(temperature: float = 0.2):
+def _get_action_llm(temperature: float = 0.1):
     return create_chat_llm(
         temperature=temperature,
         max_output_tokens=int(os.getenv("ACTION_MAX_OUTPUT_TOKENS") or "4096"),
@@ -54,7 +54,7 @@ def _get_action_llm(temperature: float = 0.2):
     )
 
 
-def _get_action_fallback_llm(temperature: float = 0.2):
+def _get_action_fallback_llm(temperature: float = 0.1):
     return create_chat_llm(
         temperature=temperature,
         max_output_tokens=int(os.getenv("ACTION_MAX_OUTPUT_TOKENS") or "4096"),

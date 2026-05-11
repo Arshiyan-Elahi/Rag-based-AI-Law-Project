@@ -98,11 +98,29 @@ class LLMRouter:
                 response_text = response_text.split("```")[1].strip()
             
             route_data = json.loads(response_text)
-            
-            # Basic validation
-            if not isinstance(route_data.get("collections"), list):
-                route_data["collections"] = ["sops", "deviations"] # Default fallback
-            
+
+            valid_sections = {"sops", "deviations", "capas", "audits", "decisions"}
+            cols = route_data.get("collections")
+            if not isinstance(cols, list):
+                cols = []
+            normalized = []
+            for c in cols:
+                if not isinstance(c, str):
+                    continue
+                key = c.strip().lower()
+                if key in valid_sections:
+                    normalized.append(key)
+            # Empty list from the LLM used to skip all retrievers and force refusal.
+            if not normalized:
+                normalized = list(keyword_collections or []) or [
+                    "sops",
+                    "deviations",
+                    "capas",
+                    "audits",
+                    "decisions",
+                ]
+            route_data["collections"] = normalized
+
             return route_data
         except Exception as e:
             logging.error(f"LLM Routing failed: {e}")

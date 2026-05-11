@@ -11,12 +11,19 @@ from .schemas import (
     ProfileSuggestionResponse, AcceptRejectSuggestionRequest,
     ProfileVersionResponse, ProfileDetectionOutput
 )
-from .services.profile_analysis import analyze_sop_traceable
+from .services.profile_analysis import analyze_sop_text_profile, analyze_sop_traceable
 
 router = APIRouter(prefix="/api/profiles", tags=["profiles"])
 
 # Mock tenant_id for now as per existing pattern in other routes
 MOCK_TENANT_ID = "00000000-0000-0000-0000-000000000000"
+
+
+def _safe_confidence(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 @router.post("", response_model=ClientProfileResponse)
 def create_profile(payload: ClientProfileCreate, db: Session = Depends(get_db)):
@@ -60,6 +67,47 @@ def list_profiles(db: Session = Depends(get_db)):
     List all available client profiles.
     """
     return db.query(ClientProfile).all()
+
+@router.post("/detect", response_model=ProfileDetectionOutput)
+def detect_profile_from_text(payload: dict):
+    """
+    Detect an SOP profile from raw text without persisting suggestions.
+    Useful for KL Assistant / chatbot context and smoke testing.
+    """
+    text = str(payload.get("text") or payload.get("content") or "").strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="text is required")
+    try:
+        result = analyze_sop_text_profile(
+            text,
+            use_llm=bool(payload.get("use_llm", False)),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Profile detection failed: {exc}")
+
+    suggestions = []
+    for suggestion in result.get("profile_suggestions") or []:
+        suggestions.append(
+            {
+                "suggestion_type": suggestion.get("suggestion_type", "general"),
+                "suggested_rule": suggestion.get("suggested_rule", ""),
+                "evidence": [
+                    {
+                        "text": suggestion.get("evidence_from_document", ""),
+                        **(suggestion.get("evidence_metadata") or {}),
+                    }
+                ]
+                if suggestion.get("evidence_from_document")
+                else [],
+                "confidence": _safe_confidence(suggestion.get("confidence_score")),
+            }
+        )
+    return {
+        "summary": result.get("summary", ""),
+        "detected_domain": result.get("detected_domain", ""),
+        "suggestions": suggestions,
+        "overall_confidence_score": result.get("overall_confidence_score", 0.0),
+    }
 
 @router.get("/{profile_id}", response_model=ClientProfileResponse)
 def get_profile(profile_id: UUID, db: Session = Depends(get_db)):
@@ -174,7 +222,7 @@ async def analyze_profile(
                 suggestion_type=sug.get("suggestion_type", "general"),
                 suggested_rule=sug.get("suggested_rule", ""),
                 evidence_json=evidence_data,
-                confidence=sug.get("confidence_score", 0.0),
+                confidence=_safe_confidence(sug.get("confidence_score")),
                 status="pending"
             )
             db.add(new_sug)

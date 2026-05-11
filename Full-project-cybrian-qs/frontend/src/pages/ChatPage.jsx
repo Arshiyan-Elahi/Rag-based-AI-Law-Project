@@ -28,6 +28,8 @@ function createInitialConversation() {
     dateGroup: 'Heute',
     hasAlert: false,
     tags: [{ id: 'source-sops', label: 'SOPs', type: 'sop' }],
+    /** Server-side chat_sessions id when authenticated; reused for follow-up turns. */
+    serverSessionId: null,
     messages: [
       {
         id: 'm-welcome',
@@ -139,6 +141,7 @@ export default function ChatPage() {
       messages: [],
       activeSources: [],
       contextTags: [],
+      serverSessionId: null,
     }
     setConversations((prev) => [next, ...prev])
     setActiveConvId(id)
@@ -187,6 +190,7 @@ export default function ChatPage() {
           chatHistory: chatHistoryPayload,
           assistantActionConfirmation: opts.assistantActionConfirmation || null,
           surface: 'global_chatbot',
+          sessionId: activeConversation?.serverSessionId || null,
         })
         const action = result?.assistant_action
         if (action?.requires_confirmation && action?.type === 'delete_sop') {
@@ -215,11 +219,14 @@ export default function ChatPage() {
             navigate('/sops')
           }
         }
-        const sourceTags = (result.sources || []).slice(0, 5).map((s, idx) => ({
-          id: `src-${Date.now()}-${idx}`,
-          label: s.label || s.id || `Quelle ${idx + 1}`,
-          type: (s.type || 'sop').toLowerCase(),
-        }))
+        const strictInventory = Boolean(result?.retrieval_stats?.strict_mode)
+        const sourceTags = strictInventory
+          ? []
+          : (result.sources || []).slice(0, 5).map((s, idx) => ({
+              id: `src-${Date.now()}-${idx}`,
+              label: s.label || s.id || `Quelle ${idx + 1}`,
+              type: (s.type || 'sop').toLowerCase(),
+            }))
         const aiMsg = {
           id: `a-${Date.now()}`,
           sender: 'ai',
@@ -237,6 +244,7 @@ export default function ChatPage() {
                   messages: [...c.messages, aiMsg],
                   activeSources: sourceTags,
                   contextTags: sourceTags.slice(0, 2),
+                  serverSessionId: result.session_id || c.serverSessionId || null,
                 }
               : c,
           ),
@@ -264,6 +272,7 @@ export default function ChatPage() {
     [
       activeConvId,
       activeConversation?.messages,
+      activeConversation?.serverSessionId,
       isSending,
       location.pathname,
       navigate,

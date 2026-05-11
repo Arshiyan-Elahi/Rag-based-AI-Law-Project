@@ -1,6 +1,29 @@
 const API_BASE = import.meta.env.VITE_API_BASE || ''
 const SIDEBAR_COUNTS_REFRESH_EVENT = 'sidebar-counts-refresh'
 
+/** Merge Authorization when a JWT is stored (enables server-side chat history on /api/ai/query). */
+function buildOptionalAuthHeaders() {
+  if (typeof window === 'undefined') return {}
+  try {
+    const flat = localStorage.getItem('access_token')
+    if (flat && String(flat).trim()) {
+      return { Authorization: `Bearer ${String(flat).trim()}` }
+    }
+    for (const key of ['auth', 'cybrain_auth']) {
+      const raw = localStorage.getItem(key)
+      if (!raw) continue
+      const parsed = JSON.parse(raw)
+      const token = parsed?.access_token || parsed?.token
+      if (token && String(token).trim()) {
+        return { Authorization: `Bearer ${String(token).trim()}` }
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return {}
+}
+
 function notifySidebarCountsRefresh() {
   if (typeof window === 'undefined') return
   window.dispatchEvent(new CustomEvent(SIDEBAR_COUNTS_REFRESH_EVENT))
@@ -13,6 +36,8 @@ function notifySidebarCountsRefresh() {
 async function throwApiError(res, fallbackMsg) {
   let detail = fallbackMsg
   let rawBody = ''
+  /** @type {{ validationOrParseError?: string, hint?: string }} */
+  const extras = {}
   try {
     rawBody = await res.text()
     if (rawBody) {
@@ -22,6 +47,18 @@ async function throwApiError(res, fallbackMsg) {
           const d = body.detail
           if (Array.isArray(d)) {
             detail = d.map((x) => (typeof x === 'string' ? x : x?.msg || JSON.stringify(x))).join(' ')
+          } else if (typeof d === 'object' && d !== null) {
+            if (typeof d.message === 'string' && d.message) {
+              detail = d.message
+              if (d.validation_or_parse_error != null && String(d.validation_or_parse_error).trim()) {
+                extras.validationOrParseError = String(d.validation_or_parse_error)
+              }
+              if (d.hint != null && String(d.hint).trim()) {
+                extras.hint = String(d.hint)
+              }
+            } else {
+              detail = JSON.stringify(d)
+            }
           } else {
             detail = typeof d === 'string' ? d : JSON.stringify(d)
           }
@@ -51,6 +88,8 @@ async function throwApiError(res, fallbackMsg) {
   const err = new Error(detail)
   err.status = res.status
   err.responseBody = rawBody
+  if (extras.validationOrParseError) err.validationOrParseError = extras.validationOrParseError
+  if (extras.hint) err.hint = extras.hint
   throw err
 }
 
@@ -247,6 +286,9 @@ export async function queryAI(question, options = {}) {
   if (options.route) {
     payload.route = options.route
   }
+  if (options.session_id && String(options.session_id).trim()) {
+    payload.session_id = String(options.session_id).trim()
+  }
 
   const controller = new AbortController()
   const timeoutMs = 70000
@@ -255,7 +297,7 @@ export async function queryAI(question, options = {}) {
   try {
     res = await fetch(`${API_BASE}/api/ai/query`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...buildOptionalAuthHeaders() },
       body: JSON.stringify(payload),
       signal: controller.signal,
     })
@@ -315,6 +357,7 @@ export async function performAIAction(payload) {
         sop_title: payload?.sop_title || null,
         section_name: payload?.section_name || payload?.section_title || null,
         section_type: payload?.section_type || null,
+        client_structured_json: payload?.client_structured_json || null,
       }),
       signal: controller.signal,
     })

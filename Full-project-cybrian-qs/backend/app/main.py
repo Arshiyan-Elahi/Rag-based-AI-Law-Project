@@ -48,6 +48,8 @@ def _ensure_performance_indexes() -> None:
         "CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_entity_version ON knowledge_chunks (entity_type, entity_id, entity_version_id)",
         "CREATE INDEX IF NOT EXISTS idx_ai_link_suggestions_source_status ON ai_link_suggestions (source_entity_type, source_entity_id, status)",
         "CREATE INDEX IF NOT EXISTS idx_ai_link_suggestions_target_status ON ai_link_suggestions (target_entity_type, target_entity_id, status)",
+        "CREATE INDEX IF NOT EXISTS ix_profile_detections_sop_version_active ON profile_detections (sop_id, sop_version_id, is_active)",
+        "CREATE INDEX IF NOT EXISTS ix_profile_detections_source_hash ON profile_detections (source_hash)",
     ]
     with engine.begin() as conn:
         for stmt in statements:

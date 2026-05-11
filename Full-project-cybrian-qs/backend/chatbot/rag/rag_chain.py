@@ -12,6 +12,8 @@ import re
 import json
 import math
 import logging
+import uuid
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Literal
@@ -28,7 +30,11 @@ from retrieval.federated_retriever import FederatedRetriever
 from retrieval.hybrid_retriever import rag_unified_enabled
 from retrieval.query_router import route_query, describe_route
 from retrieval.llm_router import LLMRouter
-from chatbot.llm.provider import create_chat_llm, get_local_llm_config, is_local_llm_unreachable_error
+from chatbot.llm.provider import (
+    classify_llm_exception,
+    create_chat_llm,
+    get_local_llm_config,
+)
 import os
 from dotenv import load_dotenv
 from app.database import SessionLocal
@@ -45,6 +51,17 @@ RAG_DEBUG_RETRIEVAL = os.getenv("RAG_DEBUG_RETRIEVAL", "false").strip().lower() 
 RAG_DEBUG_MAX_CHUNKS = int(os.getenv("RAG_DEBUG_MAX_CHUNKS", "8"))
 logger = logging.getLogger(__name__)
 RAG_STRICT_INVENTORY_MODE = os.getenv("RAG_STRICT_INVENTORY_MODE", "false").strip().lower() == "true"
+# When false (default), SOP count/list still runs from query intent (recommended for QA).
+RAG_DISABLE_SOP_INVENTORY = os.getenv("RAG_DISABLE_SOP_INVENTORY", "false").strip().lower() == "true"
+
+
+def _console_safe(value) -> str:
+    """Keep debug console output from failing on Windows non-UTF-8 code pages."""
+    return str(value).encode("ascii", errors="replace").decode("ascii")
+
+
+def _safe_print(message: str) -> None:
+    print(_console_safe(message), flush=True)
 
 
 def _json_safe_float(v, default: float = 0.0) -> float:
@@ -69,11 +86,163 @@ def _sanitize_citation_list(cits: List[dict]) -> List[dict]:
     return out
 
 
+def _db_active_sop_count() -> int:
+    db = SessionLocal()
+    try:
+        return int(db.query(SOP).filter(SOP.is_active == True).count())  # noqa: E712
+    finally:
+        db.close()
+
+
+def _db_active_sop_rows(limit: int) -> List[Tuple[str, str, str]]:
+    """(sop_number, title, status_label) for active SOPs from PostgreSQL."""
+    db = SessionLocal()
+    try:
+        rows_db: List[Tuple[str, str, str]] = []
+        for sop in (
+            db.query(SOP)
+            .filter(SOP.is_active == True)  # noqa: E712
+            .order_by(SOP.sop_number)
+            .limit(max(1, limit))
+            .all()
+        ):
+            rows_db.append((str(sop.sop_number or ""), str(sop.title or "Untitled"), "active"))
+        return rows_db
+    finally:
+        db.close()
+
+
+def _extract_active_sop_from_prompt(prompt: str) -> tuple[str, str]:
+    """Parse LIVE_ASSISTANT_CONTEXT / ACTIVE_SOP hints injected by the API."""
+    raw = str(prompt or "")
+    m = re.search(
+        r"Active SOP:\s*([^\n|]+?)\s*\|\s*title=([^\n|]+)",
+        raw,
+        re.IGNORECASE,
+    )
+    if m:
+        ref = m.group(1).strip()
+        title = m.group(2).strip()
+        if ref.lower() not in ("unknown", "none", ""):
+            return ref, title if title.lower() != "unknown" else ""
+    m = re.search(r"ACTIVE_SOP=([^\s\n|]+)", raw, re.IGNORECASE)
+    if m:
+        return m.group(1).strip(), ""
+    return "", ""
+
+
+def _strip_sources_footer_from_answer(text: str) -> str:
+    """Remove trailing 'Sources:' / '📎 Sources:' blocks so UI + citations are single source."""
+    s = (text or "").strip()
+    if not s:
+        return ""
+    pattern = re.compile(
+        r"(?:\n\n|\n|^)(?:📎\s*)?sources?\s*:.*$",
+        re.IGNORECASE | re.DOTALL,
+    )
+    return pattern.sub("", s).rstrip()
+
+
+def _strip_sources_lines_from_answer(text: str) -> str:
+    """Drop standalone 'Sources:' / '📎 Sources:' lines (LLM duplicates app citation UI)."""
+    if not (text or "").strip():
+        return ""
+    out: List[str] = []
+    for line in (text or "").splitlines():
+        if re.match(r"^\s*(?:📎\s*)?sources?\s*:\s*", line, re.IGNORECASE):
+            continue
+        out.append(line)
+    return "\n".join(out).rstrip()
+
+
+def _dedupe_citations_by_ref(cits: List[dict]) -> List[dict]:
+    seen: set[str] = set()
+    out: List[dict] = []
+    for c in cits or []:
+        if not isinstance(c, dict):
+            continue
+        ref = str(c.get("ref") or "").strip().lower()
+        key = ref or str(id(c))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(c)
+    return out
+
+
+def _format_sources_footer(cits: List[dict], max_refs: int = 14) -> str:
+    refs: List[str] = []
+    seen: set[str] = set()
+    for c in cits or []:
+        if not isinstance(c, dict):
+            continue
+        r = str(c.get("ref") or "").strip()
+        if not r or r.startswith("INDEX-") or r.startswith("#"):
+            continue
+        rl = r.lower()
+        if rl in seen:
+            continue
+        seen.add(rl)
+        refs.append(r)
+        if len(refs) >= max_refs:
+            break
+    if not refs:
+        return ""
+    return f"Sources: {', '.join(refs)}"
+
+
 def _truncate_text(text: str, limit: int) -> str:
     text = (text or "").strip()
     if limit <= 0 or len(text) <= limit:
         return text
     return text[: max(limit - 1, 0)].rstrip() + "…"
+
+
+def _canonical_entity_id_key(raw: str) -> str:
+    """Match Qdrant entity_id to Postgres UUID strings across formats."""
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    try:
+        return str(uuid.UUID(s))
+    except (ValueError, AttributeError, TypeError):
+        return s
+
+
+def _strip_injected_context_blocks(query: str) -> str:
+    """Use core user wording for keyword routing when the prompt carries UI context."""
+    q = (query or "").strip()
+    for marker in (
+        "\n\nRAG_HINTS:",
+        "\n\nLIVE_ASSISTANT_CONTEXT",
+        "\n\nPLANNED_ASSISTANT_ACTION:",
+    ):
+        if marker in q:
+            q = q.split(marker, 1)[0].strip()
+    return q
+
+
+def _normalize_router_metadata_filters(filters: dict) -> dict:
+    """
+    LLM router uses sop_number / deviation_number keys; Qdrant payloads use ref_number
+    at the top level for all entity types.
+    """
+    if not isinstance(filters, dict):
+        return {}
+    out = dict(filters)
+    id_aliases = (
+        ("sop_number", "ref_number"),
+        ("deviation_number", "ref_number"),
+        ("capa_number", "ref_number"),
+        ("finding_number", "ref_number"),
+        ("audit_number", "ref_number"),
+        ("decision_number", "ref_number"),
+    )
+    for alt_key, canonical in id_aliases:
+        alt_val = out.get(alt_key)
+        if alt_val and not out.get(canonical):
+            out[canonical] = alt_val
+    return out
 
 
 def _debug_chunk_summary(doc: Document, idx: int) -> str:
@@ -85,7 +254,7 @@ def _debug_chunk_summary(doc: Document, idx: int) -> str:
     snippet = _truncate_text((doc.page_content or "").replace("\n", " ").strip(), 220)
     return (
         f"[rag-debug] chunk#{idx} section={section} ref={ref} "
-        f"title=\"{title}\" score={score:.4f} text=\"{snippet}\""
+        f"title=\"{_console_safe(title)}\" score={score:.4f} text=\"{_console_safe(snippet)}\""
     )
 
 
@@ -164,7 +333,11 @@ class HybridRAGChain:
 
 SMART_SYSTEM = """\
 You are a precise, bilingual QMS/IT Compliance AI Assistant integrated with a
-production Hybrid RAG system.
+production Hybrid RAG system. You act as a QA assistant inside the SOP editor: lead
+with a direct answer, stay query-focused (about 4–8 short lines unless the user asks
+for full detail), and use LIVE_ASSISTANT_CONTEXT / active SOP hints in the user message
+when the question is about "this SOP", "current", or linked deviations, CAPAs, audits,
+or decisions.
 
 You have access to a structured Qdrant vector database with the following SEPARATE
 collections. You MUST search the correct collection based on the user's intent:
@@ -271,10 +444,11 @@ Example: DEV-IT-101 → SOP-IT-001 (OT access management)
 Proactively surface this link as: [RELATED SOP: SOP-IT-001]
 
 RULE 10 — REFUSAL RULE
-If the retrieved context does not contain enough information to answer
-confidently, say:
-"The available records do not contain sufficient detail to answer this
-question. Please check [collection name] or provide more context."
+When RETRIEVED CONTEXT includes records that bear on the question, you MUST
+answer from that context (with citations). Refuse only when the retrieved
+snippets are empty, off-topic, or clearly unrelated to the question.
+If you must refuse, use one short sentence stating that no relevant records
+were found (do not copy boilerplate from these instructions).
 Never hallucinate fields, dates, or root causes that are null or missing
 in the data.
 """
@@ -317,23 +491,22 @@ STEP 2 — [ANSWER]
   • If version or effective date appears in the context, you may include it
     in the citation line, e.g. [SOP-QA-010 v4.0 | effective: YYYY-MM-DD]
 
-  For non-trivial answers, use this structure (plain text, no markdown tables):
+  For non-trivial answers, you may use short plain-text sections (no markdown tables):
   Summary: one short paragraph
-  Details: bullet lines, each with citations
+  Details: only the bullets needed to answer the question (each with [REF] citations)
   Status: current status / impact when known from context
-  Cross-refs: related SOPs, deviations, CAPAs, audits, or decisions if grounded in context
+  Cross-refs: only if directly relevant to the question
 
   Do not use markdown headings (no #), bold, tables, or code fences.
-  Stay within 400 words unless the user explicitly asks for full detail.
-  End the [ANSWER] section with a line:
-  Sources: list every cited record ID in brackets, comma-separated
-  (You may prefix that line with 📎 for example: "📎 Sources: [SOP-IT-001], [DEV-IT-401]")
+  Stay within ~200 words unless the user explicitly asks for full detail.
+  Do NOT add a separate "Sources" or "📎 Sources" line in [ANSWER]; cite facts inline
+  with [SOP-…], [DEV-…], etc., and list structured citations only in ---CITATIONS--- below.
 
 STEP 3 — [CONFIDENCE]
   One line, e.g.:
   [CONFIDENCE] HIGH — exact record aligned with an identifier in context;
   or MEDIUM — semantic match, recommend verification;
-  or LOW — insufficient data; refusal rule applies.
+  or LOW — partial context only; still summarize what is present and cite it.
 
 ────────────────────────────────────────
 FORMAT RULES
@@ -478,8 +651,23 @@ def _parse_answer_citations_suggestions(raw: str) -> Tuple[str, List[dict], List
     if conf_match:
         confidence = conf_match.group(1).strip()
 
+    if not (answer or "").strip() and raw_content:
+        stripped = re.sub(
+            r"\[REASONING\][\s\S]*?(?=\[ANSWER\]|\[CONFIDENCE\]|$)",
+            "",
+            raw_content,
+            flags=re.IGNORECASE,
+        ).strip()
+        stripped = re.sub(r"\[ANSWER\]\s*", "", stripped, flags=re.IGNORECASE).strip()
+        stripped = re.sub(r"\[CONFIDENCE\][\s\S]*$", "", stripped, flags=re.IGNORECASE).strip()
+        if stripped:
+            answer = stripped[:8000]
+
     # Clamp suggestions
     suggestions = [s for s in suggestions if isinstance(s, str)][:4]
+
+    answer = _strip_sources_lines_from_answer(answer)
+    answer = _strip_sources_footer_from_answer(answer)
 
     return answer, citations, suggestions, reasoning, confidence
 
@@ -618,8 +806,12 @@ def _strict_sop_inventory_response(
     query: str,
     retriever: HybridRetriever | None = None,
     mode: Literal["count", "list"] = "list",
+    full_prompt: str = "",
 ) -> dict:
-    """Build deterministic SOP inventory from the SOP section corpus (deduped by SOP id)."""
+    """Deterministic SOP count/list: PostgreSQL active count + indexed distinct SOPs."""
+    prompt_for_active = (full_prompt or query or "").strip()
+    active_ref, active_title = _extract_active_sop_from_prompt(prompt_for_active)
+
     inventory_docs: List[Document] = list(docs or [])
     allowed_ids: set[str] = set()
     if retriever is not None:
@@ -633,7 +825,8 @@ def _strict_sop_inventory_response(
             if corpus_docs:
                 if allowed_ids:
                     inventory_docs = [
-                        d for d in corpus_docs
+                        d
+                        for d in corpus_docs
                         if str((d.metadata or {}).get("entity_id", "")) in allowed_ids
                     ]
                 else:
@@ -678,78 +871,146 @@ def _strict_sop_inventory_response(
         rows.append((display_ref, title, status))
 
     rows = sorted(rows, key=lambda x: (x[0] or "").lower())
-    # Use live PostgreSQL scoped IDs when available for authoritative SOP count.
-    total = len(allowed_ids) if allowed_ids else len(rows)
+    indexed_distinct = len(rows)
+    db_total = _db_active_sop_count()
     list_cap = int(os.getenv("SOP_INVENTORY_LIST_MAX", "50"))
 
+    if mode == "list" and not rows and db_total > 0:
+        rows = _db_active_sop_rows(list_cap * 2)[:list_cap]
+        rows = sorted(rows, key=lambda x: (x[0] or "").lower())
+
+    def _inventory_citations() -> List[dict]:
+        cits: List[dict] = [
+            {
+                "ref": "SOP database",
+                "title": "Active SOP records (PostgreSQL)",
+                "type": "metadata",
+                "excerpt": f"{db_total} active SOP(s) in the database.",
+                "score": 1.0,
+            },
+        ]
+        if indexed_distinct != db_total:
+            cits.append(
+                {
+                    "ref": "SOP index",
+                    "title": "Indexed SOP knowledge",
+                    "type": "metadata",
+                    "excerpt": f"{indexed_distinct} distinct SOP(s) in the vector/BM25 index.",
+                    "score": 0.9,
+                }
+            )
+        for ref, title, status in rows[: min(12, list_cap)]:
+            cits.append(
+                {
+                    "ref": ref,
+                    "title": title,
+                    "type": "SOP",
+                    "excerpt": f"Status: {status}",
+                    "score": 0.5,
+                }
+            )
+        if active_ref:
+            cits.insert(
+                1,
+                {
+                    "ref": active_ref,
+                    "title": active_title or "Active SOP (editor)",
+                    "type": "SOP",
+                    "excerpt": "Currently open in the SOP editor.",
+                    "score": 0.95,
+                },
+            )
+        return _dedupe_citations_by_ref(_sanitize_citation_list(cits))
+
     if mode == "count":
-        if total == 0:
+        count_citations: List[dict] = []
+        if db_total == 0 and indexed_distinct == 0:
             count_answer = (
-                "No active SOP records were found in the current indexed dataset.\n\n"
+                "No active SOP records were found in the database or in the indexed knowledge set.\n\n"
                 "If SOPs were recently added, run indexing and ask again."
             )
         else:
-            sample = ", ".join(f"{ref} ({title})" for ref, title, _ in rows[:5])
-            count_answer = (
-                f"There are {total} active SOP record(s) in the indexed dataset.\n\n"
-                f"Top matches: {sample}."
-            )
+            lines = []
+            if indexed_distinct != db_total:
+                lines.append(
+                    f"Database has {db_total} SOP(s); indexed knowledge contains {indexed_distinct} SOP(s)."
+                )
+            else:
+                lines.append(
+                    f"There are {db_total} SOP(s) in the database (active records)."
+                )
+            if active_ref:
+                tpart = f", {active_title}" if active_title else ""
+                lines.append(f"The currently active SOP is {active_ref}{tpart}.")
+            count_citations = _inventory_citations()
+            foot = _format_sources_footer(count_citations)
+            if foot:
+                lines.append("")
+                lines.append(foot)
+            count_answer = "\n".join(lines)
         return {
-        "answer": count_answer,
-        "citations": [
-            {
-                "ref": f"INDEX-SOP-COUNT({total})",
-                "title": "Indexed SOP inventory",
-                "type": "sop",
-                "excerpt": f"Distinct SOPs in SOP index: {total}.",
-            }
-        ],
-        "suggestions": [
-            "List all SOPs with titles and status",
-            "What does SOP-IT-001 cover?",
-            "Which SOPs mention access control?",
-        ],
-        "retrieval_stats": {},
-        "routed_to": "SOPs (strict count)",
-        "cached": False,
-        "metadata_snapshot": [],
-        "audit_log_snapshot": [],
-        "action_metadata": {
-            "query": query,
-            "routing": ["sops"],
-            "latency_ms": 0.0,
-            "timestamp": time.time(),
-            "model": "deterministic",
-            "strict_mode": "sop_inventory_count",
-        },
-    }
+            "answer": count_answer,
+            "citations": count_citations if db_total or indexed_distinct else [],
+            "suggestions": [
+                "List all SOPs with titles",
+                "What does the active SOP cover?",
+                "Which deviations link to this SOP?",
+            ],
+            "retrieval_stats": {},
+            "routed_to": "SOPs (strict count)",
+            "cached": False,
+            "metadata_snapshot": [],
+            "audit_log_snapshot": [],
+            "action_metadata": {
+                "query": query,
+                "routing": ["sops"],
+                "latency_ms": 0.0,
+                "timestamp": time.time(),
+                "model": "deterministic",
+                "strict_mode": "sop_inventory_count",
+            },
+        }
 
     key_points = "\n".join(
         [f"- {ref}: {title} [{status}]" for ref, title, status in rows[:list_cap]]
     )
-    if total > list_cap:
-        key_points += f"\n- … and {total - list_cap} more (truncated; increase SOP_INVENTORY_LIST_MAX to show more in list mode)."
-    sources_lines = "\n".join(
-        [f"- {ref}: {title} (SOP)" for ref, title, _ in rows[:list_cap]]
+    if len(rows) > list_cap:
+        key_points += (
+            f"\n- … and {len(rows) - list_cap} more (truncated; increase SOP_INVENTORY_LIST_MAX)."
+        )
+    citations = _inventory_citations()
+
+    answer_lines: List[str] = []
+    if indexed_distinct != db_total:
+        answer_lines.append(
+            f"Database has {db_total} SOP(s); indexed knowledge contains {indexed_distinct} SOP(s)."
+        )
+    else:
+        answer_lines.append(
+            f"There are {db_total} SOP(s) in the database (active records)."
+        )
+    answer_lines.append("")
+    answer_lines.append("SOP list:")
+    answer_lines.append(
+        key_points if key_points else "(No SOP rows in the index; list above is from the database.)"
     )
-    citations = [
-        {"ref": ref, "title": title, "type": "SOP", "excerpt": f"Status: {status}"}
-        for ref, title, status in rows[: list_cap * 2]
-    ][:200]
+    if active_ref:
+        tpart = f", {active_title}" if active_title else ""
+        answer_lines.append("")
+        answer_lines.append(f"Current SOP in the editor: {active_ref}{tpart}.")
+    foot = _format_sources_footer(citations)
+    if foot:
+        answer_lines.append("")
+        answer_lines.append(foot)
+
     suggestions = [
-        "How many SOPs are in the index?",
-        "Show details for a specific SOP by number",
-        "Find SOPs related to access control",
+        "How many SOPs are in the database?",
+        "Summarize the active SOP",
+        "What deviations link to this SOP?",
     ]
 
-    answer = (
-        f"Found {total} active SOP record(s).\n\n"
-        f"SOP list:\n{key_points if key_points else 'No SOPs found in the current index.'}\n\n"
-        f"Sources:\n{sources_lines if sources_lines else 'None.'}"
-    )
-
     return {
-        "answer": answer,
+        "answer": "\n".join(answer_lines),
         "citations": citations,
         "suggestions": suggestions,
         "retrieval_stats": {},
@@ -851,6 +1112,54 @@ class SmartRAGChain:
                 return match.group(0).upper()
         return ""
 
+    def _retrieve_ranked_for_section(
+        self,
+        section: str,
+        query_for_routing: str,
+        metadata_filters: dict,
+        active_doc_id: str,
+        num_target_sections: int,
+    ) -> tuple[str, List[Document], int]:
+        """Hybrid retrieve + rerank for one router section (thread-safe per section retriever)."""
+        retriever = self.federated.retrievers.get(section)
+        if not retriever:
+            return section, [], 0
+        try:
+            section_filters = dict(metadata_filters or {})
+            section_filters["allowed_entity_ids"] = self._get_active_entity_ids(section)
+            retriever.metadata_filters = section_filters
+            if rag_unified_enabled():
+                retriever.category_filter = section
+            else:
+                retriever.category_filter = None
+            docs = retriever.invoke(query_for_routing)
+            allowed_raw = section_filters.get("allowed_entity_ids") or []
+            allowed_ids = {
+                _canonical_entity_id_key(str(x))
+                for x in allowed_raw
+                if str(x).strip()
+            }
+            if allowed_ids:
+                docs = [
+                    d
+                    for d in docs
+                    if _canonical_entity_id_key(
+                        str((d.metadata or {}).get("entity_id") or (d.metadata or {}).get("source_id") or "")
+                    )
+                    in allowed_ids
+                ]
+            top_n = 20 if num_target_sections == 1 else 10
+            ranked = self.federated.reranker.rerank_top_n(query_for_routing, docs, top_n)
+            max_chunks = 6 if active_doc_id else 4
+            unique_limit = 15 if num_target_sections == 1 else 8
+            ranked = _unique_by_source(ranked, unique_limit, max_per_source=max_chunks)
+            for d in ranked:
+                d.metadata["_section"] = section
+            return section, ranked, len(ranked)
+        except Exception as e:
+            logger.warning("[rag-retrieval] section=%s failed: %s", section, e)
+            return section, [], 0
+
     def _generate_structured_sop(self, user_input: str) -> str:
         prompt = _build_sop_generation_prompt(_truncate_text(user_input, MAX_QUERY_CHARS))
         parser = StrOutputParser()
@@ -862,7 +1171,16 @@ class SmartRAGChain:
 
     def invoke(self, query: str, category: str = None, chat_history: List[Dict] = None) -> dict:
         t0 = time.time()
-        if _looks_like_sop_generation_query(query):
+        query_for_routing = _strip_injected_context_blocks(query)
+        full_ctx_query = (query or "").strip()
+        llm_cfg = get_local_llm_config()
+        logger.info(
+            "[rag-invoke] provider=%s model=%s retrieval_query_preview=%s",
+            llm_cfg.provider,
+            llm_cfg.model,
+            _console_safe(_truncate_text(query_for_routing or query, 240)),
+        )
+        if _looks_like_sop_generation_query(query_for_routing):
             sop_text = self._generate_structured_sop(query)
             return {
                 "answer": sop_text,
@@ -896,23 +1214,23 @@ class SmartRAGChain:
             }
 
         cat_norm = (category or "").strip().lower()
-        route_data = self.router.route(query)
+        route_data = self.router.route(query_for_routing)
         sop_inventory_mode: Optional[Literal["count", "list"]] = None
-        if RAG_STRICT_INVENTORY_MODE and ((not cat_norm) or cat_norm == "sops"):
-            sop_inventory_mode = _classify_sop_inventory_query(query)
+        if not RAG_DISABLE_SOP_INVENTORY and ((not cat_norm) or cat_norm == "sops"):
+            sop_inventory_mode = _classify_sop_inventory_query(query_for_routing)
 
         # ── Step 0: Extract Metadata Filters & Active Doc ID ──
-        metadata_filters = self._extract_metadata_filters(query)
+        metadata_filters = self._extract_metadata_filters(query_for_routing)
         active_doc_id = self._find_active_doc_id(chat_history) if chat_history else ""
         if active_doc_id and not sop_inventory_mode:
-            print(f"  [context] identified active doc from history: {active_doc_id}")
+            _safe_print(f"  [context] identified active doc from history: {active_doc_id}")
             is_sop_query = any(
-                k in (query or "").lower() for k in ["sop", "procedure", "standard"]
+                k in (query_for_routing or "").lower() for k in ["sop", "procedure", "standard"]
             )
             if active_doc_id.startswith("SOP") and is_sop_query:
                 metadata_filters["ref_number"] = active_doc_id
         if sop_inventory_mode == "count" and not re.search(
-            r"\bSOP-[A-Z0-9-]+\b", query or "", re.IGNORECASE
+            r"\bSOP-[A-Z0-9-]+\b", query_for_routing or "", re.IGNORECASE
         ):
             metadata_filters.pop("ref_number", None)
 
@@ -930,7 +1248,7 @@ class SmartRAGChain:
             "audits",
             "decisions",
         }
-        if forced_category and not _looks_cross_domain_query(query):
+        if forced_category and not _looks_cross_domain_query(query_for_routing):
             target_sections = [category.strip().lower()]
             route_data = {"collections": target_sections, "exact_filters": dict(metadata_filters)}
         elif sop_inventory_mode:
@@ -940,17 +1258,24 @@ class SmartRAGChain:
             target_sections = route_data.get("collections", [])
             metadata_filters.update(route_data.get("exact_filters", {}))
 
+        metadata_filters = _normalize_router_metadata_filters(metadata_filters)
+
+        if not target_sections:
+            fb = route_query(query_for_routing)
+            target_sections = fb or ["sops", "deviations", "capas", "audits", "decisions"]
+            logger.warning(
+                "[rag-routing] empty collections after router; keyword_fallback=%s",
+                target_sections,
+            )
+
         routed_label = describe_route(target_sections)
         logger.info(
             "[rag-routing] query='%s' sections=%s filters=%s",
-            (query or "")[:120],
+            (query_for_routing or "")[:120],
             target_sections,
             metadata_filters,
         )
-        print(
-            f"[rag-routing] sections={target_sections} filters={metadata_filters}",
-            flush=True,
-        )
+        _safe_print(f"[rag-routing] sections={target_sections} filters={metadata_filters}")
 
         if sop_inventory_mode:
             sop_retriever = self.federated.retrievers.get("sops")
@@ -962,9 +1287,10 @@ class SmartRAGChain:
                     sop_retriever.category_filter = "sops"
                 strict_resp = _strict_sop_inventory_response(
                     [],
-                    query,
+                    query_for_routing,
                     sop_retriever,
                     mode=sop_inventory_mode,
+                    full_prompt=full_ctx_query,
                 )
                 strict_resp["retrieval_stats"] = {
                     "searched": ["sops"],
@@ -974,94 +1300,116 @@ class SmartRAGChain:
                     "strict_mode": True,
                 }
                 return strict_resp
+            strict_resp = _strict_sop_inventory_response(
+                [],
+                query_for_routing,
+                None,
+                mode=sop_inventory_mode,
+                full_prompt=full_ctx_query,
+            )
+            strict_resp["retrieval_stats"] = {
+                "searched": ["sops"],
+                "per_section": {"sops": 0},
+                "total_docs": 0,
+                "latency_ms": round((time.time() - t0) * 1000, 1),
+                "strict_mode": True,
+            }
+            return strict_resp
 
         # ── Step 2: Hybrid search on targeted collections only ──
         all_docs: List[Document] = []
-        per_section_counts: Dict[str, int] = {}
+        per_section_counts: Dict[str, int] = {s: 0 for s in target_sections}
+        section_ranked: Dict[str, List[Document]] = {s: [] for s in target_sections}
+
+        t_r0 = time.time()
+        pool_sec = float(os.getenv("RAG_PARALLEL_RETRIEVAL_SECONDS", "55"))
+        n_sec = len(target_sections)
+        logger.info(
+            "[rag-retrieval-start] sections=%s parallel_budget_s=%.1f",
+            target_sections,
+            pool_sec,
+        )
+        mf_copy = dict(metadata_filters or {})
+        if n_sec <= 0:
+            pass
+        elif n_sec == 1:
+            sec = target_sections[0]
+            _, ranked, cnt = self._retrieve_ranked_for_section(
+                sec, query_for_routing, mf_copy, active_doc_id, n_sec
+            )
+            section_ranked[sec] = ranked
+            per_section_counts[sec] = cnt
+        else:
+            with ThreadPoolExecutor(max_workers=min(8, n_sec)) as executor:
+                futures = {
+                    executor.submit(
+                        self._retrieve_ranked_for_section,
+                        section,
+                        query_for_routing,
+                        mf_copy,
+                        active_doc_id,
+                        n_sec,
+                    ): section
+                    for section in target_sections
+                }
+                pending = set(futures.keys())
+                deadline = time.time() + pool_sec
+                while pending:
+                    wait_s = min(5.0, max(0.05, deadline - time.time()))
+                    if wait_s <= 0:
+                        break
+                    done, pending = wait(pending, timeout=wait_s, return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        try:
+                            section, ranked, cnt = fut.result()
+                            section_ranked[section] = ranked
+                            per_section_counts[section] = cnt
+                        except Exception as ex:
+                            sec = futures.get(fut, "?")
+                            logger.warning("[rag-retrieval] future failed section=%s: %s", sec, ex)
+                for fut in pending:
+                    fut.cancel()
+                if pending:
+                    logger.warning(
+                        "[rag-retrieval] parallel budget exhausted; incomplete_sections=%s",
+                        [futures[f] for f in pending],
+                    )
 
         for section in target_sections:
-            retriever = self.federated.retrievers.get(section)
-            if not retriever:
-                continue
-            try:
-                # Apply metadata filters (if any)
-                section_filters = dict(metadata_filters or {})
-                # Strictly constrain vector hits to currently existing entities in PostgreSQL
-                # so stale Qdrant points cannot leak into chatbot responses.
-                section_filters["allowed_entity_ids"] = self._get_active_entity_ids(section)
-                retriever.metadata_filters = section_filters
-                if rag_unified_enabled():
-                    retriever.category_filter = section
-                else:
-                    retriever.category_filter = None
-                # Deep retrieval: fetch 30 to allow for deduplication/diversification
-                docs = retriever.invoke(query)
-                allowed_ids = set(section_filters.get("allowed_entity_ids") or [])
-                if allowed_ids:
-                    qdrant_ids = [
-                        str((d.metadata or {}).get("entity_id") or (d.metadata or {}).get("source_id") or "")
-                        for d in docs
-                    ]
-                    docs = [
-                        d
-                        for d in docs
-                        if str((d.metadata or {}).get("entity_id") or (d.metadata or {}).get("source_id") or "") in allowed_ids
-                    ]
-                    if RAG_DEBUG_RETRIEVAL:
-                        print(
-                            f"[rag-debug] section='{section}' db_ids={len(allowed_ids)} qdrant_ids={qdrant_ids[:RAG_DEBUG_MAX_CHUNKS]} kept={len(docs)}",
-                            flush=True,
-                        )
-                if RAG_DEBUG_RETRIEVAL:
-                    print(
-                        f"[rag-debug] query='{query[:120]}' section='{section}' raw_hits={len(docs)}",
-                        flush=True,
-                    )
-                
-                # Rerank within this section
-                top_n = 20 if len(target_sections) == 1 else 10
-                ranked = self.federated.reranker.rerank_top_n(query, docs, top_n)
-                
-                # Deduplicate but allow more content depth (3-4 chunks per source)
-                # If we have a single targeted document, we can afford more depth.
-                max_chunks = 6 if active_doc_id else 4
-                unique_limit = 15 if len(target_sections) == 1 else 8
-                
-                ranked = _unique_by_source(ranked, unique_limit, max_per_source=max_chunks)
-                
-                # Tag each doc with its section
-                for d in ranked:
-                    d.metadata["_section"] = section
-                all_docs.extend(ranked)
-                per_section_counts[section] = len(ranked)
-                if ranked:
-                    top_preview = [
-                        {
-                            "ref": str((d.metadata or {}).get("ref_number") or (d.metadata or {}).get("source_id") or ""),
-                            "score": round(_json_safe_float((d.metadata or {}).get("rerank_score", 0.0)), 4),
-                            "section": str((d.metadata or {}).get("_section") or section),
-                        }
-                        for d in ranked[:5]
-                    ]
-                    logger.info("[rag-retrieval] section=%s top_chunks=%s", section, top_preview)
-                    print(
-                        f"[rag-retrieval] section={section} top_chunks={top_preview}",
-                        flush=True,
-                    )
-                if RAG_DEBUG_RETRIEVAL and ranked:
-                    for i, doc in enumerate(ranked[:RAG_DEBUG_MAX_CHUNKS], 1):
-                        print(_debug_chunk_summary(doc, i), flush=True)
-            except Exception as e:
-                print(f"  [router] Warning: retrieval failed for '{section}': {e}")
-                per_section_counts[section] = 0
+            ranked = section_ranked.get(section) or []
+            all_docs.extend(ranked)
+            if ranked:
+                top_preview = [
+                    {
+                        "ref": str((d.metadata or {}).get("ref_number") or (d.metadata or {}).get("source_id") or ""),
+                        "score": round(_json_safe_float((d.metadata or {}).get("rerank_score", 0.0)), 4),
+                        "section": str((d.metadata or {}).get("_section") or section),
+                    }
+                    for d in ranked[:5]
+                ]
+                logger.info("[rag-retrieval] section=%s top_chunks=%s", section, top_preview)
+                _safe_print(f"[rag-retrieval] section={section} top_chunks={top_preview}")
+            if RAG_DEBUG_RETRIEVAL and ranked:
+                for i, doc in enumerate(ranked[:RAG_DEBUG_MAX_CHUNKS], 1):
+                    _safe_print(_debug_chunk_summary(doc, i))
+
+        t_r1 = time.time()
+        retrieval_phase_ms = round((t_r1 - t_r0) * 1000.0, 1)
+        logger.info(
+            "[rag-retrieval-done] sections=%s total_chunks=%s retrieval_ms=%.1f",
+            target_sections,
+            len(all_docs),
+            retrieval_phase_ms,
+        )
 
         if not all_docs:
             if sop_inventory_mode:
                 strict_resp = _strict_sop_inventory_response(
                     [],
-                    query,
+                    query_for_routing,
                     self.federated.retrievers.get("sops"),
                     mode=sop_inventory_mode,
+                    full_prompt=full_ctx_query,
                 )
                 strict_resp["retrieval_stats"] = {
                     "searched": target_sections,
@@ -1071,6 +1419,13 @@ class SmartRAGChain:
                     "strict_mode": True,
                 }
                 return strict_resp
+            logger.info(
+                "[rag-refusal] reason=zero_chunks sections=%s filters=%s provider=%s model=%s",
+                target_sections,
+                metadata_filters,
+                llm_cfg.provider,
+                llm_cfg.model,
+            )
             return {
                 "answer": "Sorry, I do not have enough information about this.",
                 "citations": [],
@@ -1083,16 +1438,26 @@ class SmartRAGChain:
                     "searched": target_sections,
                     "total_docs": 0,
                     "latency_ms": round((time.time() - t0) * 1000, 1),
+                    "retrieval_phase_ms": retrieval_phase_ms,
+                    "llm_provider": llm_cfg.provider,
+                    "llm_model": llm_cfg.model,
+                    "llm_base_url": llm_cfg.base_url,
+                    "failure_stage": "no_retrieval",
+                    "elapsed_ms": round((time.time() - t0) * 1000, 1),
+                    "refusal_reason": "zero_chunks_after_filters",
                 },
                 "routed_to": routed_label,
+                "refusal_reason": "zero_chunks_after_filters",
+                "failure_stage": "no_retrieval",
             }
 
         if sop_inventory_mode:
             strict_resp = _strict_sop_inventory_response(
                 all_docs,
-                query,
+                query_for_routing,
                 self.federated.retrievers.get("sops"),
                 mode=sop_inventory_mode,
+                full_prompt=full_ctx_query,
             )
             strict_resp["retrieval_stats"] = {
                 "searched": target_sections,
@@ -1129,38 +1494,128 @@ class SmartRAGChain:
             "[rag-prompt] sections=%s context_chars=%s context_preview=%s",
             target_sections,
             len(context_str),
-            context_str[:600].replace("\n", " "),
+            _console_safe(context_str[:600].replace("\n", " ")),
         )
-        print(
-            f"[rag-prompt] sections={target_sections} context_chars={len(context_str)} preview={context_str[:350].replace(chr(10), ' ')}",
-            flush=True,
+        _safe_print(
+            f"[rag-prompt] sections={target_sections} context_chars={len(context_str)} preview={context_str[:350].replace(chr(10), ' ')}"
         )
         llm_source = "primary"
+        t_llm0 = time.time()
+        raw_answer: str | None = None
+        llm_exc: Exception | None = None
+        history_focus = (
+            f"HISTORY FOCUS: Priority should be given to {active_doc_id} as it was discussed recently."
+            if active_doc_id
+            else ""
+        )
+        logger.info(
+            "[rag-llm-start] model=%s context_chars=%s history_msgs=%s",
+            llm_cfg.model,
+            len(context_str),
+            len(chat_history_messages),
+        )
         try:
-            history_focus = f"HISTORY FOCUS: Priority should be given to {active_doc_id} as it was discussed recently." if active_doc_id else ""
             raw_answer = (self.prompt | self.llm | StrOutputParser()).invoke({
-                "context":      context_str,
-                "question":     query,
+                "context": context_str,
+                "question": query,
                 "chat_history_messages": chat_history_messages,
                 "history_focus": history_focus,
             })
         except Exception as e:
-            if is_local_llm_unreachable_error(e):
-                raise
+            llm_exc = e
             err = str(e).lower()
             if "503" in err or "unavailable" in err or "high demand" in err:
-                fallback_llm = get_fallback_llm()
-                llm_source = "fallback"
-                raw_answer = (self.prompt | fallback_llm | StrOutputParser()).invoke({
-                    "context":      context_str,
-                    "question":     query,
-                    "chat_history_messages": chat_history_messages,
-                })
+                try:
+                    fallback_llm = get_fallback_llm()
+                    llm_source = "fallback"
+                    raw_answer = (self.prompt | fallback_llm | StrOutputParser()).invoke({
+                        "context": context_str,
+                        "question": query,
+                        "chat_history_messages": chat_history_messages,
+                        "history_focus": history_focus,
+                    })
+                    llm_exc = None
+                except Exception as e2:
+                    llm_exc = e2
             else:
-                raise
+                pass
+
+        llm_phase_ms = round((time.time() - t_llm0) * 1000.0, 1)
+
+        if raw_answer is None and llm_exc is not None:
+            stage = classify_llm_exception(llm_exc)
+            logger.error(
+                "[rag-llm-failed] stage=%s llm_ms=%.1f err=%s",
+                stage,
+                llm_phase_ms,
+                llm_exc,
+            )
+            excerpt_cits = _sanitize_citation_list(list(raw_cits))
+            pieces: List[str] = []
+            for c in excerpt_cits[:10]:
+                if not isinstance(c, dict):
+                    continue
+                ref = str(c.get("ref") or "").strip()
+                ex = str(c.get("excerpt") or "").strip()
+                title = str(c.get("title") or "").strip()
+                body = ex or title
+                if body:
+                    pieces.append(f"{ref}: {body}" if ref else body)
+            answer_fb = (
+                "\n\n".join(pieces)
+                if pieces
+                else "Retrieved relevant records from the index, but the local language model did not return a summary."
+            )
+            latency_ms = round((time.time() - t0) * 1000.0, 1)
+            return {
+                "answer": answer_fb,
+                "reasoning": "",
+                "confidence": "LOW",
+                "citations": excerpt_cits,
+                "retrieval_debug": _build_retrieval_debug_rows(all_docs),
+                "suggestions": [
+                    "Retry after confirming the local model is loaded in LM Studio",
+                    "Check that LOCAL_LLM_MODEL matches a model id from GET /v1/models",
+                    "Try a shorter question or reduce RAG context size",
+                ],
+                "retrieval_stats": {
+                    "searched": target_sections,
+                    "per_section": per_section_counts,
+                    "total_docs": len(all_docs),
+                    "latency_ms": latency_ms,
+                    "retrieval_phase_ms": retrieval_phase_ms,
+                    "llm_phase_ms": llm_phase_ms,
+                    "llm_provider": llm_cfg.provider,
+                    "llm_model": llm_cfg.model,
+                    "llm_base_url": llm_cfg.base_url,
+                    "llm_source": llm_source,
+                    "failure_stage": stage,
+                    "elapsed_ms": latency_ms,
+                },
+                "routed_to": routed_label,
+                "cached": False,
+                "metadata_snapshot": [],
+                "audit_log_snapshot": [],
+                "llm_error": str(llm_exc),
+                "failure_stage": stage,
+                "action_metadata": {
+                    "query": query,
+                    "routing": target_sections,
+                    "latency_ms": latency_ms,
+                    "timestamp": time.time(),
+                    "model": llm_cfg.model,
+                    "llm_provider": llm_cfg.provider,
+                    "llm_source": llm_source,
+                    "failure_stage": stage,
+                },
+            }
+
+        logger.info("[rag-llm-done] llm_ms=%.1f source=%s", llm_phase_ms, llm_source)
 
         # ── Step 5: Parse answer, citations, suggestions, reasoning, confidence ──
-        answer, llm_citations, suggestions, reasoning, confidence = _parse_answer_citations_suggestions(raw_answer)
+        answer, llm_citations, suggestions, reasoning, confidence = _parse_answer_citations_suggestions(
+            raw_answer or ""
+        )
 
         # Merge LLM-parsed citations with raw retrieval metadata for richer response
         final_citations = []
@@ -1187,12 +1642,36 @@ class SmartRAGChain:
         if not final_citations:
             final_citations = raw_cits
         final_citations = _sanitize_citation_list(final_citations)
+        final_citations = _dedupe_citations_by_ref(final_citations)
+        if len(final_citations) > 12:
+            final_citations = sorted(
+                final_citations,
+                key=lambda c: _json_safe_float((c or {}).get("score", 0.0)),
+                reverse=True,
+            )[:12]
         if RAG_DEBUG_RETRIEVAL:
             cited_refs = [str(c.get("ref", "")).strip() for c in final_citations if isinstance(c, dict)]
-            print(
-                f"[rag-debug] final_citations={len(cited_refs)} refs={cited_refs[:RAG_DEBUG_MAX_CHUNKS]}",
-                flush=True,
+            _safe_print(
+                f"[rag-debug] final_citations={len(cited_refs)} refs={cited_refs[:RAG_DEBUG_MAX_CHUNKS]}"
             )
+
+        if not (answer or "").strip() and final_citations:
+            pieces: List[str] = []
+            for c in final_citations[:8]:
+                if not isinstance(c, dict):
+                    continue
+                ref = str(c.get("ref") or "").strip()
+                ex = str(c.get("excerpt") or "").strip()
+                title = str(c.get("title") or "").strip()
+                body = ex or title
+                if body:
+                    pieces.append(f"{ref}: {body}" if ref else body)
+            if pieces:
+                answer = "\n\n".join(pieces)
+                logger.warning(
+                    "[rag-answer] empty LLM [ANSWER]; using excerpt-aligned fallback lines=%s",
+                    len(pieces),
+                )
 
         # ── Step 6: Assemble full Audit Vault snapshots ──
 
@@ -1209,12 +1688,16 @@ class SmartRAGChain:
 
         latency_ms = round((time.time() - t0) * 1000, 1)
         logger.info(
-            "[rag-answer] model=%s llm_source=%s routed_to=%s docs=%s latency_ms=%s",
-            get_local_llm_config().model,
+            "[rag-answer] model=%s provider=%s llm_source=%s routed_to=%s chunks=%s citations=%s latency_ms=%s retrieval_ms=%s llm_ms=%s",
+            llm_cfg.model,
+            llm_cfg.provider,
             llm_source,
             routed_label,
             len(all_docs),
+            len(final_citations),
             latency_ms,
+            retrieval_phase_ms,
+            llm_phase_ms,
         )
 
         return {
@@ -1229,6 +1712,14 @@ class SmartRAGChain:
                 "per_section":  per_section_counts,
                 "total_docs":   len(all_docs),
                 "latency_ms":   latency_ms,
+                "elapsed_ms":   latency_ms,
+                "retrieval_phase_ms": retrieval_phase_ms,
+                "llm_phase_ms":       llm_phase_ms,
+                "llm_provider": llm_cfg.provider,
+                "llm_model":    llm_cfg.model,
+                "llm_base_url": llm_cfg.base_url,
+                "llm_source":   llm_source,
+                "failure_stage": None,
             },
             "routed_to":   routed_label,
             "cached":      False,
@@ -1240,7 +1731,8 @@ class SmartRAGChain:
                 "routing": target_sections,
                 "latency_ms": latency_ms,
                 "timestamp": time.time(),
-                "model": get_local_llm_config().model,
+                "model": llm_cfg.model,
+                "llm_provider": llm_cfg.provider,
                 "llm_source": llm_source,
             }
         }

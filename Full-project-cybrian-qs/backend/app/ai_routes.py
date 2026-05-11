@@ -18,9 +18,10 @@ import uuid
 import logging
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import ValidationError
 from sqlalchemy import or_
-from langchain_core.output_parsers import StrOutputParser
+from langchain_core.messages import AIMessage
 
 from action.prompts import (
     IMPROVE_REWRITE_NO_RAG_CONTEXT,
@@ -29,12 +30,46 @@ from action.prompts import (
     build_rewrite_prompt,
 )
 from action.runtime import create_action_runtime
-from action.utils import format_chunks, parse_with_retry
+from action.utils import (
+    ACTION_LLM_EMPTY_RETRY_SUFFIX,
+    format_chunks,
+    normalize_action_input_text,
+    parse_with_retry,
+    truncate_prompt_for_llm,
+)
 from schemas.sop_actions import ActionRequest, GapCheckResponse, ImproveResponse, RewriteResponse
 from .schemas import AIActionRequest, AIActionResponse
 from .database import SessionLocal
-from .models import SOP, SOPVersion, Deviation, Capa, AuditFinding, Decision
-from chatbot.llm.provider import get_local_llm_config, is_local_llm_unreachable_error
+from .auth_routes import get_current_user_optional
+from .models import SOP, SOPVersion, Deviation, Capa, AuditFinding, Decision, User
+from .services.chat_query_persistence import persist_chat_query_exchange
+from .services.nlp.prompt_injector import get_style_prompt_injection
+from .services.nlp.editor_action_nlp import (
+    build_nlp_bundle_for_action,
+    log_nlp_detected,
+    nlp_action_summary,
+)
+from .services.profile_detection_store import (
+    load_active_profile_detection_row,
+    persist_profile_detection_for_sop_version,
+    serialize_profile_detection_row,
+)
+from .services.sop_version_metadata_compact import (
+    compact_sop_version_metadata_for_storage,
+    log_metadata_load,
+    log_metadata_merge,
+)
+try:
+    from openai import BadRequestError
+except Exception:  # pragma: no cover
+    BadRequestError = Exception  # type: ignore[misc,assignment]
+from chatbot.llm.provider import (
+    check_local_llm_api_health,
+    get_chat_pipeline_timeout_seconds,
+    get_local_llm_config,
+    get_local_llm_timeout_seconds,
+    is_local_llm_unreachable_error,
+)
 
 # RAG-specific imports are lazy-loaded inside _get_smart_rag_chain()
 # to avoid ModuleNotFoundError when running without the RAG chatbot modules.
@@ -45,7 +80,6 @@ _smart_rag_lock = threading.Lock()
 _smart_rag_chain = None
 _action_runtime_lock = threading.Lock()
 _action_runtime = None
-CHAT_QUERY_TIMEOUT_SECONDS = int(os.getenv("CHAT_QUERY_TIMEOUT_SECONDS", "60"))
 SOP_REF_PATTERN = re.compile(r"\bSOP-[A-Z0-9-]+\b", re.IGNORECASE)
 DEV_REF_PATTERN = re.compile(r"\bDEV-[A-Z0-9-]+\b", re.IGNORECASE)
 CAPA_REF_PATTERN = re.compile(r"\bCAPA-[A-Z0-9-]+\b", re.IGNORECASE)
@@ -63,6 +97,41 @@ ACTION_INTENT_UPDATE = re.compile(
     r"\b(add)\b.*\b(section)\b.*\b(current sop|this sop)\b",
     re.IGNORECASE,
 )
+
+
+def _extract_profile_context(payload: dict, assistant_context: dict) -> dict[str, Any] | None:
+    """
+    Pull an already-detected NLP profile from request/context metadata.
+    This intentionally does not run heavyweight profile detection during chat.
+    """
+    candidates = [
+        payload.get("nlp_profile"),
+        payload.get("profile_detection"),
+        assistant_context.get("nlp_profile") if isinstance(assistant_context, dict) else None,
+        assistant_context.get("profile_detection") if isinstance(assistant_context, dict) else None,
+    ]
+    current_sop = assistant_context.get("current_sop") if isinstance(assistant_context, dict) else {}
+    if isinstance(current_sop, dict):
+        meta = current_sop.get("metadata_json") or current_sop.get("metadata") or {}
+        if isinstance(meta, dict):
+            candidates.extend(
+                [
+                    meta.get("nlp_profile"),
+                    meta.get("profile_detection"),
+                    (meta.get("sopMetadata") or {}).get("nlp_profile")
+                    if isinstance(meta.get("sopMetadata"), dict)
+                    else None,
+                ]
+            )
+
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            if isinstance(candidate.get("style_profile"), dict):
+                return candidate
+            nested = candidate.get("nlp_profile")
+            if isinstance(nested, dict) and isinstance(nested.get("style_profile"), dict):
+                return nested
+    return None
 
 
 def _is_prompt_too_large_error(exc: Exception) -> bool:
@@ -168,12 +237,108 @@ def _clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip()
 
 
+def _truncate_text(text: str, max_chars: int) -> str:
+    raw = str(text or "")
+    if max_chars <= 0 or len(raw) <= max_chars:
+        return raw
+    return raw[: max_chars - 3].rstrip() + "..."
+
+
 def _split_sentences(text: str) -> list[str]:
     cleaned = _clean_text(text)
     if not cleaned:
         return []
     parts = re.split(r"(?<=[.!?])\s+", cleaned)
     return [part.strip() for part in parts if part.strip()]
+
+
+def _derive_sop_style_profile(text: str) -> dict[str, Any]:
+    raw = str(text or "")
+    cleaned = _clean_text(raw)
+    if not cleaned:
+        return {
+            "tone": "neutral",
+            "language": "unknown",
+            "avg_sentence_words": 0,
+            "imperative_ratio": 0.0,
+            "modal_ratio": 0.0,
+            "bullet_density": 0.0,
+            "passive_markers": 0,
+            "style_rules": [],
+        }
+
+    sentences = _split_sentences(cleaned)
+    words = re.findall(r"\b[\w/-]+\b", cleaned)
+    word_count = len(words)
+    sentence_count = max(1, len(sentences))
+    avg_sentence_words = round(word_count / sentence_count, 1)
+
+    lower = cleaned.lower()
+    english_modals = re.findall(r"\b(should|must|shall|may|can)\b", lower)
+    german_modals = re.findall(r"\b(soll|sollen|muss|müssen|darf|dürfen|kann|können)\b", lower)
+    modal_count = len(english_modals) + len(german_modals)
+    modal_ratio = round(modal_count / max(1, sentence_count), 3)
+
+    imperative_markers = re.findall(
+        r"\b(ensure|verify|document|record|review|approve|reject|notify|execute|perform|maintain|prüfen|sicherstellen|dokumentieren|aufzeichnen|überprüfen|genehmigen|durchführen)\b",
+        lower,
+    )
+    imperative_ratio = round(len(imperative_markers) / max(1, sentence_count), 3)
+
+    bullet_lines = re.findall(r"(?m)^\s*(?:[-*•]|\d+[.)])\s+", raw)
+    line_count = max(1, len(re.findall(r"(?m)^", raw)))
+    bullet_density = round(len(bullet_lines) / line_count, 3)
+
+    passive_markers = len(
+        re.findall(
+            r"\b(be\s+\w+ed|is\s+\w+ed|are\s+\w+ed|was\s+\w+ed|were\s+\w+ed|wird\s+\w+(?:t|en)|werden\s+\w+(?:t|en))\b",
+            lower,
+        )
+    )
+
+    language = "de" if re.search(r"\b(und|der|die|das|mit|für|nicht)\b", lower) else "en"
+    tone = "directive" if imperative_ratio >= 0.5 or modal_ratio >= 0.8 else "formal"
+
+    style_rules: list[str] = []
+    if avg_sentence_words > 28:
+        style_rules.append("Shorten long sentences while preserving requirements.")
+    if passive_markers > sentence_count // 2:
+        style_rules.append("Prefer active voice with explicit responsible roles.")
+    if modal_ratio > 1.2:
+        style_rules.append("Reduce stacked modal verbs; keep obligations explicit and crisp.")
+    if bullet_density > 0.2:
+        style_rules.append("Keep concise procedural list formatting where appropriate.")
+    if not style_rules:
+        style_rules.append("Maintain current SOP style while tightening clarity and compliance language.")
+
+    return {
+        "tone": tone,
+        "language": language,
+        "avg_sentence_words": avg_sentence_words,
+        "imperative_ratio": imperative_ratio,
+        "modal_ratio": modal_ratio,
+        "bullet_density": bullet_density,
+        "passive_markers": passive_markers,
+        "style_rules": style_rules,
+    }
+
+
+def _style_profile_prompt_block(profile: dict[str, Any]) -> str:
+    if not isinstance(profile, dict) or not profile:
+        return "STYLE_PROFILE: unavailable"
+    rules = profile.get("style_rules") or []
+    top_rules = "; ".join(str(r) for r in rules[:4]) or "Maintain SOP style consistency."
+    return (
+        "STYLE_PROFILE\n"
+        f"- tone={profile.get('tone', 'formal')}\n"
+        f"- language={profile.get('language', 'unknown')}\n"
+        f"- avg_sentence_words={profile.get('avg_sentence_words', 0)}\n"
+        f"- imperative_ratio={profile.get('imperative_ratio', 0.0)}\n"
+        f"- modal_ratio={profile.get('modal_ratio', 0.0)}\n"
+        f"- bullet_density={profile.get('bullet_density', 0.0)}\n"
+        f"- passive_markers={profile.get('passive_markers', 0)}\n"
+        f"- style_guidance={top_rules}"
+    )
 
 
 def _extract_text_from_tiptap(node: Any) -> str:
@@ -721,24 +886,230 @@ def _render_improve(structured_data: dict) -> str:
 
 
 def _action_output_token_budget(input_chars: int) -> int:
-    """
-    Long selected text needs a larger output budget; JSON + improved copy can exceed 1–2k tokens.
-    """
-    cap = int(os.getenv("ACTION_MAX_OUTPUT_TOKENS_CAP", "8192"))
-    if input_chars <= 0:
-        return int(os.getenv("ACTION_MAX_OUTPUT_TOKENS") or "4096")
-    return min(cap, max(2048, int(input_chars * 0.45) + 1200))
-
-
-def _call_action_llm(runtime: Any, prompt: str, *, input_char_budget: int = 0) -> str:
-    parser = StrOutputParser()
-    n = _action_output_token_budget(input_char_budget) if input_char_budget else int(
-        os.getenv("ACTION_MAX_OUTPUT_TOKENS") or "4096"
+    """Target output budget before context-aware clamping."""
+    base = int(
+        os.getenv("ACTION_LLM_MAX_TOKENS")
+        or os.getenv("ACTION_MAX_OUTPUT_TOKENS")
+        or "4096"
     )
+    cap = int(os.getenv("ACTION_MAX_OUTPUT_TOKENS_CAP", "32768"))
+    if input_chars <= 0:
+        return min(cap, base)
+    return min(cap, max(2048, min(base, int(input_chars * 0.45) + 1200)))
+
+
+def _action_model_context_tokens() -> int:
     try:
-        return (runtime.llm.bind(max_tokens=n) | parser).invoke(prompt)
-    except Exception:
-        return (runtime.fallback_llm.bind(max_tokens=n) | parser).invoke(prompt)
+        return max(4096, int(os.getenv("ACTION_MODEL_CONTEXT_TOKENS", "32768")))
+    except (TypeError, ValueError):
+        return 32768
+
+
+def _action_prompt_soft_limit_chars() -> int:
+    raw = os.getenv("ACTION_PROMPT_SOFT_LIMIT")
+    if raw and raw.strip():
+        try:
+            return max(4000, int(raw))
+        except (TypeError, ValueError):
+            pass
+    return max(8000, int(_action_model_context_tokens() * 0.75))
+
+
+def _is_context_length_error_text(text: str) -> bool:
+    msg = (text or "").lower()
+    return (
+        ("n_keep" in msg and "n_ctx" in msg)
+        or "context length" in msg
+        or "prompt is greater than context" in msg
+        or "prompt is too long" in msg
+        or "maximum context length" in msg
+    )
+
+
+def _extract_n_ctx_from_error(text: str) -> int | None:
+    m = re.search(r"n_ctx\s*:\s*(\d+)", text or "", flags=re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_action_max_tokens(base_tokens: int, prompt_chars: int, *, n_ctx: int | None = None) -> int:
+    prompt_est_tokens = max(1, int(prompt_chars / 4.0))
+    ctx = n_ctx or _action_model_context_tokens()
+    reserve = int(os.getenv("ACTION_CONTEXT_RESPONSE_RESERVE", "256"))
+    safe_by_ctx = max(128, ctx - prompt_est_tokens - reserve)
+    safe_cap = int(os.getenv("ACTION_SAFE_MAX_TOKENS_CAP", "32768"))
+    return max(128, min(int(base_tokens), safe_by_ctx, safe_cap))
+
+
+def _context_error_http_exception(err_txt: str) -> HTTPException:
+    cfg = get_local_llm_config()
+    return HTTPException(
+        status_code=422,
+        detail={
+            "message": (
+                "Selected text is too long for the local model context. Please select a smaller section "
+                "or load the model with larger context length."
+            ),
+            "validation_or_parse_error": err_txt,
+            "hint": "Reduce selection length (especially Gap Check), or increase LM Studio model context.",
+            "llm_model": cfg.model,
+            "llm_base_url": cfg.base_url,
+            "n_ctx": _extract_n_ctx_from_error(err_txt),
+        },
+    )
+
+
+def _trim_large_selection_for_fallback(text: str) -> str:
+    s = (text or "").strip()
+    if not s:
+        return ""
+    try:
+        lim = int(os.getenv("ACTION_FALLBACK_TEXT_LIMIT", "3200"))
+    except (TypeError, ValueError):
+        lim = 3200
+    if len(s) <= lim:
+        return s
+    head = max(1200, int(lim * 0.6))
+    tail = max(600, lim - head - 24)
+    return s[:head] + "\n\n[... trimmed ...]\n\n" + s[-tail:]
+
+
+def _extract_text_and_meta(message: Any) -> tuple[str, dict[str, Any]]:
+    if isinstance(message, AIMessage):
+        content = message.content
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    t = item.get("text")
+                    if isinstance(t, str):
+                        parts.append(t)
+            text = "".join(parts)
+        else:
+            text = str(content or "")
+        meta = dict(message.response_metadata or {})
+        usage = meta.get("token_usage") or meta.get("usage") or {}
+        usage_meta = getattr(message, "usage_metadata", None) or {}
+        if isinstance(usage_meta, dict):
+            usage = {**usage, **usage_meta}
+        meta["usage"] = usage
+        return text, meta
+    return str(message or ""), {}
+
+
+def _response_looks_cut(text: str) -> bool:
+    s = (text or "").rstrip()
+    if not s:
+        return False
+    return s[-1].isalnum() and not s.endswith((".", "!", "?", "}", "]", '"'))
+
+
+def _call_action_llm(runtime: Any, prompt: str, *, input_char_budget: int = 0, action: str = "unknown") -> str:
+    base_n = _action_output_token_budget(input_char_budget) if input_char_budget else int(
+        os.getenv("ACTION_LLM_MAX_TOKENS") or os.getenv("ACTION_MAX_OUTPUT_TOKENS") or "4096"
+    )
+    soft = _action_prompt_soft_limit_chars()
+    cfg = get_local_llm_config()
+
+    budgets: list[int] = []
+    for b in (soft, int(soft * 0.75), int(soft * 0.5)):
+        if b > 0 and b not in budgets:
+            budgets.append(b)
+
+    n_ctx_hint: int | None = None
+    last_context_error: str | None = None
+    out = ""
+    used_tokens = base_n
+    last_meta: dict[str, Any] = {}
+    length_limited_seen = False
+
+    for budget in budgets:
+        work = truncate_prompt_for_llm(prompt, budget) if len(prompt) > budget else prompt
+        used_tokens = _safe_action_max_tokens(base_n, len(work), n_ctx=n_ctx_hint)
+        try:
+            msg = runtime.llm.bind(max_tokens=used_tokens).invoke(work)
+            out, last_meta = _extract_text_and_meta(msg)
+            finish_reason = str(last_meta.get("finish_reason") or "").lower()
+            usage = last_meta.get("usage") or {}
+            logger.info(
+                "[ai-action-llm-meta] action=%s prompt_chars=%s output_chars=%s max_tokens=%s finish_reason=%s prompt_tokens=%s completion_tokens=%s total_tokens=%s",
+                action,
+                len(work),
+                len(out or ""),
+                used_tokens,
+                finish_reason or "unknown",
+                usage.get("prompt_tokens"),
+                usage.get("completion_tokens"),
+                usage.get("total_tokens"),
+            )
+            if finish_reason == "length":
+                length_limited_seen = True
+                continue
+            if (out or "").strip():
+                break
+            msg = runtime.llm.bind(max_tokens=used_tokens).invoke(work + ACTION_LLM_EMPTY_RETRY_SUFFIX)
+            out, last_meta = _extract_text_and_meta(msg)
+            if (out or "").strip():
+                break
+        except BadRequestError as exc:
+            err_txt = str(exc)
+            if _is_context_length_error_text(err_txt):
+                last_context_error = err_txt
+                n_ctx_hint = _extract_n_ctx_from_error(err_txt) or n_ctx_hint
+                logger.warning(
+                    "[ai-action-context-error] prompt_chars=%s max_tokens=%s model=%s base_url=%s n_ctx=%s error=%s",
+                    len(work),
+                    used_tokens,
+                    cfg.model,
+                    cfg.base_url,
+                    n_ctx_hint,
+                    err_txt,
+                )
+                continue
+            msg = runtime.fallback_llm.bind(max_tokens=used_tokens).invoke(work)
+            out, last_meta = _extract_text_and_meta(msg)
+            if (out or "").strip():
+                break
+        except Exception:
+            msg = runtime.fallback_llm.bind(max_tokens=used_tokens).invoke(work)
+            out, last_meta = _extract_text_and_meta(msg)
+            finish_reason = str(last_meta.get("finish_reason") or "").lower()
+            if finish_reason == "length":
+                length_limited_seen = True
+                continue
+            if (out or "").strip():
+                break
+
+    if last_context_error and not (out or "").strip():
+        raise _context_error_http_exception(last_context_error)
+
+    finish_reason = str(last_meta.get("finish_reason") or "").lower()
+    if finish_reason == "length" or length_limited_seen or _response_looks_cut(out):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "AI response was truncated due to model/output limit.",
+                "validation_or_parse_error": f"finish_reason={finish_reason or 'unknown'}",
+                "hint": "Increase ACTION_LLM_MAX_TOKENS, shorten selection, or increase ACTION_MODEL_CONTEXT_TOKENS.",
+            },
+        )
+
+    preview = (out or "").replace("\n", "\\n")[:900]
+    logger.info(
+        "[ai-action-llm] raw_len=%s max_tokens=%s preview=%s",
+        len(out or ""),
+        used_tokens,
+        preview,
+    )
+    return out
 
 
 def _render_dynamic_text(text: str) -> str:
@@ -792,6 +1163,185 @@ def _build_action_request(payload: AIActionRequest) -> ActionRequest:
     )
 
 
+def _load_uploaded_sop_context(request: ActionRequest) -> dict[str, Any]:
+    """
+    Resolve uploaded SOP from DB using SOP number/title and return text context,
+    compact `sop_versions.metadata_json`, and active ProfileDetection snapshot.
+    """
+    db = SessionLocal()
+    try:
+        sop_ref = str(request.sop_title or "").strip()
+        if not sop_ref:
+            return {"detected": False, "reason": "missing_sop_title"}
+
+        sop = db.query(SOP).filter(SOP.is_active == True).filter(  # noqa: E712
+            (SOP.sop_number.ilike(sop_ref)) | (SOP.title.ilike(sop_ref))
+        ).first()
+
+        if not sop:
+            return {"detected": False, "reason": "not_found", "query": sop_ref}
+
+        version = None
+        if sop.current_version_id:
+            version = db.query(SOPVersion).filter(SOPVersion.id == sop.current_version_id).first()
+        if not version:
+            version = (
+                db.query(SOPVersion)
+                .filter(SOPVersion.sop_id == sop.id)
+                .order_by(SOPVersion.created_at.desc())
+                .first()
+            )
+
+        sop_text = _extract_text_from_tiptap((version.content_json or {})) if version else ""
+        meta: dict[str, Any] = (
+            dict(version.metadata_json) if version and isinstance(version.metadata_json, dict) else {}
+        )
+        meta_keys = sorted(meta.keys())
+
+        compact_vm: dict[str, Any] = {}
+        if version:
+            compact_vm = compact_sop_version_metadata_for_storage(meta, sop, version)
+
+        pd_row = None
+        if version:
+            pd_row = load_active_profile_detection_row(db, sop_id=sop.id, sop_version_id=version.id)
+
+        pd_ser = serialize_profile_detection_row(pd_row)
+        pb_chars = len((pd_row.prompt_block or "")) if pd_row else 0
+        log_metadata_load(
+            sop_id=sop.id,
+            sop_version_id=version.id if version else None,
+            metadata_keys=meta_keys,
+            prompt_block_chars=pb_chars,
+        )
+        if version and (compact_vm or pd_ser):
+            log_metadata_merge(
+                sop_id=sop.id,
+                sop_version_id=version.id,
+                merged_keys=meta_keys + (["profile_detection"] if pd_ser else []),
+                prompt_block_chars=pb_chars,
+            )
+
+        stored_nlp = None
+        if pd_row and isinstance(pd_row.nlp_analysis_json, dict):
+            stored_nlp = pd_row.nlp_analysis_json
+        if stored_nlp is None:
+            legacy = meta.get("nlp_analysis") if isinstance(meta.get("nlp_analysis"), dict) else None
+            stored_nlp = legacy
+
+        return {
+            "detected": True,
+            "sop_id": str(sop.id),
+            "sop_number": sop.sop_number,
+            "title": sop.title,
+            "version_id": str(version.id) if version else None,
+            "text": sop_text or "",
+            "nlp_analysis": stored_nlp,
+            "version_metadata_compact": compact_vm,
+            "version_metadata_keys": meta_keys,
+            "profile_detection": pd_ser,
+        }
+    finally:
+        db.close()
+
+
+def _ensure_profile_detection_row(sop_ctx: dict[str, Any], action: str) -> None:
+    """If no active ProfileDetection row, persist one (NLP + metadata) then refresh sop_ctx."""
+    if action not in ("improve", "rewrite", "gap_check"):
+        return
+    if not sop_ctx.get("detected") or not sop_ctx.get("version_id"):
+        return
+    if sop_ctx.get("profile_detection"):
+        return
+    try:
+        vid = uuid.UUID(str(sop_ctx["version_id"]))
+        sid = uuid.UUID(str(sop_ctx["sop_id"]))
+    except Exception:
+        return
+    db = SessionLocal()
+    try:
+        v = db.query(SOPVersion).filter(SOPVersion.id == vid).first()
+        if not v:
+            return
+        persist_profile_detection_for_sop_version(db, v)
+        pd_row = load_active_profile_detection_row(db, sop_id=sid, sop_version_id=vid)
+        ser = serialize_profile_detection_row(pd_row)
+        if ser:
+            sop_ctx["profile_detection"] = ser
+            nlpj = ser.get("nlp_analysis_json")
+            if isinstance(nlpj, dict):
+                sop_ctx["nlp_analysis"] = nlpj
+    except Exception as exc:
+        logger.warning("[profile-detection] ensure_if_missing failed err=%s", exc)
+    finally:
+        db.close()
+
+
+def _try_client_structured_ai_response(
+    payload: AIActionRequest,
+    action: str,
+    request: ActionRequest,
+    style_profile: dict[str, Any],
+) -> AIActionResponse | None:
+    data = getattr(payload, "client_structured_json", None)
+    if not isinstance(data, dict) or not data:
+        return None
+    try:
+        if action == "improve":
+            txt = str(data.get("improved_text") or data.get("improved_version") or "").strip()
+            if len(txt) < 2:
+                return None
+            ImproveResponse.model_validate({"improved_text": txt})
+            return AIActionResponse(
+                action="improve",
+                original_text=request.section_text,
+                suggested_text=_render_dynamic_text(txt),
+                explanation="Applied structured improvement from client (validated; no new LLM call).",
+                structured_data={
+                    "improved_text": txt,
+                    "improved_version": txt,
+                    "style_profile": style_profile,
+                    "client_supplied": True,
+                },
+            )
+        if action == "rewrite":
+            txt = str(data.get("rewritten_text") or "").strip()
+            if len(txt) < 2:
+                return None
+            RewriteResponse.model_validate({"rewritten_text": txt})
+            return AIActionResponse(
+                action="rewrite",
+                original_text=request.section_text,
+                suggested_text=_render_dynamic_text(txt),
+                explanation="Applied structured rewrite from client (validated; no new LLM call).",
+                structured_data={
+                    "rewritten_text": txt,
+                    "style_profile": style_profile,
+                    "client_supplied": True,
+                },
+            )
+        if action == "gap_check":
+            txt = str(data.get("analysis") or "").strip()
+            if len(txt) < 10:
+                return None
+            GapCheckResponse.model_validate({"analysis": txt})
+            return AIActionResponse(
+                action="gap_check",
+                original_text=request.section_text,
+                suggested_text=_render_gap_check_analysis_html(txt),
+                explanation="Applied structured gap analysis from client (validated; no new LLM call).",
+                structured_data={
+                    "analysis": txt,
+                    "style_profile": style_profile,
+                    "client_supplied": True,
+                },
+            )
+    except ValidationError as ve:
+        logger.warning("[ai-action] client_structured_json rejected: %s", ve)
+        return None
+    return None
+
+
 def _build_gap_check_retrieval_query(request: ActionRequest) -> str:
     parts = [
         f"SOP: {request.sop_title}",
@@ -806,26 +1356,87 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
     runtime = _get_action_runtime()
     request = _build_action_request(payload)
     ch_budget = len(request.section_text or "")
+    sop_ctx = _load_uploaded_sop_context(request)
+    sop_text = str(sop_ctx.get("text") or "")
+    style_source_text = sop_text if sop_text else request.section_text
+    style_profile = _derive_sop_style_profile(style_source_text)
+    style_block = _style_profile_prompt_block(style_profile)
+    sop_context_block = ""
+    if sop_ctx.get("detected"):
+        sop_context_block = (
+            "SOP_DETECTED_CONTEXT\n"
+            f"- sop_number={sop_ctx.get('sop_number')}\n"
+            f"- title={sop_ctx.get('title')}\n"
+            f"- source=uploaded_database_sop\n"
+            f"- excerpt={_truncate_text(sop_text, 1200)}"
+        )
+    print(
+        f"[nlp-action] action={action} sop_detected={bool(sop_ctx.get('detected'))} "
+        f"sop_number={sop_ctx.get('sop_number') or '-'} tone={style_profile.get('tone')} "
+        f"avg_sentence_words={style_profile.get('avg_sentence_words')}",
+        flush=True,
+    )
+    logger.info(
+        "[action-style-profile] action=%s sop_detected=%s sop_number=%s tone=%s language=%s avg_sentence_words=%s imperative_ratio=%s",
+        action,
+        bool(sop_ctx.get("detected")),
+        sop_ctx.get("sop_number"),
+        style_profile.get("tone"),
+        style_profile.get("language"),
+        style_profile.get("avg_sentence_words"),
+        style_profile.get("imperative_ratio"),
+    )
+
+    bypass = _try_client_structured_ai_response(payload, action, request, style_profile)
+    if bypass is not None:
+        logger.info("[ai-action] using client_structured_json bypass action=%s", action)
+        return bypass
+
+    _ensure_profile_detection_row(sop_ctx, action)
+
+    nlp_bundle, nlp_block = build_nlp_bundle_for_action(action, request, sop_ctx, style_profile)
+    log_nlp_detected(action, nlp_bundle)
+    nlp_summary = nlp_action_summary(nlp_bundle)
+    cfg = get_local_llm_config()
 
     if action == "gap_check":
         retrieval_query = _build_gap_check_retrieval_query(request)
         raw_docs = runtime.retriever.invoke(retrieval_query)
         reranked = runtime.reranker.rerank_top_n(retrieval_query, raw_docs, 3)
-        context = format_chunks(reranked)
+        context = f"{format_chunks(reranked)}\n\n{style_block}\n\n{sop_context_block}".strip()
+        print(
+            f"[nlp-action] action=gap_check retrieval_docs={len(raw_docs)} reranked_docs={len(reranked)}",
+            flush=True,
+        )
     else:
         # improve / rewrite: no RAG — system prompt + rules + document fields + section text only
-        context = IMPROVE_REWRITE_NO_RAG_CONTEXT
+        context = f"{IMPROVE_REWRITE_NO_RAG_CONTEXT}\n{style_block}\n{sop_context_block}".strip()
+
+    logger.info(
+        "[ai-action-prompt] action=%s prompt_type=%s_json_nlp_v1 provider=%s model=%s nlp_block_chars=%s",
+        action,
+        action,
+        cfg.provider,
+        cfg.model,
+        len(nlp_block or ""),
+    )
 
     if action == "improve":
-        prompt = build_improve_prompt(request, context)
+        prompt = build_improve_prompt(request, context, nlp_block)
         parsed = parse_with_retry(
-            raw=_call_action_llm(runtime, prompt, input_char_budget=ch_budget),
+            raw=_call_action_llm(runtime, prompt, input_char_budget=ch_budget, action=action),
             schema=ImproveResponse,
             prompt=prompt,
             call_llm=lambda rp: _call_action_llm(
-                runtime, rp, input_char_budget=ch_budget
+                runtime, rp, input_char_budget=ch_budget, action=action
             ),
             audit_log=[],
+        )
+        logger.info(
+            "[ai-action-result] action=improve ok=1 provider=%s model=%s suggested_chars=%s",
+            cfg.provider,
+            cfg.model,
+            len(parsed.improved_text or ""),
         )
         return AIActionResponse(
             action="improve",
@@ -835,19 +1446,27 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
             structured_data={
                 "improved_text": parsed.improved_text,
                 "improved_version": parsed.improved_text,
+                "style_profile": style_profile,
+                "nlp_action_summary": nlp_summary,
             },
         )
 
     if action == "rewrite":
-        prompt = build_rewrite_prompt(request, context)
+        prompt = build_rewrite_prompt(request, context, nlp_block)
         parsed = parse_with_retry(
-            raw=_call_action_llm(runtime, prompt, input_char_budget=ch_budget),
+            raw=_call_action_llm(runtime, prompt, input_char_budget=ch_budget, action=action),
             schema=RewriteResponse,
             prompt=prompt,
             call_llm=lambda rp: _call_action_llm(
-                runtime, rp, input_char_budget=ch_budget
+                runtime, rp, input_char_budget=ch_budget, action=action
             ),
             audit_log=[],
+        )
+        logger.info(
+            "[ai-action-result] action=rewrite ok=1 provider=%s model=%s suggested_chars=%s",
+            cfg.provider,
+            cfg.model,
+            len(parsed.rewritten_text or ""),
         )
         return AIActionResponse(
             action="rewrite",
@@ -856,19 +1475,27 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
             explanation="Text neu formuliert / Text rewritten.",
             structured_data={
                 "rewritten_text": parsed.rewritten_text,
+                "style_profile": style_profile,
+                "nlp_action_summary": nlp_summary,
             },
         )
 
     if action == "gap_check":
-        prompt = build_gap_check_prompt(request, context)
+        prompt = build_gap_check_prompt(request, context, nlp_block)
         parsed = parse_with_retry(
-            raw=_call_action_llm(runtime, prompt, input_char_budget=ch_budget),
+            raw=_call_action_llm(runtime, prompt, input_char_budget=ch_budget, action=action),
             schema=GapCheckResponse,
             prompt=prompt,
             call_llm=lambda rp: _call_action_llm(
-                runtime, rp, input_char_budget=ch_budget
+                runtime, rp, input_char_budget=ch_budget, action=action
             ),
             audit_log=[],
+        )
+        logger.info(
+            "[ai-action-result] action=gap_check ok=1 provider=%s model=%s analysis_chars=%s",
+            cfg.provider,
+            cfg.model,
+            len(parsed.analysis or ""),
         )
         return AIActionResponse(
             action="gap_check",
@@ -877,6 +1504,8 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
             explanation="Compliance-Lückenanalyse abgeschlossen / Compliance gap analysis completed.",
             structured_data={
                 "analysis": parsed.analysis,
+                "style_profile": style_profile,
+                "nlp_action_summary": nlp_summary,
             },
         )
 
@@ -886,14 +1515,42 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
 def _fallback_gap_check(payload: AIActionRequest) -> AIActionResponse:
     runtime = _get_action_runtime()
     request = _build_action_request(payload)
+    request.section_text = _trim_large_selection_for_fallback(request.section_text)
     ch_budget = len(request.section_text or "")
-    prompt = build_gap_check_prompt(request, "Kein relevanter Kontext verfügbar. / No relevant context found.")
-    raw = _call_action_llm(runtime, prompt, input_char_budget=ch_budget)
+    sop_ctx = _load_uploaded_sop_context(request)
+    sop_text = str(sop_ctx.get("text") or "")
+    style_profile = _derive_sop_style_profile(sop_text if sop_text else request.section_text)
+    style_block = _style_profile_prompt_block(style_profile)
+    sop_context_block = ""
+    if sop_ctx.get("detected"):
+        sop_context_block = (
+            "SOP_DETECTED_CONTEXT\n"
+            f"- sop_number={sop_ctx.get('sop_number')}\n"
+            f"- title={sop_ctx.get('title')}\n"
+            f"- source=uploaded_database_sop\n"
+            f"- excerpt={_truncate_text(sop_text, 1200)}"
+        )
+    nlp_bundle, nlp_block = build_nlp_bundle_for_action("gap_check", request, sop_ctx, style_profile)
+    log_nlp_detected("gap_check", nlp_bundle)
+    nlp_summary = nlp_action_summary(nlp_bundle)
+    cfg = get_local_llm_config()
+    logger.info(
+        "[ai-action-prompt] action=gap_check prompt_type=gap_check_json_nlp_v1_fallback provider=%s model=%s nlp_block_chars=%s",
+        cfg.provider,
+        cfg.model,
+        len(nlp_block or ""),
+    )
+    prompt = build_gap_check_prompt(
+        request,
+        f"Kein relevanter Kontext verfügbar. / No relevant context found.\n\n{style_block}\n\n{sop_context_block}",
+        nlp_block,
+    )
+    raw = _call_action_llm(runtime, prompt, input_char_budget=ch_budget, action="gap_check")
     parsed = parse_with_retry(
         raw=raw,
         schema=GapCheckResponse,
         prompt=prompt,
-        call_llm=lambda rp: _call_action_llm(runtime, rp, input_char_budget=ch_budget),
+        call_llm=lambda rp: _call_action_llm(runtime, rp, input_char_budget=ch_budget, action="gap_check"),
         audit_log=[],
     )
     return AIActionResponse(
@@ -901,7 +1558,11 @@ def _fallback_gap_check(payload: AIActionRequest) -> AIActionResponse:
         original_text=_clean_text(payload.text),
         suggested_text=_render_gap_check_analysis_html(parsed.analysis),
         explanation="Compliance-Lückenanalyse abgeschlossen / Compliance gap analysis completed.",
-        structured_data={"analysis": parsed.analysis},
+        structured_data={
+            "analysis": parsed.analysis,
+            "style_profile": style_profile,
+            "nlp_action_summary": nlp_summary,
+        },
     )
 
 
@@ -909,13 +1570,41 @@ def _fallback_rewrite(payload: AIActionRequest) -> AIActionResponse:
     runtime = _get_action_runtime()
     request = _build_action_request(payload)
     ch_budget = len(request.section_text or "")
-    prompt = build_rewrite_prompt(request, IMPROVE_REWRITE_NO_RAG_CONTEXT)
-    raw = _call_action_llm(runtime, prompt, input_char_budget=ch_budget)
+    sop_ctx = _load_uploaded_sop_context(request)
+    sop_text = str(sop_ctx.get("text") or "")
+    style_profile = _derive_sop_style_profile(sop_text if sop_text else request.section_text)
+    style_block = _style_profile_prompt_block(style_profile)
+    sop_context_block = ""
+    if sop_ctx.get("detected"):
+        sop_context_block = (
+            "SOP_DETECTED_CONTEXT\n"
+            f"- sop_number={sop_ctx.get('sop_number')}\n"
+            f"- title={sop_ctx.get('title')}\n"
+            f"- source=uploaded_database_sop\n"
+            f"- excerpt={_truncate_text(sop_text, 1200)}"
+        )
+    _ensure_profile_detection_row(sop_ctx, "rewrite")
+    nlp_bundle, nlp_block = build_nlp_bundle_for_action("rewrite", request, sop_ctx, style_profile)
+    log_nlp_detected("rewrite", nlp_bundle)
+    nlp_summary = nlp_action_summary(nlp_bundle)
+    cfg = get_local_llm_config()
+    logger.info(
+        "[ai-action-prompt] action=rewrite prompt_type=rewrite_json_nlp_v1_fallback provider=%s model=%s nlp_block_chars=%s",
+        cfg.provider,
+        cfg.model,
+        len(nlp_block or ""),
+    )
+    prompt = build_rewrite_prompt(
+        request,
+        f"{IMPROVE_REWRITE_NO_RAG_CONTEXT}\n{style_block}\n{sop_context_block}".strip(),
+        nlp_block,
+    )
+    raw = _call_action_llm(runtime, prompt, input_char_budget=ch_budget, action="rewrite")
     parsed = parse_with_retry(
         raw=raw,
         schema=RewriteResponse,
         prompt=prompt,
-        call_llm=lambda rp: _call_action_llm(runtime, rp, input_char_budget=ch_budget),
+        call_llm=lambda rp: _call_action_llm(runtime, rp, input_char_budget=ch_budget, action="rewrite"),
         audit_log=[],
     )
     return AIActionResponse(
@@ -923,7 +1612,11 @@ def _fallback_rewrite(payload: AIActionRequest) -> AIActionResponse:
         original_text=_clean_text(payload.text),
         suggested_text=_render_dynamic_text(parsed.rewritten_text),
         explanation="Text neu formuliert / Text rewritten.",
-        structured_data={"rewritten_text": parsed.rewritten_text},
+        structured_data={
+            "rewritten_text": parsed.rewritten_text,
+            "style_profile": style_profile,
+            "nlp_action_summary": nlp_summary,
+        },
     )
 
 
@@ -931,13 +1624,41 @@ def _fallback_improve(payload: AIActionRequest) -> AIActionResponse:
     runtime = _get_action_runtime()
     request = _build_action_request(payload)
     ch_budget = len(request.section_text or "")
-    prompt = build_improve_prompt(request, IMPROVE_REWRITE_NO_RAG_CONTEXT)
-    raw = _call_action_llm(runtime, prompt, input_char_budget=ch_budget)
+    sop_ctx = _load_uploaded_sop_context(request)
+    sop_text = str(sop_ctx.get("text") or "")
+    style_profile = _derive_sop_style_profile(sop_text if sop_text else request.section_text)
+    style_block = _style_profile_prompt_block(style_profile)
+    sop_context_block = ""
+    if sop_ctx.get("detected"):
+        sop_context_block = (
+            "SOP_DETECTED_CONTEXT\n"
+            f"- sop_number={sop_ctx.get('sop_number')}\n"
+            f"- title={sop_ctx.get('title')}\n"
+            f"- source=uploaded_database_sop\n"
+            f"- excerpt={_truncate_text(sop_text, 1200)}"
+        )
+    _ensure_profile_detection_row(sop_ctx, "improve")
+    nlp_bundle, nlp_block = build_nlp_bundle_for_action("improve", request, sop_ctx, style_profile)
+    log_nlp_detected("improve", nlp_bundle)
+    nlp_summary = nlp_action_summary(nlp_bundle)
+    cfg = get_local_llm_config()
+    logger.info(
+        "[ai-action-prompt] action=improve prompt_type=improve_json_nlp_v1_fallback provider=%s model=%s nlp_block_chars=%s",
+        cfg.provider,
+        cfg.model,
+        len(nlp_block or ""),
+    )
+    prompt = build_improve_prompt(
+        request,
+        f"{IMPROVE_REWRITE_NO_RAG_CONTEXT}\n{style_block}\n{sop_context_block}".strip(),
+        nlp_block,
+    )
+    raw = _call_action_llm(runtime, prompt, input_char_budget=ch_budget, action="improve")
     parsed = parse_with_retry(
         raw=raw,
         schema=ImproveResponse,
         prompt=prompt,
-        call_llm=lambda rp: _call_action_llm(runtime, rp, input_char_budget=ch_budget),
+        call_llm=lambda rp: _call_action_llm(runtime, rp, input_char_budget=ch_budget, action="improve"),
         audit_log=[],
     )
     return AIActionResponse(
@@ -945,7 +1666,11 @@ def _fallback_improve(payload: AIActionRequest) -> AIActionResponse:
         original_text=_clean_text(payload.text),
         suggested_text=_render_dynamic_text(parsed.improved_text),
         explanation="Text verbessert / Text improved.",
-        structured_data={"improved_text": parsed.improved_text},
+        structured_data={
+            "improved_text": parsed.improved_text,
+            "style_profile": style_profile,
+            "nlp_action_summary": nlp_summary,
+        },
     )
 
 
@@ -1033,38 +1758,6 @@ def _summarize_live_context(assistant_context: dict | None, question: str = "") 
         f"- References in editor metadata: {', '.join(str(r) for r in references[:10]) or 'none'}\n"
         f"- Editor text excerpt: {excerpt if excerpt else 'not injected for this query intent'}"
     )
-
-
-def _build_live_context_answer(intents: set[str], assistant_context: dict | None) -> str | None:
-    ctx = assistant_context or {}
-    current = ctx.get("current_sop") if isinstance(ctx.get("current_sop"), dict) else {}
-    linked = ctx.get("linked_context") if isinstance(ctx.get("linked_context"), dict) else {}
-
-    if "active_sop" in intents:
-        sop_ref = str(current.get("sop_number") or current.get("id") or "").strip()
-        if not sop_ref:
-            return None
-        title = str(current.get("title") or "unknown").strip() or "unknown"
-        version = str(current.get("version") or "unknown").strip() or "unknown"
-        status = str(current.get("status") or "unknown").strip() or "unknown"
-        return (
-            f"The currently open SOP is {sop_ref}. "
-            f"Title: {title}. Version: {version}. Status: {status}."
-        )
-
-    if "linked" in intents:
-        dev_refs = _extract_refs(_ctx_list(linked.get("deviations")), ["deviation_number", "ref_number", "id"], limit=12)
-        capa_refs = _extract_refs(_ctx_list(linked.get("capas")), ["capa_number", "ref_number", "id"], limit=12)
-        audit_refs = _extract_refs(_ctx_list(linked.get("audits")), ["finding_number", "audit_number", "ref_number", "id"], limit=12)
-        if not (dev_refs or capa_refs or audit_refs):
-            return None
-        return (
-            f"Linked Deviations ({len(dev_refs)}): {', '.join(dev_refs) if dev_refs else 'none'}.\n"
-            f"Linked CAPAs ({len(capa_refs)}): {', '.join(capa_refs) if capa_refs else 'none'}.\n"
-            f"Linked Audits ({len(audit_refs)}): {', '.join(audit_refs) if audit_refs else 'none'}."
-        )
-
-    return None
 
 
 def _resolve_sop_from_context(db, assistant_context: dict | None, question: str) -> SOP | None:
@@ -1244,9 +1937,18 @@ async def perform_ai_action(payload: AIActionRequest):
     frontend can reliably support compare-and-confirm workflows.
     """
     action = _normalize_action(payload.action)
-    payload.text = _clean_text(payload.text)
+    raw_in = (payload.text or "").strip()
+    payload.text = normalize_action_input_text(payload.text)
     if not payload.text:
         raise HTTPException(status_code=422, detail="Selected text is required.")
+
+    logger.info(
+        "[ai-action-request] action=%s text_in_len=%s text_norm_len=%s preview=%s",
+        action,
+        len(raw_in),
+        len(payload.text),
+        _truncate_text(raw_in.replace("\n", " "), 220),
+    )
 
     try:
         return await asyncio.to_thread(_run_dynamic_ai_action, payload, action)
@@ -1263,10 +1965,24 @@ async def perform_ai_action(payload: AIActionRequest):
     raise HTTPException(status_code=400, detail=f"Action '{payload.action}' is not supported.")
 
 
+@ai_router.get("/api/ai/llm-health")
+async def llm_health(chat_probe: bool = Query(False, description="If true, POST a minimal /v1/chat/completions probe")):
+    """
+    Check reachability of the configured OpenAI-compatible server (/v1/models).
+    """
+    return await asyncio.to_thread(check_local_llm_api_health, chat_probe=chat_probe)
+
+
 @ai_router.post("/api/ai/query")
-async def query_ai(payload: dict):
+async def query_ai(
+    payload: dict,
+    current_user: User | None = Depends(get_current_user_optional),
+):
     """
     Chatbot query endpoint integrated from the standalone chatbot module.
+    When the client sends Authorization: Bearer <jwt>, each successful exchange
+    is appended to chat_sessions / chat_messages; response may include session_id
+    and message_id for follow-up requests.
     """
     question = (payload.get("question") or payload.get("query") or "").strip()
     if not question:
@@ -1291,8 +2007,10 @@ async def query_ai(payload: dict):
         f"[chatbot-request] surface={surface} route={route or '-'} provider={cfg.provider} model={cfg.model} category={category or 'auto'} qlen={len(question)}",
         flush=True,
     )
-    assistant_context = payload.get("assistant_context") or {}
+    raw_ac = payload.get("assistant_context")
+    assistant_context = raw_ac if isinstance(raw_ac, dict) else {}
     assistant_action_confirmation = payload.get("assistant_action_confirmation") or {}
+    profile_context = _extract_profile_context(payload, assistant_context)
     intents = _query_intents(question)
     context_summary = _summarize_live_context(assistant_context, question)
     action_plan = _plan_sop_action(question, assistant_context)
@@ -1326,43 +2044,46 @@ async def query_ai(payload: dict):
         context_hints.append("INTENT=COMPARE_SOPS")
     if ("active_sop" in intents) and active_ref:
         context_hints.append(f"FOCUS_REF={active_ref}")
-    live_context_answer = _build_live_context_answer(intents, assistant_context)
-    if live_context_answer:
-        response = {
-            "answer": live_context_answer,
-            "sources": [],
-            "citations": [],
-            "retrieval_debug": [],
-            "suggestions": [],
-            "retrieval_stats": {
-                "provider": cfg.provider,
-                "model": cfg.model,
-                "source": "live_context",
-                "surface": surface,
-                "intents": sorted(intents),
-                "latency_ms_total": round((time.perf_counter() - t0) * 1000.0, 1),
-            },
-            "routed_to": "live-context",
-            "assistant_action": action_result or action_plan,
-        }
-        logger.info(
-            "[chatbot-response] source=live_context surface=%s intents=%s latency_ms=%.1f",
-            surface,
-            sorted(intents),
-            (time.perf_counter() - t0) * 1000.0,
-        )
-        return response
+    if profile_context:
+        try:
+            style_hint = get_style_prompt_injection(profile_context.get("style_profile"))
+            if style_hint:
+                context_hints.append(style_hint[:1200])
+        except Exception as exc:
+            logger.warning("[chatbot-profile] profile context ignored: %s", exc)
     if context_hints:
         question_for_rag = f"{question_for_rag}\n\nRAG_HINTS: {' | '.join(context_hints)}"
-    elif action_plan:
-        # Include tiny context summary only for action-intent alignment.
-        question_for_rag = f"{question_for_rag}\n\n{context_summary[:500]}"
+
+    live_block = (context_summary or "").strip()
+    live_ctx_chars = len(live_block)
+    if live_ctx_chars > 60:
+        question_for_rag = f"{question_for_rag}\n\n{live_block[:3200]}"
+
     if action_plan:
         question_for_rag = (
             f"{question_for_rag}\n\n"
             f"PLANNED_ASSISTANT_ACTION: {action_plan}\n"
             "Use this planned action and live context while answering."
         )
+
+    async def _merge_persisted(response: dict) -> dict:
+        if current_user is None:
+            return response
+        extra = await asyncio.to_thread(
+            persist_chat_query_exchange,
+            user_id=str(current_user.id),
+            client_session_id=payload.get("session_id") or payload.get("chat_session_id"),
+            collection_name=str(payload.get("collection_name") or "").strip() or "docs_sops",
+            category=str(category).strip() if category is not None else None,
+            question=question,
+            response=response,
+            assistant_context=assistant_context,
+            llm_provider=str(cfg.provider or ""),
+            llm_model=str(cfg.model or ""),
+        )
+        if extra:
+            return {**response, **extra}
+        return response
 
     # RAG is the default source of truth. Local DB primary mode is opt-in only
     # for diagnostics and should not be used in normal semantic chatbot flow.
@@ -1379,10 +2100,24 @@ async def query_ai(payload: dict):
         )
         return response
 
+    pipeline_timeout = get_chat_pipeline_timeout_seconds()
+    logger.info(
+        "[chatbot-timeout] pipeline_seconds=%s local_llm_seconds=%s",
+        pipeline_timeout,
+        get_local_llm_timeout_seconds(),
+    )
+
     try:
         rag = await asyncio.wait_for(
             asyncio.to_thread(_get_smart_rag_chain),
-            timeout=CHAT_QUERY_TIMEOUT_SECONDS,
+            timeout=pipeline_timeout,
+        )
+        logger.info(
+            "[chatbot-rag-call] intents=%s category=%s live_ctx_chars=%s q_preview=%s",
+            sorted(intents),
+            category or "auto",
+            live_ctx_chars,
+            (question[:200] or ""),
         )
         try:
             result = await asyncio.wait_for(
@@ -1392,7 +2127,7 @@ async def query_ai(payload: dict):
                     category,
                     chat_history,
                 ),
-                timeout=CHAT_QUERY_TIMEOUT_SECONDS,
+                timeout=pipeline_timeout,
             )
         except Exception as first_exc:
             if _is_prompt_too_large_error(first_exc) and question_for_rag != question:
@@ -1400,35 +2135,61 @@ async def query_ai(payload: dict):
                     "[chatbot-request] prompt too large; retrying compact query path"
                 )
                 compact_history = (chat_history or [])[-4:]
+                compact_q = (question_for_rag or question)[:1200]
                 result = await asyncio.wait_for(
                     asyncio.to_thread(
                         rag.invoke,
-                        question,
+                        compact_q,
                         category,
                         compact_history,
                     ),
-                    timeout=CHAT_QUERY_TIMEOUT_SECONDS,
+                    timeout=pipeline_timeout,
                 )
             else:
                 raise
+        if not isinstance(result, dict):
+            logger.error(
+                "[chatbot-response] invalid rag result type=%s; coercing empty response",
+                type(result).__name__,
+            )
+            result = {}
     except (TimeoutError, asyncio.TimeoutError):
+        elapsed = round((time.perf_counter() - t0) * 1000.0, 1)
+        logger.error("[chatbot-response] failure_stage=pipeline_timeout elapsed_ms=%s", elapsed)
         raise HTTPException(
             status_code=504,
-            detail="RAG request timed out. Please retry with a shorter or more specific query.",
+            detail={
+                "message": "The chat pipeline exceeded its asyncio time budget (chain load + retrieval + LLM).",
+                "failure_stage": "pipeline_timeout",
+                "elapsed_ms": elapsed,
+                "chat_pipeline_timeout_seconds": pipeline_timeout,
+                "local_llm_timeout_seconds": get_local_llm_timeout_seconds(),
+                "llm_base_url": cfg.base_url,
+                "llm_model": cfg.model,
+                "hint": "Increase CHAT_QUERY_TIMEOUT_SECONDS or reduce RAG context; confirm GET /api/ai/llm-health.",
+            },
         )
     except Exception as exc:
+        elapsed = round((time.perf_counter() - t0) * 1000.0, 1)
         if is_local_llm_unreachable_error(exc):
             logger.error(
-                "[chatbot-response] source=error reason=llm_unreachable latency_ms=%.1f error=%s",
-                (time.perf_counter() - t0) * 1000.0,
+                "[chatbot-response] failure_stage=llm_unreachable elapsed_ms=%.1f error=%s",
+                elapsed,
                 str(exc),
             )
             raise HTTPException(
                 status_code=503,
-                detail=(
-                    f"Local LLM server unreachable ({cfg.base_url}, model={cfg.model}). "
-                    "Please ensure the local model service is running."
-                ),
+                detail={
+                    "message": "The local OpenAI-compatible LLM could not complete a request (connection, timeout, or HTTP error).",
+                    "failure_stage": "llm_unreachable",
+                    "error": str(exc),
+                    "elapsed_ms": elapsed,
+                    "llm_base_url": cfg.base_url,
+                    "llm_model": cfg.model,
+                    "llm_provider": cfg.provider,
+                    "local_llm_timeout_seconds": get_local_llm_timeout_seconds(),
+                    "hint": "Run GET /api/ai/llm-health and ensure LOCAL_LLM_MODEL matches a model id from /v1/models.",
+                },
             )
         raise HTTPException(status_code=500, detail=f"Chatbot query failed: {exc}")
 
@@ -1447,7 +2208,13 @@ async def query_ai(payload: dict):
             out.append(d)
         return out
 
-    citations = _json_safe_citations(result.get("citations", []))
+    citations = _json_safe_citations((result or {}).get("citations", []))
+    try:
+        from chatbot.rag.rag_chain import _dedupe_citations_by_ref
+
+        citations = _dedupe_citations_by_ref(citations)
+    except Exception:
+        pass
     sources = []
     for idx, c in enumerate(citations):
         ref = c.get("ref") or c.get("title") or f"source-{idx+1}"
@@ -1455,16 +2222,21 @@ async def query_ai(payload: dict):
         source_type = (c.get("type") or "doc").lower()
         sources.append({"id": ref, "type": source_type, "label": label})
 
+    base_stats = dict((result or {}).get("retrieval_stats") or {})
     response = {
-        "answer": result.get("answer", ""),
+        "answer": (result or {}).get("answer", ""),
         "sources": sources,
         "citations": citations,
-        "retrieval_debug": result.get("retrieval_debug", []),
-        "suggestions": result.get("suggestions", []),
-        "retrieval_stats": result.get("retrieval_stats", {}),
-        "routed_to": result.get("routed_to", ""),
+        "retrieval_debug": (result or {}).get("retrieval_debug", []),
+        "suggestions": (result or {}).get("suggestions", []),
+        "retrieval_stats": {**base_stats},
+        "routed_to": (result or {}).get("routed_to", ""),
         "assistant_action": action_result or action_plan,
     }
+    if (result or {}).get("failure_stage") is not None:
+        response["failure_stage"] = (result or {}).get("failure_stage")
+    if (result or {}).get("llm_error"):
+        response["llm_error"] = (result or {}).get("llm_error")
 
     if pending_confirmation and not bool(assistant_action_confirmation.get("confirmed")):
         response["assistant_action"] = {
@@ -1475,7 +2247,7 @@ async def query_ai(payload: dict):
             "I can delete the active SOP, but I need your confirmation first. "
             "Please confirm deletion in the in-app modal."
         )
-        return response
+        return await _merge_persisted(response)
 
     if action_plan and action_plan.get("type") == "delete_sop" and bool(assistant_action_confirmation.get("confirmed")):
         action_result = await asyncio.to_thread(
@@ -1487,7 +2259,7 @@ async def query_ai(payload: dict):
                 f"{response.get('answer', '')}\n\n"
                 f"Action completed: {action_result.get('message', 'SOP deleted.')}"
             ).strip()
-        return response
+        return await _merge_persisted(response)
 
     if action_plan and action_plan.get("type") in {"create_sop", "update_sop"}:
         llm_generated = result.get("answer", "")
@@ -1507,19 +2279,58 @@ async def query_ai(payload: dict):
                 f"Action completed: {action_result.get('message', 'Done.')}"
             ).strip()
 
-    answer_text = (response.get("answer") or "").strip().lower()
-    rag_weak = (
-        not answer_text
-        or "no relevant information found" in answer_text
-        or "do not contain sufficient detail" in answer_text
+    response.setdefault("retrieval_stats", {})
+    retrieval_total = int(response["retrieval_stats"].get("total_docs") or 0)
+    had_evidence = retrieval_total > 0 or len(citations) > 0
+    answer_raw = (response.get("answer") or "").strip()
+    answer_lower = answer_raw.lower()
+    boilerplate_unreachable = (
+        "no relevant information found" in answer_lower
+        or "the available records do not contain sufficient detail" in answer_lower
     )
-    if rag_weak:
+    dbg_rows = response.get("retrieval_debug") or []
+    dbg_preview = ""
+    if dbg_rows:
+        dbg_preview = str(dbg_rows[0])[:480]
+
+    if not had_evidence and (not answer_raw or boilerplate_unreachable):
         response["answer"] = "Sorry, I do not have enough information about this."
         response["citations"] = []
         response["sources"] = []
         response["retrieval_debug"] = []
+        rr = (
+            (result or {}).get("refusal_reason")
+            or (result or {}).get("retrieval_stats", {}).get("refusal_reason")
+            or "no_retrieval"
+        )
+        response["refusal_reason"] = rr
+        logger.info(
+            "[chatbot-refusal] reason=%s intents=%s routed_to=%s q_preview=%s",
+            rr,
+            sorted(intents),
+            response.get("routed_to", ""),
+            (question[:220] or ""),
+        )
+    elif had_evidence and boilerplate_unreachable:
+        logger.warning(
+            "[chatbot-refusal-skipped] refusal-like phrasing but total_docs=%s citations=%s",
+            retrieval_total,
+            len(citations),
+        )
 
-    response.setdefault("retrieval_stats", {})
+    try:
+        from chatbot.rag.rag_chain import (
+            _strip_sources_footer_from_answer,
+            _strip_sources_lines_from_answer,
+        )
+
+        if not bool((response.get("retrieval_stats") or {}).get("strict_mode")):
+            response["answer"] = _strip_sources_footer_from_answer(
+                _strip_sources_lines_from_answer(response.get("answer") or "")
+            )
+    except Exception:
+        pass
+
     response["retrieval_stats"].update(
         {
             "provider": cfg.provider,
@@ -1527,17 +2338,24 @@ async def query_ai(payload: dict):
             "source": "rag",
             "surface": surface,
             "intents": sorted(intents),
+            "profile_detection": bool(profile_context),
             "latency_ms_total": round((time.perf_counter() - t0) * 1000.0, 1),
+            "llm_base_url": cfg.base_url,
         }
     )
+    response["elapsed_ms_total"] = round((time.perf_counter() - t0) * 1000.0, 1)
+    response["retrieval_stats"]["elapsed_ms_total"] = response["elapsed_ms_total"]
     logger.info(
-        "[chatbot-response] source=rag routed_to=%s citations=%s latency_ms=%.1f",
+        "[chatbot-response] source=rag routed_to=%s total_docs=%s citations=%s intents=%s dbg_preview=%s latency_ms=%.1f",
         response.get("routed_to", ""),
+        retrieval_total,
         len(citations),
+        sorted(intents),
+        dbg_preview.replace("\n", " ")[:500],
         (time.perf_counter() - t0) * 1000.0,
     )
     print(
-        f"[chatbot-response] source=rag routed_to={response.get('routed_to', '')} citations={len(citations)} latency_ms={(time.perf_counter() - t0) * 1000.0:.1f}",
+        f"[chatbot-response] source=rag routed_to={response.get('routed_to', '')} total_docs={retrieval_total} citations={len(citations)} latency_ms={(time.perf_counter() - t0) * 1000.0:.1f}",
         flush=True,
     )
-    return response
+    return await _merge_persisted(response)
