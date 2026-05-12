@@ -1,0 +1,283 @@
+
+## **SOP ID:** SOP-QA-007
+
+## **Titel:** Umgang mit Abweichungen (Deviation Management)
+
+---
+
+## **1. Zweck (Purpose)**
+
+Der Zweck dieser Standard Operating Procedure (SOP) ist die Definition eines einheitlichen, kontrollierten und nachvollziehbaren Prozesses zur Identifikation, Dokumentation, Bewertung und Bearbeitung von Abweichungen (Deviations) im Produktions- und Qualitätsumfeld.
+
+Eine Abweichung liegt vor, wenn ein tatsächlicher Prozess, ein Ergebnis oder eine Tätigkeit von den definierten Spezifikationen, SOPs, regulatorischen Anforderungen oder Qualitätsstandards abweicht.
+
+Das Ziel dieser SOP ist es sicherzustellen, dass:
+
+* alle Abweichungen systematisch erfasst und bewertet werden
+* Ursachen identifiziert und dokumentiert werden
+* geeignete Korrektur- und Vorbeugemaßnahmen (CAPA) definiert werden
+* die Produktqualität, Patientensicherheit und regulatorische Compliance jederzeit gewährleistet bleiben
+* eine vollständige Nachvollziehbarkeit gemäß GMP und Annex 11 sichergestellt ist
+
+---
+
+## **2. Geltungsbereich (Scope)**
+
+Diese SOP gilt für alle Abteilungen und Prozesse, die Einfluss auf die Produktqualität, Produktionsabläufe oder regulatorische Anforderungen haben.
+
+Der Geltungsbereich umfasst insbesondere:
+
+* Produktion
+* Qualitätssicherung (QA)
+* Qualitätskontrolle (QC)
+* Logistik und Lager
+* IT-Systeme mit Qualitätsrelevanz
+
+Diese SOP gilt für alle Mitarbeiter sowie externe Dienstleister, die an diesen Prozessen beteiligt sind.
+
+---
+
+## **3. Begriffsdefinitionen (Definitions)**
+
+**Abweichung (Deviation):**
+Ein Ereignis, bei dem ein Prozess, eine Aktivität oder ein Ergebnis nicht den festgelegten Anforderungen entspricht.
+
+**Kritische Abweichung:**
+Eine Abweichung, die potenziell Einfluss auf Produktqualität, Sicherheit oder regulatorische Compliance hat.
+
+**CAPA (Corrective and Preventive Action):**
+Maßnahmen zur Behebung einer Abweichung und zur Vermeidung ihres erneuten Auftretens.
+
+**Root Cause Analysis (RCA):**
+Systematische Analyse zur Identifikation der zugrunde liegenden Ursache einer Abweichung.
+
+---
+
+## **4. Verantwortlichkeiten (Responsibilities)**
+
+### **4.1 Mitarbeiter**
+
+* sofortige Meldung erkannter Abweichungen
+* Unterstützung bei der Dokumentation
+* Einhaltung der definierten Prozesse
+
+### **4.2 Vorgesetzte / Abteilungsleiter**
+
+* Bewertung der Abweichung
+* Einleitung notwendiger Maßnahmen
+* Sicherstellung der fristgerechten Bearbeitung
+
+### **4.3 Qualitätssicherung (QA)**
+
+* Überprüfung und Freigabe der Abweichungsberichte
+* Bewertung der Kritikalität
+* Genehmigung von CAPA-Maßnahmen
+* Sicherstellung der Compliance
+
+### **4.4 Qualitätskontrolle (QC)**
+
+* Unterstützung bei der Analyse von Produktabweichungen
+* Durchführung von Tests und Bewertungen
+
+---
+
+## **5. Voraussetzungen (Prerequisites)**
+
+Vor der Bearbeitung einer Abweichung müssen folgende Voraussetzungen erfüllt sein:
+
+* Zugang zu einem Abweichungsmanagementsystem oder Formular
+* Verfügbarkeit relevanter Prozessdaten
+* definierte Ansprechpartner für Eskalation
+
+---
+
+## **6. Verfahren (Procedure)**
+
+---
+
+### **6.1 Identifikation der Abweichung**
+
+1. Eine Abweichung wird durch einen Mitarbeiter, ein System oder eine Kontrolle festgestellt
+2. Die Abweichung wird unverzüglich gemeldet
+3. Erste Bewertung der Dringlichkeit erfolgt
+
+---
+
+### **6.2 Dokumentation der Abweichung**
+
+Folgende Informationen müssen erfasst werden:
+
+* Datum und Uhrzeit
+* betroffener Prozess oder System
+* Beschreibung der Abweichung
+* betroffene Produkte oder Chargen
+* verantwortliche Person
+
+Die Dokumentation muss vollständig und verständlich erfolgen.
+
+---
+
+### **6.3 Klassifizierung der Abweichung**
+
+Die Abweichung wird durch QA klassifiziert:
+
+* kritisch
+* major
+* minor
+
+Kriterien:
+
+* Einfluss auf Produktqualität
+* Einfluss auf Sicherheit
+* regulatorische Relevanz
+
+---
+
+### **6.4 Ursachenanalyse (Root Cause Analysis)**
+
+Die Ursachenanalyse wird durchgeführt unter Verwendung geeigneter Methoden, z. B.:
+
+* 5-Why-Analyse
+* Ishikawa-Diagramm
+* Fehlerbaumanalyse
+
+Die identifizierte Ursache muss:
+
+* nachvollziehbar
+* dokumentiert
+* überprüfbar
+
+sein.
+
+---
+
+### **6.5 Definition von CAPA-Maßnahmen**
+
+Basierend auf der Ursachenanalyse werden Maßnahmen definiert:
+
+* Corrective Actions (Behebung der aktuellen Abweichung)
+* Preventive Actions (Vermeidung zukünftiger Abweichungen)
+
+Jede Maßnahme muss enthalten:
+
+* Verantwortlicher
+* Frist
+* Beschreibung
+
+---
+
+### **6.6 Umsetzung der Maßnahmen**
+
+1. Maßnahmen werden umgesetzt
+2. Fortschritt wird dokumentiert
+3. Fristen werden überwacht
+
+---
+
+### **6.7 Wirksamkeitsprüfung (Effectiveness Check)**
+
+Nach Umsetzung wird geprüft:
+
+* ob die Maßnahme wirksam ist
+* ob die Abweichung nachhaltig behoben wurde
+
+Dies erfolgt durch QA.
+
+---
+
+### **6.8 Abschluss der Abweichung**
+
+Eine Abweichung kann abgeschlossen werden, wenn:
+
+* alle Maßnahmen umgesetzt wurden
+* die Wirksamkeit bestätigt ist
+* QA die Abweichung freigegeben hat
+
+---
+
+## **7. Dokumentation (Documentation)**
+
+Folgende Dokumente müssen geführt werden:
+
+* Abweichungsbericht
+* Ursachenanalyse
+* CAPA-Dokumentation
+* Wirksamkeitsprüfung
+* Audit Trail
+
+Alle Daten müssen revisionssicher gespeichert werden.
+
+---
+
+## **8. Eskalation (Escalation)**
+
+Eine Eskalation erfolgt, wenn:
+
+* kritische Abweichungen vorliegen
+* Fristen nicht eingehalten werden
+* wiederholte Abweichungen auftreten
+
+Eskalationsstufen:
+
+* Abteilungsleitung
+* QA-Leitung
+* Geschäftsführung
+
+---
+
+## **9. Risiken und Kontrollen (Risk and Control)**
+
+### Risiken:
+
+* unvollständige Dokumentation
+* falsche Ursachenanalyse
+* ineffektive CAPA
+
+### Kontrollen:
+
+* QA-Review
+* Audit Trail
+* regelmäßige Überprüfung
+
+---
+
+## **10. Schulung (Training)**
+
+Alle betroffenen Mitarbeiter müssen:
+
+* initial geschult werden
+* regelmäßig geschult werden
+
+Schulungen müssen dokumentiert werden.
+
+---
+
+## **11. Anhänge (Appendices)**
+
+* Formular Abweichungsmeldung
+* Vorlage CAPA
+* Checkliste Ursachenanalyse
+
+---
+
+## **12. Änderungshistorie (Change History)**
+
+| Version | Datum   | Änderung         | Autor  |
+| ------- | ------- | ---------------- | ------ |
+| 1.0     | 22-05-26 | Initiale Version | Asim
+
+---
+
+# 💡 Für dein System perfekt geeignet, weil:
+
+* viele klare Sections → Struktur-Erkennung
+* QA Begriffe → Regulatory Check
+* unterschiedliche Texttypen → NLP Test
+* Prozesslogik → Gap Check
+
+---
+
+Wenn du willst, mache ich dir als nächstes:
+
+👉 eine **schlecht geschriebene SOP (zum Testen deines Systems)**
+👉 oder **gleiche SOP in anderem Schreibstil (für Profile Detection)**

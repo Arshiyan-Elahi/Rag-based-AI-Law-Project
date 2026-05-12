@@ -1,46 +1,102 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { Send, Zap } from 'lucide-react'
-import { nowTime, runUnifiedAssistantQuery, getAssistantRouteMeta, toHtml } from '../../utils/chatAssistant'
-import { createDocument } from '../../api/editorApi'
+import {
+  nowTime,
+  runUnifiedAssistantQuery,
+  getAssistantRouteMeta,
+  toHtml,
+  formatChatTimeFromIso,
+  readKlAssistantMode,
+  writeKlAssistantMode,
+} from '../../utils/chatAssistant'
+import {
+  createDocument,
+  getChatSessionMessages,
+} from '../../api/editorApi'
 import { htmlToPlainText, deriveSopTitleFromText, plainTextToTiptapDoc } from '../../utils/chatSopSave'
 import { getAssistantContextStorageKeys, resetAssistantStateOnce } from '../../utils/assistantContext'
 import './DashboardComponents.css'
 
-const STORAGE_KEY_BY_PATH = 'ai_widget_messages_by_path_v3_reset'
+const LS_SESSION_BY_PATH = 'cybrain_kl_chat_session_by_path'
+
 resetAssistantStateOnce()
+
+function readSessionIdForPath(pathname) {
+  try {
+    const raw = localStorage.getItem(LS_SESSION_BY_PATH)
+    const j = raw ? JSON.parse(raw) : {}
+    const sid = j?.[pathname]
+    return sid && String(sid).trim() ? String(sid).trim() : null
+  } catch {
+    return null
+  }
+}
+
+function writeSessionIdForPath(pathname, sessionId) {
+  try {
+    const raw = localStorage.getItem(LS_SESSION_BY_PATH)
+    const j = raw ? JSON.parse(raw) : {}
+    j[pathname] = sessionId
+    localStorage.setItem(LS_SESSION_BY_PATH, JSON.stringify(j))
+  } catch {
+    // ignore
+  }
+}
+
+function defaultGreeting() {
+  return [
+    {
+      id: `greeting-${Date.now()}`,
+      role: 'ai',
+      text: 'Chatbot ist verbunden. Stelle eine Frage zu SOPs, Abweichungen, CAPAs, Audits oder Entscheidungen.',
+      tags: [],
+      time: nowTime(),
+    },
+  ]
+}
+
+function dbMessagesToWidget(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return defaultGreeting()
+  return rows.map((m) => ({
+    id: m.id,
+    role: m.role === 'user' ? 'user' : 'ai',
+    text: String(m.content || ''),
+    tags: [],
+    time: formatChatTimeFromIso(m.created_at),
+  }))
+}
+
+const QUICK_ACTION_CHIPS = [
+  { id: 'rewrite', label: 'Rewrite', text: 'Rewrite the active SOP into an industry-level SOP using the configured LLM model.' },
+  { id: 'improve', label: 'Improve', text: 'Improve readability of this SOP.' },
+  { id: 'gap', label: 'Gap Check', text: 'Run gap check on this SOP.' },
+  { id: 'summarize', label: 'Summarize', text: 'Summarize this SOP for executives.' },
+  { id: 'analyze', label: 'Analyze', text: 'Analyze compliance of this SOP.' },
+  { id: 'compare', label: 'Compare', text: 'Compare SOP versions for this document.' },
+]
 
 export default function AIWidget() {
   const location = useLocation()
   const navigate = useNavigate()
   const routeMeta = getAssistantRouteMeta(location.pathname)
-  const [messages, setMessages] = useState(() => {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY_BY_PATH)
-      const parsed = raw ? JSON.parse(raw) : {}
-      const byPath = parsed?.[location.pathname]
-      if (Array.isArray(byPath) && byPath.length > 0) return byPath
-    } catch {
-      // no-op
-    }
-    return [
-      {
-        id: `greeting-${Date.now()}`,
-        role: 'ai',
-        text: 'Chatbot ist verbunden. Stelle eine Frage zu SOPs, Abweichungen, CAPAs, Audits oder Entscheidungen.',
-        tags: [],
-        time: nowTime(),
-      },
-    ]
-  })
+  const [messages, setMessages] = useState(() => defaultGreeting())
   const [input, setInput] = useState('')
+  const [assistantMode, setAssistantMode] = useState(() => readKlAssistantMode())
   const [sending, setSending] = useState(false)
   const [pendingDeleteAction, setPendingDeleteAction] = useState(null)
   const [actionToast, setActionToast] = useState('')
   const chatEndRef = useRef(null)
   const messagesRef = useRef(messages)
-  const serverSessionIdRef = useRef(null)
   const suggestions = routeMeta.suggestions
+
+  useEffect(() => {
+    setAssistantMode(readKlAssistantMode())
+  }, [location.pathname])
+
+  useEffect(() => {
+    if (assistantMode === 'query') setPendingDeleteAction(null)
+  }, [assistantMode])
 
   const emitSOPRefresh = useCallback((reason, sopId) => {
     if (typeof window === 'undefined') return
@@ -75,44 +131,32 @@ export default function AIWidget() {
     messagesRef.current = messages
   }, [messages])
 
-  // Auto-scroll to bottom when messages change or when loading indicator appears
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, sending])
 
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY_BY_PATH)
-      const parsed = raw ? JSON.parse(raw) : {}
-      parsed[location.pathname] = messages
-      localStorage.setItem(STORAGE_KEY_BY_PATH, JSON.stringify(parsed))
-    } catch {
-      // ignore storage failures
-    }
-  }, [location.pathname, messages])
-
-  useEffect(() => {
-    serverSessionIdRef.current = null
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY_BY_PATH)
-      const parsed = raw ? JSON.parse(raw) : {}
-      const byPath = parsed?.[location.pathname]
-      if (Array.isArray(byPath) && byPath.length > 0) {
-        setMessages(byPath)
+    let cancelled = false
+    const path = location.pathname
+    async function load() {
+      const sid = readSessionIdForPath(path)
+      if (!sid) {
+        if (!cancelled) setMessages(defaultGreeting())
         return
       }
-    } catch {
-      // no-op
+      try {
+        const rows = await getChatSessionMessages(sid)
+        if (cancelled) return
+        setMessages(dbMessagesToWidget(rows))
+      } catch (e) {
+        console.error('[chat-history-load] AIWidget messages', e)
+        if (!cancelled) setMessages(defaultGreeting())
+      }
     }
-    setMessages([
-      {
-        id: `greeting-${Date.now()}`,
-        role: 'ai',
-        text: 'Chatbot ist verbunden. Stelle eine Frage zu SOPs, Abweichungen, CAPAs, Audits oder Entscheidungen.',
-        tags: [],
-        time: nowTime(),
-      },
-    ])
+    load()
+    return () => {
+      cancelled = true
+    }
   }, [location.pathname])
 
   const sendMessage = useCallback(async (text, opts = {}) => {
@@ -133,16 +177,18 @@ export default function AIWidget() {
         })),
         { role: 'user', content: trimmed },
       ]
+      const sid = readSessionIdForPath(location.pathname)
       const result = await runUnifiedAssistantQuery({
         question: trimmed,
         pathname: location.pathname,
         chatHistory: chatHistoryPayload,
         assistantActionConfirmation: opts.assistantActionConfirmation || null,
         surface: 'kl_assistant',
-        sessionId: serverSessionIdRef.current,
+        sessionId: sid,
+        assistantMode,
       })
       const action = result?.assistant_action
-      if (action?.requires_confirmation && action?.type === 'delete_sop') {
+      if (assistantMode === 'action' && action?.requires_confirmation && action?.type === 'delete_sop') {
         setPendingDeleteAction({
           question: trimmed,
           action,
@@ -150,15 +196,15 @@ export default function AIWidget() {
       } else {
         setPendingDeleteAction(null)
       }
-      if (action?.ok && action?.type === 'create_sop' && action?.sop_id) {
+      if (assistantMode === 'action' && action?.ok && action?.type === 'create_sop' && action?.sop_id) {
         emitSOPRefresh('create', action.sop_id)
         showToast('SOP created successfully')
         navigate(`/editor/${action.sop_id}`)
       }
-      if (action?.ok && action?.type === 'update_sop') {
+      if (assistantMode === 'action' && action?.ok && action?.type === 'update_sop') {
         showToast('SOP updated successfully')
       }
-      if (action?.ok && action?.type === 'delete_sop') {
+      if (assistantMode === 'action' && action?.ok && action?.type === 'delete_sop') {
         emitSOPRefresh('delete', action.sop_id)
         showToast('SOP deleted successfully')
         console.info('[assistant-delete-ui] delete success', action)
@@ -168,17 +214,20 @@ export default function AIWidget() {
           navigate('/sops')
         }
       }
-      const aiMsg = {
-        id: Date.now() + 1,
-        role: 'ai',
-        text: result.answer || result.text || result.response || '—',
-        tags: result.sources?.map(s => s.label) ?? [],
-        time: nowTime(),
+      if (result?.session_id) {
+        writeSessionIdForPath(location.pathname, result.session_id)
+        const rows = await getChatSessionMessages(result.session_id)
+        setMessages(dbMessagesToWidget(rows))
+      } else {
+        const aiMsg = {
+          id: Date.now() + 1,
+          role: 'ai',
+          text: result.answer || result.text || result.response || '—',
+          tags: result.sources?.map((s) => s.label) ?? [],
+          time: nowTime(),
+        }
+        setMessages((prev) => [...prev, aiMsg])
       }
-      if (result.session_id) {
-        serverSessionIdRef.current = result.session_id
-      }
-      setMessages(prev => [...prev, aiMsg])
     } catch (err) {
       // Graceful error message in chat
       const errMsg = {
@@ -192,7 +241,7 @@ export default function AIWidget() {
     } finally {
       setSending(false)
     }
-  }, [sending, location.pathname, navigate, emitSOPRefresh, showToast, clearAssistantActiveContext])
+  }, [sending, location.pathname, navigate, emitSOPRefresh, showToast, clearAssistantActiveContext, assistantMode])
 
   const handleSend = () => sendMessage(input)
 
@@ -200,6 +249,7 @@ export default function AIWidget() {
   const handleSuggestionClick = (text) => sendMessage(text)
 
   const handleCreateSOP = useCallback(async (messageText) => {
+    if (assistantMode === 'query') return
     try {
       if (!messageText) return
       const htmlText = toHtml(messageText)
@@ -241,7 +291,7 @@ export default function AIWidget() {
     } catch (err) {
       console.error('Failed to create SOP from AIWidget:', err)
     }
-  }, [navigate])
+  }, [navigate, assistantMode])
 
   const contextLabel = routeMeta.contextLabel
 
@@ -283,6 +333,49 @@ export default function AIWidget() {
           <span className="ai-context-label">{contextLabel}</span>
         </div>
 
+        <div className="ai-assistant-mode-row">
+          <label htmlFor="kl-assistant-mode" className="ai-assistant-mode-label">
+            Modus
+          </label>
+          <select
+            id="kl-assistant-mode"
+            className={`ai-assistant-mode-select ${assistantMode === 'query' ? 'ai-assistant-mode-select--query' : 'ai-assistant-mode-select--action'}`}
+            value={assistantMode}
+            onChange={(e) => {
+              const v = e.target.value
+              if (v === 'query' || v === 'action') {
+                writeKlAssistantMode(v)
+                setAssistantMode(v)
+              }
+            }}
+            aria-label="Assistenz-Modus"
+          >
+            <option value="query">Query</option>
+            <option value="action">Perform Action</option>
+          </select>
+          <span
+            className={`ai-assistant-mode-pill ${assistantMode === 'query' ? 'ai-assistant-mode-pill--query' : 'ai-assistant-mode-pill--action'}`}
+          >
+            {assistantMode === 'query' ? 'Nur Abfrage' : 'Aktionen'}
+          </span>
+        </div>
+
+        {assistantMode === 'action' ? (
+          <div className="ai-action-chips" role="group" aria-label="Schnellaktionen">
+            {QUICK_ACTION_CHIPS.map((c) => (
+              <button
+                key={c.id}
+                type="button"
+                className="ai-action-chip"
+                disabled={sending}
+                onClick={() => setInput(c.text)}
+              >
+                {c.label}
+              </button>
+            ))}
+          </div>
+        ) : null}
+
         {/* Input and send button (n_af201, n_dfc55, n_61f05) */}
         <div className="ai-context-input-group">
           <input
@@ -307,38 +400,31 @@ export default function AIWidget() {
 
       <div className="ai-widget-divider" />
 
-      {/* Chat message bubble (n_50e03) */}
+      {/* Chat messages (DB-backed when authenticated) */}
       <div className="ai-messages-section">
-        {messages.length > 0 && (
-          <div className="ai-greeting-bubble">
-            <p className="ai-greeting-text">{messages[0]?.text}</p>
-            {messages[0]?.tags && messages[0]?.tags.length > 0 && (
-              <div className="ai-message-tags">
-                {messages[0]?.tags.map(tag => (
-                  <span key={tag} className="ai-message-tag">{tag}</span>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Additional messages */}
-        {messages.slice(1).map(m => (
+        {messages.map((m, idx) => (
           <div
             key={m.id}
-            className={`ai-chat-message ${m.role}${m.isError ? ' error' : ''}`}
+            className={`ai-chat-message ${m.role}${m.isError ? ' error' : ''}${idx === 0 && String(m.id).startsWith('greeting') ? ' ai-greeting-bubble' : ''}`}
           >
-            <div className="ai-message-content" dangerouslySetInnerHTML={{ __html: toHtml(m.text) }} />
+            {idx === 0 && String(m.id).startsWith('greeting') ? (
+              <p className="ai-greeting-text">{m.text}</p>
+            ) : (
+              <div className="ai-message-content" dangerouslySetInnerHTML={{ __html: toHtml(m.text) }} />
+            )}
             {m.tags && m.tags.length > 0 && (
               <div className="ai-message-tags">
-                {m.tags.map(tag => (
-                  <span key={tag} className="ai-message-tag">{tag}</span>
+                {m.tags.map((tag) => (
+                  <span key={tag} className="ai-message-tag">
+                    {tag}
+                  </span>
                 ))}
               </div>
             )}
-            {m.role === 'ai' && !m.isError && /purpose|zweck|scope|geltungsbereich|procedure|verfahren|responsibilities|verantwortlichkeiten/i.test(m.text) && (
-              <button 
-                className="ai-kontext-btn" 
+            {m.role === 'ai' && !m.isError && assistantMode === 'action' && /purpose|zweck|scope|geltungsbereich|procedure|verfahren|responsibilities|verantwortlichkeiten/i.test(m.text) && (
+              <button
+                className="ai-kontext-btn"
+                type="button"
                 style={{ marginTop: '10px', padding: '6px 12px', fontSize: '11px', minHeight: 'auto', borderRadius: '4px' }}
                 onClick={() => handleCreateSOP(m.text)}
               >

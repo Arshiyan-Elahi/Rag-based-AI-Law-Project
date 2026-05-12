@@ -1,6 +1,31 @@
 import { queryAI } from '../api/editorApi'
 import { getKLAssistantContext } from './assistantContext'
 
+/** Persisted interaction mode for the KL/KI sidebar assistant (global across routes). */
+const KL_ASSISTANT_MODE_LS_KEY = 'cybrain_kl_assistant_mode_v1'
+
+export function readKlAssistantMode() {
+  if (typeof window === 'undefined') return 'action'
+  try {
+    const v = localStorage.getItem(KL_ASSISTANT_MODE_LS_KEY)
+    if (v === 'query' || v === 'action') return v
+  } catch {
+    // ignore
+  }
+  return 'action'
+}
+
+export function writeKlAssistantMode(mode) {
+  if (typeof window === 'undefined') return
+  try {
+    if (mode === 'query' || mode === 'action') {
+      localStorage.setItem(KL_ASSISTANT_MODE_LS_KEY, mode)
+    }
+  } catch {
+    // ignore
+  }
+}
+
 const ROUTE_CONFIG = {
   '/sops': {
     category: 'sops',
@@ -87,6 +112,17 @@ const DEFAULT_CONFIG = {
 
 export function nowTime() {
   return new Date().toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })
+}
+
+export function formatChatTimeFromIso(iso) {
+  if (!iso) return nowTime()
+  try {
+    const d = new Date(iso)
+    if (Number.isNaN(d.getTime())) return nowTime()
+    return d.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })
+  } catch {
+    return nowTime()
+  }
 }
 
 export function toHtml(text) {
@@ -188,10 +224,17 @@ export async function runUnifiedAssistantQuery({
   assistantActionConfirmation = null,
   surface = 'global_chatbot',
   sessionId = null,
+  assistantMode = null,
 }) {
   const routeMeta = matchRouteConfig(pathname)
   const contextualQuestion = buildContextualQuestion(question, pathname)
   const assistantContext = getKLAssistantContext(pathname)
+  const mode =
+    assistantMode === 'query' || assistantMode === 'action'
+      ? assistantMode
+      : surface === 'kl_assistant'
+        ? readKlAssistantMode()
+        : 'action'
   return queryAI(contextualQuestion, {
     chat_history: chatHistory,
     category: routeMeta.category,
@@ -200,5 +243,6 @@ export async function runUnifiedAssistantQuery({
     surface,
     route: pathname,
     session_id: sessionId || undefined,
+    assistant_mode: mode,
   })
 }

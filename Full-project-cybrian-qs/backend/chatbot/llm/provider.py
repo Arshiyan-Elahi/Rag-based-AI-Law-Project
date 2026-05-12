@@ -43,7 +43,7 @@ def _file_env() -> dict[str, str]:
 def get_local_llm_config() -> LocalLLMConfig:
     file_env = _file_env()
     provider = str(file_env.get("LLM_PROVIDER") or os.getenv("LLM_PROVIDER", "local_openai")).strip().lower()
-    base_url = str(file_env.get("LOCAL_LLM_BASE_URL") or os.getenv("LOCAL_LLM_BASE_URL", "http://192.168.100.15:1234/v1")).strip()
+    base_url = str(file_env.get("LOCAL_LLM_BASE_URL") or os.getenv("LOCAL_LLM_BASE_URL", "http://192.168.56.1:1234/v1")).strip()
     model = str(file_env.get("LOCAL_LLM_MODEL") or os.getenv("LOCAL_LLM_MODEL", "qwen/qwen2.5-vl-7b:2")).strip()
     api_key = str(file_env.get("LOCAL_LLM_API_KEY") or os.getenv("LOCAL_LLM_API_KEY", "local-key")).strip() or "local-key"
     return LocalLLMConfig(
@@ -62,6 +62,26 @@ def get_local_llm_timeout_seconds() -> int:
         return max(5, int(float(raw)))
     except (TypeError, ValueError):
         return 120
+
+
+def get_local_llm_health_models_timeout_seconds() -> float:
+    """Timeout for GET /v1/models during health checks (remote LAN hosts may need >8s)."""
+    fe = _file_env()
+    raw = fe.get("LOCAL_LLM_HEALTH_MODELS_TIMEOUT") or os.getenv("LOCAL_LLM_HEALTH_MODELS_TIMEOUT", "45")
+    try:
+        return max(3.0, float(raw))
+    except (TypeError, ValueError):
+        return 45.0
+
+
+def get_local_llm_health_chat_timeout_seconds() -> float:
+    """Timeout for optional POST /v1/chat/completions probe."""
+    fe = _file_env()
+    raw = fe.get("LOCAL_LLM_HEALTH_CHAT_TIMEOUT") or os.getenv("LOCAL_LLM_HEALTH_CHAT_TIMEOUT", "60")
+    try:
+        return max(5.0, float(raw))
+    except (TypeError, ValueError):
+        return 60.0
 
 
 def get_chat_pipeline_timeout_seconds() -> int:
@@ -84,16 +104,44 @@ def get_chat_pipeline_timeout_seconds() -> int:
     return llm_t + rag_budget + pad
 
 
+def _connectivity_troubleshooting(models_error: str | None, models_url: str | None = None) -> list[str]:
+    if not models_error:
+        return []
+    err = (models_error or "").lower()
+    hints: list[str] = []
+    probe = f" Try: curl {models_url}" if models_url else ""
+    if "timed out" in err or "timeout" in err:
+        hints.extend(
+            [
+                "TCP to the LLM host did not complete in time. This is usually network/firewall, not the model name.",
+                "On the PC running LM Studio / llama.cpp: enable 'Listen on network' (or bind to 0.0.0.0), not only 127.0.0.1.",
+                "On that same PC: allow inbound TCP on the server port in the OS firewall (Private network profile).",
+                f"From this machine (where uvicorn runs): ping the LLM host IP; then open or curl the models URL.{probe}",
+                "Both machines must be on the same LAN or Host-Only segment (e.g. VirtualBox Host-Only adapters).",
+                "Increase LOCAL_LLM_HEALTH_MODELS_TIMEOUT in .env if the first response is very slow.",
+            ]
+        )
+    if "refused" in err or "unreachable" in err:
+        hints.append("Connection refused: nothing is listening on that host:port, or a firewall is rejecting the SYN.")
+    if "name or service not known" in err or "getaddrinfo" in err:
+        hints.append("DNS/hostname resolution failed; try IP address only in LOCAL_LLM_BASE_URL.")
+    return hints
+
+
 def check_local_llm_api_health(
     *,
     chat_probe: bool = False,
-    models_timeout: float = 8.0,
-    chat_timeout: float = 12.0,
+    models_timeout: float | None = None,
+    chat_timeout: float | None = None,
 ) -> dict[str, Any]:
     """
     Probe OpenAI-compatible /v1/models and optionally /v1/chat/completions.
     Uses sync urllib (same process as uvicorn worker).
     """
+    if models_timeout is None:
+        models_timeout = get_local_llm_health_models_timeout_seconds()
+    if chat_timeout is None:
+        chat_timeout = get_local_llm_health_chat_timeout_seconds()
     cfg = get_local_llm_config()
     base = cfg.base_url.rstrip("/")
     out: dict[str, Any] = {
@@ -101,11 +149,13 @@ def check_local_llm_api_health(
         "llm_provider": cfg.provider,
         "llm_model": cfg.model,
         "models_url": f"{base}/models",
+        "models_probe_timeout_seconds": models_timeout,
         "models_status": None,
         "model_ids": [],
         "configured_model_found": False,
         "models_error": None,
         "chat_completions_probe": None,
+        "connectivity_troubleshooting": [],
     }
     try:
         req = urllib.request.Request(
@@ -124,6 +174,8 @@ def check_local_llm_api_health(
     except Exception as e:
         out["models_error"] = f"{type(e).__name__}: {e}"
 
+    out["connectivity_troubleshooting"] = _connectivity_troubleshooting(out.get("models_error"), out.get("models_url"))
+
     if chat_probe and out.get("model_ids"):
         probe_model = cfg.model if cfg.model in out["model_ids"] else out["model_ids"][0]
         url = f"{base}/chat/completions"
@@ -135,7 +187,13 @@ def check_local_llm_api_health(
                 "temperature": 0,
             }
         ).encode("utf-8")
-        chat_out: dict[str, Any] = {"url": url, "model": probe_model, "status": None, "error": None}
+        chat_out: dict[str, Any] = {
+            "url": url,
+            "model": probe_model,
+            "status": None,
+            "error": None,
+            "chat_probe_timeout_seconds": chat_timeout,
+        }
         try:
             req = urllib.request.Request(
                 url,

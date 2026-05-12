@@ -98,6 +98,39 @@ ACTION_INTENT_UPDATE = re.compile(
     re.IGNORECASE,
 )
 
+# Extra imperative / mutation-shaped requests blocked in assistant_mode=query (beyond _plan_sop_action).
+QUERY_MODE_EXTRA_MUTATION = re.compile(
+    r"\b(rewrite|re-?write|umschreiben|überarbeiten)\b.*\b(sop|this\s+sop|current\s+sop|diesen|diesem|dieser|aktuellen?)\b|"
+    r"\b(improve|verbessern)\b.*\b(readability|lesbarkeit|this\s+sop|sop|abschnitt|section)\b|"
+    r"\b(gap\s*check|gap-check|lückenprüfung|lücken\s*analyse|compliance-?check)\b.*\b(sop|this|current|dies|dokument)\b|"
+    r"\b(run|execute|führe|starte)\b.*\b(nlp|profil|profile)\b",
+    re.IGNORECASE,
+)
+
+QUERY_MODE_REFUSAL_DE = (
+    "Im Modus **Nur Abfrage (Query)** führe ich keine Dokument- oder SOP-Aktionen aus "
+    "(z. B. Umschreiben, Löschen, Aktualisieren oder Erstellen). "
+    "Bitte wechseln Sie oben auf **Aktion ausführen**, wenn Sie solche Schritte wünschen, "
+    "oder stellen Sie eine rein informelle Frage."
+)
+
+
+def _normalize_assistant_mode(raw: object) -> str:
+    v = str(raw or "").strip().lower()
+    if v in {"query", "query_only", "strict_query"}:
+        return "query"
+    return "action"
+
+
+def _query_mode_mutation_intent(question: str, assistant_context: dict | None) -> bool:
+    """True if the prompt looks like a document/SOP mutation (blocked in query mode)."""
+    if _plan_sop_action(question, assistant_context):
+        return True
+    q = (question or "").strip()
+    if not q:
+        return False
+    return bool(QUERY_MODE_EXTRA_MUTATION.search(q))
+
 
 def _extract_profile_context(payload: dict, assistant_context: dict) -> dict[str, Any] | None:
     """
@@ -1016,6 +1049,13 @@ def _call_action_llm(runtime: Any, prompt: str, *, input_char_budget: int = 0, a
     base_n = _action_output_token_budget(input_char_budget) if input_char_budget else int(
         os.getenv("ACTION_LLM_MAX_TOKENS") or os.getenv("ACTION_MAX_OUTPUT_TOKENS") or "4096"
     )
+    if action == "rewrite" and input_char_budget:
+        configured_cap = int(
+            os.getenv("ACTION_LLM_MAX_TOKENS")
+            or os.getenv("ACTION_MAX_OUTPUT_TOKENS")
+            or "4096"
+        )
+        base_n = min(configured_cap, max(base_n, 4096, int(input_char_budget * 1.4) + 1800))
     soft = _action_prompt_soft_limit_chars()
     cfg = get_local_llm_config()
 
@@ -1352,9 +1392,247 @@ def _build_gap_check_retrieval_query(request: ActionRequest) -> str:
     return "\n".join(part.strip() for part in parts if part and part.strip())
 
 
+def _rewrite_should_use_industry_scaffold(request: ActionRequest) -> bool:
+    text = request.section_text or ""
+    section_type = (request.section_type or "").strip().lower()
+    if section_type == "full document" and len(text) >= 1800:
+        return True
+    record_ids = re.findall(r"\b(?:DEV|CAPA|AUD|DEC)-[A-Z]+-\d+\b", text)
+    section_headers = re.findall(r"(?m)^\s*(?:#{1,6}\s*)?(?:\d+[.)]\s+|##\s*\*\*)", text)
+    return len(text) >= 2500 and (len(record_ids) >= 3 or len(section_headers) >= 4)
+
+
+def _first_nonempty_line(text: str) -> str:
+    for line in (text or "").splitlines():
+        cleaned = line.strip(" \t#*")
+        if cleaned:
+            return cleaned
+    return "Untitled SOP"
+
+
+def _split_traceability_records(text: str) -> tuple[str, str]:
+    marker = re.search(
+        r"(?im)^\s*(?:[^\w\s]?\s*)?(?:DEVIATIONS|CAPAS|AUDIT FINDINGS|DECISIONS)\b",
+        text or "",
+    )
+    if not marker:
+        return text.strip(), ""
+    return text[: marker.start()].strip(), text[marker.start() :].strip()
+
+
+def _extract_existing_purpose(main_text: str) -> str:
+    lines = [line.strip() for line in (main_text or "").splitlines()]
+    body: list[str] = []
+    capture = False
+    for line in lines:
+        if not line:
+            continue
+        if re.search(r"\b(zweck|purpose)\b", line, flags=re.IGNORECASE):
+            capture = True
+            continue
+        if capture and re.match(r"^\s*(?:\d+[.)]\s+|#{1,6}\s*)", line):
+            break
+        if capture:
+            body.append(line)
+    if body:
+        return " ".join(body).strip()
+    non_meta = [
+        line
+        for line in lines[1:8]
+        if line and not re.search(r"\b(version|status|department|sop id|titel)\b", line, flags=re.IGNORECASE)
+    ]
+    return " ".join(non_meta).strip()
+
+
+def _looks_like_structured_full_sop(text: str) -> bool:
+    headers = re.findall(
+        r"(?im)^\s*(?:#{1,6}\s*)?(?:\d+[.)]\s+|##\s*\*\*)\s*(?:[A-ZÄÖÜa-zäöü0-9]+)",
+        text or "",
+    )
+    return len(headers) >= 6
+
+
+def _build_industry_rewrite_text(request: ActionRequest) -> str:
+    source = (request.section_text or "").strip()
+    main_text, records_text = _split_traceability_records(source)
+    if not records_text and _looks_like_structured_full_sop(main_text):
+        return "\n\n".join(
+            [
+                main_text,
+                "Industry Rewrite Completion Controls\n"
+                "- Kontroll- und Akzeptanzkriterien: [Zu definieren: messbare Grenzwerte, Fristen/SLA, Review-Frequenz und Akzeptanzkriterien, sofern nicht bereits oben festgelegt].\n"
+                "- Dokumentationskontrolle: Alle qualitaetsrelevanten Nachweise muessen eindeutig versioniert, revisionssicher gespeichert und durch verantwortliche Rollen pruefbar sein.\n"
+                "- Lifecycle/Freigabe: [Zu definieren: Review-Frequenz, naechster Review-Termin, Genehmiger, Wirksamkeitspruefung und Obsoleszenzverfahren].\n"
+                "- Traceability Records: [Zu definieren: zugehoerige Abweichungen, CAPAs, Audit Findings und Entscheidungen, falls anwendbar].",
+            ]
+        ).strip()
+
+    title_line = _first_nonempty_line(source)
+    purpose = _extract_existing_purpose(main_text) or "[Zu definieren: Zweck und regulatorischer Kontrollzweck vor Freigabe ergaenzen]"
+    metadata_lines = [
+        line.strip()
+        for line in main_text.splitlines()[1:6]
+        if re.search(r"\b(version|status|department|gmp|kritikal|sop id|titel)\b", line, flags=re.IGNORECASE)
+    ]
+    metadata = "\n".join(metadata_lines).strip()
+    records_section = records_text or "[Zu definieren: zugehoerige Abweichungen, CAPAs, Audit Findings und Entscheidungen, falls anwendbar]"
+
+    return "\n\n".join(
+        [
+            title_line,
+            metadata,
+            "1. Zweck\n"
+            f"{purpose}",
+            "2. Geltungsbereich\n"
+            "Diese SOP gilt fuer alle Rollen, Systeme, Prozesse und externen Parteien, die im beschriebenen Prozesskontext genannt sind. "
+            "[Zu definieren: konkrete Standorte, Systeme, Rollen und Ausnahmen vor SOP-Freigabe bestaetigen].",
+            "3. Begriffe und Abkuerzungen\n"
+            "- SOP: Standard Operating Procedure.\n"
+            "- QA: Qualitaetssicherung.\n"
+            "- CAPA: Corrective and Preventive Action.\n"
+            "- [Zu definieren: weitere prozessspezifische Begriffe, Systeme und Rollen].",
+            "4. Verantwortlichkeiten\n"
+            "- Process Owner: verantwortet die fachliche Vollstaendigkeit, Aktualitaet und Umsetzung dieser SOP.\n"
+            "- QA: prueft die Compliance-Relevanz, genehmigt qualitaetsrelevante Entscheidungen und bewertet Abweichungen/CAPAs.\n"
+            "- Ausfuehrende Rolle: fuehrt die beschriebenen Schritte gemaess dieser SOP aus und dokumentiert die erforderlichen Nachweise.\n"
+            "- IT/Produktion/Abteilungsleitung: uebernimmt Aufgaben, sofern diese im SOP-Kontext oder in den Traceability Records genannt sind.\n"
+            "- [Zu definieren: finale Rollenmatrix, Stellvertretungen und Eskalationsweg].",
+            "5. Verfahren\n"
+            "1. Der Process Owner stellt sicher, dass der Prozess nur innerhalb des genehmigten Geltungsbereichs ausgefuehrt wird.\n"
+            "2. Die verantwortliche Rolle prueft vor Ausfuehrung die Berechtigung, den Anlass, die Kritikalitaet und die erforderlichen Freigaben.\n"
+            "3. Qualitaetsrelevante Aktivitaeten muessen mit eindeutigem Datum, Rolle, System/Prozess, Begruendung und Ergebnis dokumentiert werden.\n"
+            "4. Abweichungen vom genehmigten Ablauf muessen unverzueglich als Deviation erfasst, bewertet und bei Bedarf mit CAPA verknuepft werden.\n"
+            "5. QA oder die definierte freigabeberechtigte Rolle prueft kritische Entscheidungen, Ausnahmen und offene Massnahmen vor Abschluss.\n"
+            "6. Der Process Owner ueberwacht offene Punkte bis zur Wirksamkeitspruefung und dokumentiert den Abschluss.\n"
+            "7. [Zu definieren: detaillierte operative Schrittfolge, Systeme/Formulare und Entscheidungskriterien].",
+            "6. Kontroll- und Akzeptanzkriterien\n"
+            "- Jede Aktivitaet muss einer verantwortlichen Rolle, einem Nachweis und einem nachvollziehbaren Ergebnis zugeordnet sein.\n"
+            "- Kritische oder qualitaetsrelevante Ausnahmen benoetigen dokumentierte Begruendung und QA-Bewertung.\n"
+            "- Offene Deviations/CAPAs duerfen nicht ohne dokumentierte Risikobewertung und Nachverfolgung geschlossen werden.\n"
+            "- [Zu definieren: messbare Grenzwerte, Fristen/SLA, Review-Frequenz und Akzeptanzkriterien].",
+            "7. Dokumentation und Aufbewahrung\n"
+            "- Erforderliche Nachweise: SOP-Version, Freigaben, Durchfuehrungsnachweise, Deviation/CAPA/Audit/Decision-Records und Wirksamkeitspruefungen.\n"
+            "- Alle Aufzeichnungen muessen revisionssicher, nachvollziehbar und gegen unbefugte Aenderung geschuetzt gespeichert werden.\n"
+            "- [Zu definieren: Formularnamen, Ablageort, System of Record und Aufbewahrungsfrist].",
+            "8. Schulung\n"
+            "Alle betroffenen Rollen muessen vor Anwendung dieser SOP und nach wesentlichen Aenderungen geschult werden. "
+            "Die Schulung ist mit Datum, Teilnehmer, Version und Schulungsnachweis zu dokumentieren.",
+            "9. Review, Freigabe und Lifecycle\n"
+            "Diese SOP muss vor Inkraftsetzung fachlich und durch QA freigegeben werden. "
+            "[Zu definieren: Review-Frequenz, naechster Review-Termin, Genehmiger und Obsoleszenzverfahren].",
+            "10. Traceability Records / Anhaenge\n"
+            f"{records_section}",
+        ]
+    ).strip()
+
+
+def _split_industry_scaffold_for_llm(scaffold: str) -> tuple[str, str]:
+    markers = [
+        "\n10. Traceability Records / Anhaenge\n",
+        "\nIndustry Rewrite Completion Controls\n",
+    ]
+    for marker in markers:
+        idx = scaffold.find(marker)
+        if idx >= 0:
+            return scaffold[:idx].strip(), scaffold[idx:].strip()
+    return scaffold.strip(), ""
+
+
+def _build_industry_rewrite_llm_prompt(request: ActionRequest, scaffold_core: str) -> str:
+    return f"""You are a senior GMP/QA SOP writer. Rewrite the following SOP core into polished, industry-ready SOP language.
+Return exactly one valid JSON object and nothing else: {{"rewritten_text":"..."}}
+
+Rules:
+- Use the same language as the SOP core.
+- Keep SOP number, title, version/status, department, roles, systems, thresholds, dates, and identifiers unchanged.
+- Preserve bracketed placeholders exactly when facts are missing; do not invent missing owners, forms, retention periods, dates, systems, limits, or approvals.
+- Keep the industry SOP backbone complete: purpose, scope, definitions, responsibilities, procedure, controls/acceptance criteria, documentation/records, training, review/approval/lifecycle.
+- Improve wording, flow, accountability, mandatory language, audit readiness, and professional SOP style.
+- Keep the rewritten core concise; do not expand placeholders or add long explanatory rationale.
+- Do not include markdown fences, explanations, sources, or citations.
+- Encode line breaks inside JSON strings as \\n.
+
+SOP title: {request.sop_title}
+Section: {request.section_title} ({request.section_type})
+
+SOP CORE TO REWRITE:
+\"\"\"{scaffold_core}\"\"\""""
+
+
+def _restore_missing_identifiers(original_text: str, rewritten_text: str, traceability_text: str = "") -> str:
+    source_ids = sorted(set(re.findall(r"\b(?:SOP|DEV|CAPA|AUD|DEC)-[A-Z]+-\d+\b", original_text or "")))
+    if not source_ids:
+        return rewritten_text
+    out = rewritten_text or ""
+    missing = [item for item in source_ids if item not in out]
+    if not missing:
+        return out
+    if traceability_text and all(item in traceability_text for item in missing):
+        return "\n\n".join(part for part in [out.strip(), traceability_text.strip()] if part)
+    return out.rstrip() + "\n\nTraceability IDs preserved from source:\n" + "\n".join(f"- {item}" for item in missing)
+
+
+def _rewrite_industry_scaffold_with_llm(runtime: Any, request: ActionRequest, scaffold: str) -> tuple[str, bool, str | None]:
+    core, traceability = _split_industry_scaffold_for_llm(scaffold)
+    prompt = _build_industry_rewrite_llm_prompt(request, core)
+    audit_log: list[dict[str, Any]] = []
+    raw = _call_action_llm(runtime, prompt, input_char_budget=len(core), action="rewrite_core")
+    parsed = parse_with_retry(
+        raw=raw,
+        schema=RewriteResponse,
+        prompt=prompt,
+        call_llm=lambda rp: _call_action_llm(runtime, rp, input_char_budget=len(core), action="rewrite_core"),
+        audit_log=audit_log,
+    )
+    llm_text = (parsed.rewritten_text or "").strip()
+    if not llm_text:
+        return scaffold, False, "empty_llm_rewrite"
+    combined = "\n\n".join(part for part in [llm_text, traceability] if part.strip())
+    combined = _restore_missing_identifiers(request.section_text, combined, traceability)
+    return combined.strip(), True, None
+
+
 def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionResponse:
-    runtime = _get_action_runtime()
     request = _build_action_request(payload)
+    if action == "rewrite" and _rewrite_should_use_industry_scaffold(request):
+        style_profile = _derive_sop_style_profile(request.section_text)
+        scaffold = _build_industry_rewrite_text(request)
+        runtime = _get_action_runtime()
+        try:
+            rewritten, used_llm, llm_error = _rewrite_industry_scaffold_with_llm(runtime, request, scaffold)
+        except Exception as exc:
+            logger.warning("[ai-action-result] action=rewrite mode=industry_scaffold_llm_failed err=%s", exc)
+            rewritten, used_llm, llm_error = scaffold, False, str(exc)
+        logger.info(
+            "[ai-action-result] action=rewrite ok=1 mode=industry_scaffold_llm used_llm=%s suggested_chars=%s",
+            used_llm,
+            len(rewritten or ""),
+        )
+        return AIActionResponse(
+            action="rewrite",
+            original_text=request.section_text,
+            suggested_text=_render_dynamic_text(rewritten),
+            explanation=(
+                "Industry-level SOP rewrite generated with the configured LLM and preserved traceability records."
+                if used_llm
+                else "Industry-level SOP scaffold returned because the LLM rewrite failed; traceability records were preserved."
+            ),
+            structured_data={
+                "rewritten_text": rewritten,
+                "style_profile": style_profile,
+                "nlp_action_summary": {
+                    "has_upload_nlp": False,
+                    "window_skipped": True,
+                    "profile_row_reused": False,
+                    "reason": "industry_scaffold_llm",
+                },
+                "rewrite_mode": "industry_scaffold_llm" if used_llm else "industry_scaffold_fallback",
+                "llm_used": used_llm,
+                "llm_error": llm_error,
+            },
+        )
+
+    runtime = _get_action_runtime()
     ch_budget = len(request.section_text or "")
     sop_ctx = _load_uploaded_sop_context(request)
     sop_text = str(sop_ctx.get("text") or "")
@@ -1452,6 +1730,24 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
         )
 
     if action == "rewrite":
+        if _rewrite_should_use_industry_scaffold(request):
+            rewritten = _build_industry_rewrite_text(request)
+            logger.info(
+                "[ai-action-result] action=rewrite ok=1 mode=industry_scaffold suggested_chars=%s",
+                len(rewritten or ""),
+            )
+            return AIActionResponse(
+                action="rewrite",
+                original_text=request.section_text,
+                suggested_text=_render_dynamic_text(rewritten),
+                explanation="Industry-level SOP rewrite generated with preserved traceability records.",
+                structured_data={
+                    "rewritten_text": rewritten,
+                    "style_profile": style_profile,
+                    "nlp_action_summary": nlp_summary,
+                    "rewrite_mode": "industry_scaffold",
+                },
+            )
         prompt = build_rewrite_prompt(request, context, nlp_block)
         parsed = parse_with_retry(
             raw=_call_action_llm(runtime, prompt, input_char_budget=ch_budget, action=action),
@@ -1980,9 +2276,13 @@ async def query_ai(
 ):
     """
     Chatbot query endpoint integrated from the standalone chatbot module.
-    When the client sends Authorization: Bearer <jwt>, each successful exchange
-    is appended to chat_sessions / chat_messages; response may include session_id
-    and message_id for follow-up requests.
+    Each successful exchange is appended to chat_sessions / chat_messages when persistence
+    succeeds (authenticated users get user_id set; anonymous users get user_id NULL).
+    Response may include session_id and message_id for follow-up requests.
+
+    Optional payload field ``assistant_mode``:
+    - ``query`` (or ``query_only``): RAG/QA only; SOP mutations and action execution are disabled.
+    - ``action`` (default): existing behaviour with optional SOP create/update/delete flows.
     """
     question = (payload.get("question") or payload.get("query") or "").strip()
     if not question:
@@ -2010,10 +2310,72 @@ async def query_ai(
     raw_ac = payload.get("assistant_context")
     assistant_context = raw_ac if isinstance(raw_ac, dict) else {}
     assistant_action_confirmation = payload.get("assistant_action_confirmation") or {}
+
+    async def _merge_persisted(response: dict) -> dict:
+        uid = str(current_user.id) if current_user is not None else None
+        extra = await asyncio.to_thread(
+            persist_chat_query_exchange,
+            user_id=uid,
+            client_session_id=payload.get("session_id") or payload.get("chat_session_id"),
+            collection_name=str(payload.get("collection_name") or "").strip() or "docs_sops",
+            category=str(category).strip() if category is not None else None,
+            question=question,
+            response=response,
+            assistant_context=assistant_context,
+            llm_provider=str(cfg.provider or ""),
+            llm_model=str(cfg.model or ""),
+            surface=surface,
+            route=route,
+        )
+        if extra:
+            return {**response, **extra}
+        return response
+
+    assistant_mode = _normalize_assistant_mode(payload.get("assistant_mode"))
+    if assistant_mode == "query":
+        logger.info("[assistant-query-mode] surface=%s route=%s", surface, route)
+    else:
+        logger.info("[assistant-action-mode] surface=%s route=%s", surface, route)
+
+    if assistant_mode == "query" and _query_mode_mutation_intent(question, assistant_context):
+        logger.info(
+            "[assistant-query-mode] blocked_mutation_shaped_request surface=%s q_preview=%s",
+            surface,
+            (question[:160] or ""),
+        )
+        guard = {
+            "answer": QUERY_MODE_REFUSAL_DE,
+            "sources": [],
+            "citations": [],
+            "retrieval_debug": [],
+            "suggestions": [],
+            "retrieval_stats": {
+                "total_docs": 0,
+                "source": "query_mode_guard",
+                "surface": surface,
+                "assistant_mode": assistant_mode,
+                "query_mutation_block": True,
+                "latency_ms_total": round((time.perf_counter() - t0) * 1000.0, 1),
+            },
+            "routed_to": "query_mode_guard",
+            "assistant_action": None,
+            "elapsed_ms_total": round((time.perf_counter() - t0) * 1000.0, 1),
+        }
+        guard["retrieval_stats"]["elapsed_ms_total"] = guard["elapsed_ms_total"]
+        return await _merge_persisted(guard)
+
     profile_context = _extract_profile_context(payload, assistant_context)
     intents = _query_intents(question)
     context_summary = _summarize_live_context(assistant_context, question)
-    action_plan = _plan_sop_action(question, assistant_context)
+    action_plan = None
+    if assistant_mode == "action":
+        action_plan = _plan_sop_action(question, assistant_context)
+        if action_plan:
+            logger.info(
+                "[assistant-action-detected] surface=%s type=%s",
+                surface,
+                action_plan.get("type"),
+            )
     action_result = None
     pending_confirmation = (
         isinstance(action_plan, dict)
@@ -2065,25 +2427,6 @@ async def query_ai(
             f"PLANNED_ASSISTANT_ACTION: {action_plan}\n"
             "Use this planned action and live context while answering."
         )
-
-    async def _merge_persisted(response: dict) -> dict:
-        if current_user is None:
-            return response
-        extra = await asyncio.to_thread(
-            persist_chat_query_exchange,
-            user_id=str(current_user.id),
-            client_session_id=payload.get("session_id") or payload.get("chat_session_id"),
-            collection_name=str(payload.get("collection_name") or "").strip() or "docs_sops",
-            category=str(category).strip() if category is not None else None,
-            question=question,
-            response=response,
-            assistant_context=assistant_context,
-            llm_provider=str(cfg.provider or ""),
-            llm_model=str(cfg.model or ""),
-        )
-        if extra:
-            return {**response, **extra}
-        return response
 
     # RAG is the default source of truth. Local DB primary mode is opt-in only
     # for diagnostics and should not be used in normal semantic chatbot flow.
@@ -2250,6 +2593,7 @@ async def query_ai(
         return await _merge_persisted(response)
 
     if action_plan and action_plan.get("type") == "delete_sop" and bool(assistant_action_confirmation.get("confirmed")):
+        logger.info("[assistant-action-execute] type=delete_sop surface=%s", surface)
         action_result = await asyncio.to_thread(
             _execute_sop_action, "delete_sop", question, assistant_context, "", "replace"
         )
@@ -2264,6 +2608,12 @@ async def query_ai(
     if action_plan and action_plan.get("type") in {"create_sop", "update_sop"}:
         llm_generated = result.get("answer", "")
         mode = action_plan.get("mode", "replace")
+        logger.info(
+            "[assistant-action-execute] type=%s surface=%s mode=%s",
+            action_plan.get("type"),
+            surface,
+            mode,
+        )
         action_result = await asyncio.to_thread(
             _execute_sop_action,
             action_plan["type"],
@@ -2341,6 +2691,7 @@ async def query_ai(
             "profile_detection": bool(profile_context),
             "latency_ms_total": round((time.perf_counter() - t0) * 1000.0, 1),
             "llm_base_url": cfg.base_url,
+            "assistant_mode": assistant_mode,
         }
     )
     response["elapsed_ms_total"] = round((time.perf_counter() - t0) * 1000.0, 1)

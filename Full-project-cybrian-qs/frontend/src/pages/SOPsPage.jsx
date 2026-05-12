@@ -4,7 +4,7 @@ import {
   Sparkles, ExternalLink, Edit3, Filter, Download,
   AlertCircle, FileText, X, FileEdit, List, Loader, Upload, Trash2
 } from 'lucide-react'
-import { getSOPs, getDocument, queryAI, createDocument, deleteDocument } from '../api/editorApi'
+import { getSOPs, getDocument, queryAI, createDocument, deleteDocument, getChatSessionMessages } from '../api/editorApi'
 import {
   buildSOPDisplayLabel,
   prepareNewSOPImport,
@@ -12,6 +12,7 @@ import {
 } from '../utils/sopImportService'
 import SOPTable from '../components/SOPs/SOPTable'
 import StatusBadge from '../components/Common/StatusBadge'
+import { getKLAssistantContext } from '../utils/assistantContext'
 import './SOPsPage.css'
 const EditorPage = lazy(() => import('./EditorPage'))
 const KL_WORKSPACE_CONTEXT_KEY = 'kl_assistant_workspace_state_v2'
@@ -81,7 +82,7 @@ function SOPCard({ sop, onOpen, onOpenNewTab, onEdit, onDelete }) {
   )
 }
 
-function KISummary({ open, onToggle, query, summaryText, sources, loading, error }) {
+function KISummary({ open, onToggle, query, summaryText, sources, loading, error, historyRows = [] }) {
   return (
     <div className={`sops-ki-summary ${open ? 'sops-ki-open' : ''}`}>
       <button className="ki-summary-header" onClick={onToggle}>
@@ -97,6 +98,23 @@ function KISummary({ open, onToggle, query, summaryText, sources, loading, error
 
       {open && (
         <div className="ki-summary-body">
+          {historyRows.length > 0 ? (
+            <div className="ki-transcript" style={{ marginBottom: 12, maxHeight: 220, overflowY: 'auto', fontSize: 13 }}>
+              {historyRows.map((row) => (
+                <div
+                  key={row.id}
+                  style={{
+                    marginBottom: 8,
+                    padding: 8,
+                    borderRadius: 6,
+                    background: row.role === 'user' ? 'var(--surface-2, #f4f4f5)' : 'var(--surface-1, #fafafa)',
+                  }}
+                >
+                  <strong>{row.role === 'user' ? 'Sie' : 'KI'}:</strong> {row.content}
+                </div>
+              ))}
+            </div>
+          ) : null}
           {loading ? <p className="ki-summary-text">KI analysiert Kontext...</p> : null}
           {error ? <p className="ki-summary-text" style={{ color: 'var(--error)' }}>{error}</p> : null}
           {!loading && !error ? (
@@ -307,6 +325,11 @@ export default function SOPsPage() {
   const [kiError, setKIError] = useState('')
   const [kiSummaryText, setKISummaryText] = useState('')
   const [kiSources, setKISources] = useState([])
+  const KNOWLEDGE_SESSION_LS = 'cybrain_knowledge_chat_session_id'
+  const [knowledgeSessionId, setKnowledgeSessionId] = useState(() =>
+    typeof window !== 'undefined' ? localStorage.getItem(KNOWLEDGE_SESSION_LS) : null,
+  )
+  const [knowledgeHistoryRows, setKnowledgeHistoryRows] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [sops, setSops] = useState([])
@@ -333,6 +356,37 @@ export default function SOPsPage() {
   useEffect(() => {
     loadSOPs()
   }, [loadSOPs])
+
+  useEffect(() => {
+    if (viewMode !== 'knowledge') {
+      setKnowledgeHistoryRows([])
+      return
+    }
+    const sid = knowledgeSessionId || localStorage.getItem(KNOWLEDGE_SESSION_LS)
+    if (!sid) {
+      setKnowledgeHistoryRows([])
+      return
+    }
+    let cancelled = false
+    getChatSessionMessages(sid)
+      .then((rows) => {
+        if (cancelled || !Array.isArray(rows)) return
+        setKnowledgeHistoryRows(
+          rows.map((m) => ({
+            id: m.id,
+            role: m.role,
+            content: String(m.content || '').slice(0, 4000),
+          })),
+        )
+      })
+      .catch((err) => {
+        console.error('[chat-history-load] knowledge session', err)
+        if (!cancelled) setKnowledgeHistoryRows([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [viewMode, knowledgeSessionId])
 
   useEffect(() => {
     const onRefreshRequest = (event) => {
@@ -431,10 +485,47 @@ export default function SOPsPage() {
     if (!text) return
     setIsKIAnalyzing(true)
     setKIError('')
-    queryAI(text, { category: 'sop', surface: 'knowledge_search', route: '/knowledge' })
-      .then((res) => {
+    const sid =
+      knowledgeSessionId ||
+      (typeof window !== 'undefined' ? localStorage.getItem(KNOWLEDGE_SESSION_LS) : null)
+    const chatHistoryPayload = knowledgeHistoryRows.map((r) => ({
+      role: r.role,
+      content: r.content,
+    }))
+    queryAI(text, {
+      category: 'sop',
+      surface: 'knowledge_search',
+      route: '/knowledge',
+      session_id: sid || undefined,
+      assistant_context: getKLAssistantContext('/knowledge'),
+      chat_history: chatHistoryPayload.length ? chatHistoryPayload : undefined,
+    })
+      .then(async (res) => {
         setKISummaryText(res?.answer || 'Keine Antwort vom Backend erhalten.')
         setKISources(Array.isArray(res?.sources) ? res.sources : [])
+        const nextSid = res?.session_id && String(res.session_id).trim()
+        if (nextSid) {
+          try {
+            localStorage.setItem(KNOWLEDGE_SESSION_LS, nextSid)
+          } catch {
+            // ignore
+          }
+          setKnowledgeSessionId(nextSid)
+          try {
+            const rows = await getChatSessionMessages(nextSid)
+            if (Array.isArray(rows)) {
+              setKnowledgeHistoryRows(
+                rows.map((m) => ({
+                  id: m.id,
+                  role: m.role,
+                  content: String(m.content || '').slice(0, 4000),
+                })),
+              )
+            }
+          } catch (e) {
+            console.error('[chat-history-load] knowledge after query', e)
+          }
+        }
       })
       .catch((err) => {
         setKIError(err?.message || 'KI-Analyse fehlgeschlagen.')
@@ -744,6 +835,7 @@ export default function SOPsPage() {
               sources={kiSources}
               loading={isKIAnalyzing}
               error={kiError}
+              historyRows={knowledgeHistoryRows}
             />
             {/* Relevant SOPs from backend */}
             <div className="sops-section-title-row">

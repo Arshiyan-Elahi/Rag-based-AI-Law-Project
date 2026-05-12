@@ -274,6 +274,7 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true, onPrevi
 
     let sectionName = 'Selected text'
     let sectionType = 'Paragraph'
+    const isFullDocumentSelection = Number(savedSelection.selectedFraction || 0) >= 0.85
 
     try {
       const resolvedPos = editor.state.doc.resolve(savedSelection.from)
@@ -294,6 +295,11 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true, onPrevi
       }
     } catch {
       // Best-effort section inference only.
+    }
+
+    if (isFullDocumentSelection) {
+      sectionName = 'Full Document'
+      sectionType = 'Full Document'
     }
 
     const structuredPayload = savedSelection.structuredText || selectedText

@@ -45,16 +45,32 @@ const StructuredDetails = ({ action, structuredData, suggestedText }) => {
   }
 
   if (action === 'rewrite') {
+    const rewriteMode = structuredData.rewrite_mode
+    const llmUsed = structuredData.llm_used
     return (
       <div className="ai-details ai-details--green">
         <div className="ai-details__title">
           <Wand2 size={18} />
           <span>Rewrite Summary</span>
         </div>
-        <div className="ai-details__item">
-          <p className="ai-details__label">Rewritten Text</p>
-          <p className="ai-details__value">{structuredData.rewritten_text || suggestedText}</p>
-        </div>
+        {rewriteMode ? (
+          <div className="ai-details__item">
+            <p className="ai-details__label">Rewrite Mode</p>
+            <p className="ai-details__value">{rewriteMode}</p>
+          </div>
+        ) : null}
+        {typeof llmUsed === 'boolean' ? (
+          <div className="ai-details__item">
+            <p className="ai-details__label">LLM Rewrite</p>
+            <p className="ai-details__value">{llmUsed ? 'Used configured LLM model' : 'Fallback scaffold used'}</p>
+          </div>
+        ) : null}
+        {structuredData.llm_error ? (
+          <div className="ai-details__item">
+            <p className="ai-details__label">LLM Detail</p>
+            <p className="ai-details__value">{structuredData.llm_error}</p>
+          </div>
+        ) : null}
         {structuredData.structural_changes ? (
           <div className="ai-details__item">
             <p className="ai-details__label">Changes Made</p>

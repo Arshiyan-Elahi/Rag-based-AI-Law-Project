@@ -74,7 +74,7 @@ Return only:
 
 
 def build_rewrite_prompt(request: ActionRequest, context: str, nlp_block: str = "") -> str:
-    return f"""You are a senior GMP/QA SOP editor. Task: REWRITE the selected SOP text into the best professional SOP version while preserving the original context and control intent.
+    return f"""You are a senior GMP/QA SOP architect and QA documentation lead. Task: REWRITE the selected SOP text into an industry-ready SOP version while preserving the original context, control intent, and traceability evidence.
 {_SPEED_FIRST}
 {_JSON_ESCAPING_RULE}
 {_LANGUAGE_RULE}
@@ -86,6 +86,15 @@ Use the NLP_STRUCTURE_AND_PARAMETERS and database metadata as controlling contex
 - If metadata and selected TEXT conflict, preserve the selected TEXT meaning and use metadata only for style, structure, and terminology alignment.
 
 Rewrite rules:
+- INDUSTRY SOP REWRITE OVERRIDE: If the selected TEXT is a complete SOP or a weak/incomplete SOP draft, rewrite it as a complete industry-level SOP, not just a polished fragment. This override takes priority over any rule that would otherwise keep an incomplete structure unchanged.
+- If the selected TEXT is clearly only a small section, rewrite that section only, but add missing role, record, acceptance, timing, or control details as bracketed placeholders where needed for audit readiness.
+- For full SOP drafts, include the expected SOP backbone when missing: Purpose/Zweck, Scope/Geltungsbereich, Definitions/Begriffe when useful, Responsibilities/Verantwortlichkeiten, Procedure/Verfahren, Acceptance Criteria or Controls/Akzeptanzkriterien/Kontrollen, Documentation/Records/Dokumentation, Review/Approval or Lifecycle/Pruefung/Freigabe, Training/Schulung when relevant, and Appendices/Traceability Records when records are present.
+- Keep the original section/header style where it is already professional; otherwise normalize to clear numbered SOP sections and concise bullet/step lists in the input language.
+- Add only industry-standard control structure that is directly implied by the TEXT, SOP title, metadata, detected roles, risks, records, or lifecycle context. Do not invent specific facts, dates, systems, owners, limits, forms, retention periods, or approvals.
+- When required details are missing, write explicit bracketed placeholders such as "[Zu definieren: verantwortliche Rolle]", "[Zu definieren: Aufbewahrungsfrist]", or "[To define before approval: acceptance criterion]" instead of inventing values.
+- Convert vague requirements into audit-ready mandatory language with accountable roles where the role is present or can be safely generalized from context, such as QA, IT, Produktion, Abteilungsleitung, or Process Owner.
+- Add measurable control prompts where needed: trigger, frequency, deadline/SLA, evidence record, approval gate, verification step, exception handling, escalation path, acceptance criterion, retention/location, and effectiveness review.
+- Put deviation, CAPA, audit finding, and decision logs under a clearly labeled traceability/appendix section if the original mixes them into the procedure, unless the original already has a better structure.
 - Follow the same structure and format as the original selected TEXT: same section/header pattern, list/table shape, numbering style, paragraph sequence, and SOP flow.
 - Preserve every original section/block and every record. Do not omit DEVIATIONS, CAPAs, AUDIT FINDINGS, DECISIONS, references, or trailing content when present.
 - Preserve every listed item count and every identifier, including SOP-*, DEV-*, CAPA-*, AUD-*, and DEC-* records; each original item must appear once in the output.

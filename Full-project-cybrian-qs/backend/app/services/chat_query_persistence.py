@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import json
 import logging
 from uuid import UUID
 
@@ -13,6 +15,7 @@ from app.models import ChatMessage, ChatSession
 logger = logging.getLogger(__name__)
 
 MAX_TITLE = 500
+MAX_ASSISTANT_CONTEXT_JSON = 18_000
 
 
 def _parse_session_uuid(raw: object) -> UUID | None:
@@ -20,6 +23,15 @@ def _parse_session_uuid(raw: object) -> UUID | None:
         return None
     try:
         return UUID(str(raw).strip())
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def _parse_user_uuid(user_id: str | None) -> UUID | None:
+    if user_id is None:
+        return None
+    try:
+        return UUID(str(user_id).strip())
     except (ValueError, AttributeError, TypeError):
         return None
 
@@ -46,6 +58,26 @@ def _sop_snapshot(assistant_context: dict | None) -> dict | None:
     return snap or None
 
 
+def _compact_assistant_context(ctx: dict | None) -> dict | None:
+    """Shrink assistant_context for JSON columns (retain structure, trim heavy strings)."""
+    if not isinstance(ctx, dict) or not ctx:
+        return None
+    d = copy.deepcopy(ctx)
+    excerpt = d.get("editor_excerpt")
+    if isinstance(excerpt, str) and len(excerpt) > 2500:
+        d["editor_excerpt"] = excerpt[:2500] + "…"
+    raw = json.dumps(d, default=str)
+    if len(raw) <= MAX_ASSISTANT_CONTEXT_JSON:
+        return d
+    d.pop("editor_excerpt", None)
+    d["linked_context"] = {}
+    d["opened_tabs"] = []
+    raw2 = json.dumps(d, default=str)
+    if len(raw2) > MAX_ASSISTANT_CONTEXT_JSON:
+        return {"route": d.get("route"), "current_document_id": d.get("current_document_id"), "_truncated": True}
+    return d
+
+
 def _build_retrieval_metadata(response: dict, llm_provider: str, llm_model: str) -> dict:
     stats = response.get("retrieval_stats")
     if not isinstance(stats, dict):
@@ -57,9 +89,32 @@ def _build_retrieval_metadata(response: dict, llm_provider: str, llm_model: str)
     }
 
 
+def _build_metadata_snapshot(
+    assistant_context: dict | None,
+    *,
+    surface: str | None,
+    route: str | None,
+    category: str | None,
+) -> dict | None:
+    snap: dict = {}
+    sop = _sop_snapshot(assistant_context)
+    if sop:
+        snap.update(sop)
+    if surface:
+        snap["surface"] = str(surface)[:120]
+    if route:
+        snap["route"] = str(route)[:500]
+    if category:
+        snap["category"] = str(category)[:100]
+    compact = _compact_assistant_context(assistant_context)
+    if compact:
+        snap["assistant_context"] = compact
+    return snap or None
+
+
 def persist_chat_query_exchange(
     *,
-    user_id: str,
+    user_id: str | None,
     client_session_id: str | None,
     collection_name: str,
     category: str | None,
@@ -68,17 +123,20 @@ def persist_chat_query_exchange(
     assistant_context: dict | None,
     llm_provider: str,
     llm_model: str,
+    surface: str | None = None,
+    route: str | None = None,
 ) -> dict:
     """
     Insert one user row and one assistant row. Swallows all errors (logs only).
 
+    ``user_id`` may be None for anonymous clients (``chat_sessions.user_id`` NULL).
+
     Returns optional keys to merge into the API JSON: session_id, message_id
     (assistant message id).
     """
-    try:
-        uid = UUID(str(user_id).strip())
-    except (ValueError, AttributeError, TypeError):
-        logger.warning("chat persistence skipped: invalid user_id")
+    uid = _parse_user_uuid(user_id)
+    if user_id is not None and uid is None:
+        logger.warning("[chat-history-error] persistence skipped: invalid user_id=%r", user_id)
         return {}
 
     db: Session = SessionLocal()
@@ -89,16 +147,23 @@ def persist_chat_query_exchange(
 
         sid = _parse_session_uuid(client_session_id)
         session_row = None
+        reused = False
         if sid is not None:
-            session_row = (
+            q = (
                 db.query(ChatSession)
                 .filter(
                     ChatSession.id == sid,
-                    ChatSession.user_id == uid,
                     ChatSession.is_active == True,  # noqa: E712
                 )
-                .first()
             )
+            if uid is not None:
+                q = q.filter(ChatSession.user_id == uid)
+            else:
+                q = q.filter(ChatSession.user_id.is_(None))
+            session_row = q.first()
+            if session_row is not None:
+                reused = True
+
         if session_row is None:
             session_row = ChatSession(
                 user_id=uid,
@@ -108,14 +173,37 @@ def persist_chat_query_exchange(
             )
             db.add(session_row)
             db.flush()
+            logger.info(
+                "[chat-history-session-create] user_id=%s session_id=%s title=%s collection=%s",
+                uid or "anon",
+                session_row.id,
+                title_hint[:80],
+                coll,
+            )
+        else:
+            logger.info(
+                "[chat-history-session-reuse] user_id=%s session_id=%s reused=%s",
+                uid or "anon",
+                session_row.id,
+                reused,
+            )
 
         if not session_row.title or not str(session_row.title).strip():
             session_row.title = title_hint
 
-        meta_snap = _sop_snapshot(assistant_context)
+        meta_snap = _build_metadata_snapshot(
+            assistant_context,
+            surface=surface,
+            route=route,
+            category=category,
+        )
         retrieval_meta = _build_retrieval_metadata(response, llm_provider, llm_model)
         answer = str(response.get("answer") or "")
         citations = response.get("citations")
+        trace_meta = {
+            "surface": (surface or "")[:120] or None,
+            "route": (route or "")[:500] or None,
+        }
 
         user_msg = ChatMessage(
             session_id=session_row.id,
@@ -124,6 +212,7 @@ def persist_chat_query_exchange(
             citations=None,
             retrieval_metadata=None,
             metadata_snapshot=meta_snap,
+            action_metadata=trace_meta,
             category_filter=cat_filter,
         )
         asst_msg = ChatMessage(
@@ -133,10 +222,25 @@ def persist_chat_query_exchange(
             citations=citations if citations is not None else None,
             retrieval_metadata=retrieval_meta,
             metadata_snapshot=meta_snap,
+            action_metadata=trace_meta,
             category_filter=cat_filter,
         )
         db.add(user_msg)
         db.add(asst_msg)
+        db.flush()
+        logger.info(
+            "[chat-history-user-save] session_id=%s message_id=%s role=user qlen=%s",
+            session_row.id,
+            user_msg.id,
+            len((question or "").strip()),
+        )
+        logger.info(
+            "[chat-history-assistant-save] session_id=%s message_id=%s role=assistant alen=%s citations=%s",
+            session_row.id,
+            asst_msg.id,
+            len(answer),
+            len(citations) if isinstance(citations, list) else 0,
+        )
         db.commit()
         db.refresh(asst_msg)
 
@@ -146,7 +250,7 @@ def persist_chat_query_exchange(
         }
     except Exception as exc:
         db.rollback()
-        logger.warning("chat query persistence failed (non-fatal): %s", exc, exc_info=True)
+        logger.warning("[chat-history-error] chat query persistence failed (non-fatal): %s", exc, exc_info=True)
         return {}
     finally:
         db.close()

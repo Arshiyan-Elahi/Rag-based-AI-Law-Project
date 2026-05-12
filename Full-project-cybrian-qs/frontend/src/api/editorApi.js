@@ -1,27 +1,21 @@
+import { getCybrainAccessToken } from '../utils/authSession'
+
 const API_BASE = import.meta.env.VITE_API_BASE || ''
 const SIDEBAR_COUNTS_REFRESH_EVENT = 'sidebar-counts-refresh'
 
 /** Merge Authorization when a JWT is stored (enables server-side chat history on /api/ai/query). */
 function buildOptionalAuthHeaders() {
   if (typeof window === 'undefined') return {}
-  try {
-    const flat = localStorage.getItem('access_token')
-    if (flat && String(flat).trim()) {
-      return { Authorization: `Bearer ${String(flat).trim()}` }
-    }
-    for (const key of ['auth', 'cybrain_auth']) {
-      const raw = localStorage.getItem(key)
-      if (!raw) continue
-      const parsed = JSON.parse(raw)
-      const token = parsed?.access_token || parsed?.token
-      if (token && String(token).trim()) {
-        return { Authorization: `Bearer ${String(token).trim()}` }
-      }
-    }
-  } catch {
-    // ignore
+  const token = getCybrainAccessToken()
+  if (token) {
+    return { Authorization: `Bearer ${token}` }
   }
   return {}
+}
+
+/** True when a Bearer token is available (optional; chat persistence works without it). */
+export function hasChatAuthToken() {
+  return Boolean(getCybrainAccessToken())
 }
 
 function notifySidebarCountsRefresh() {
@@ -91,6 +85,37 @@ async function throwApiError(res, fallbackMsg) {
   if (extras.validationOrParseError) err.validationOrParseError = extras.validationOrParseError
   if (extras.hint) err.hint = extras.hint
   throw err
+}
+
+export async function listChatSessions() {
+  const res = await fetch(`${API_BASE}/api/chat/sessions`, {
+    headers: { ...buildOptionalAuthHeaders() },
+  })
+  if (!res.ok) await throwApiError(res, 'Failed to load chat sessions')
+  return res.json()
+}
+
+export async function createChatSession(payload = {}) {
+  const res = await fetch(`${API_BASE}/api/chat/sessions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...buildOptionalAuthHeaders() },
+    body: JSON.stringify({
+      title: payload.title ?? null,
+      collection_name: payload.collection_name || 'docs_sops',
+    }),
+  })
+  if (!res.ok) await throwApiError(res, 'Failed to create chat session')
+  return res.json()
+}
+
+export async function getChatSessionMessages(sessionId) {
+  const sid = String(sessionId || '').trim()
+  if (!sid) return []
+  const res = await fetch(`${API_BASE}/api/chat/sessions/${encodeURIComponent(sid)}/messages`, {
+    headers: { ...buildOptionalAuthHeaders() },
+  })
+  if (!res.ok) await throwApiError(res, 'Failed to load chat messages')
+  return res.json()
 }
 
 // ─────────────────────────────────────────────────────
@@ -289,6 +314,9 @@ export async function queryAI(question, options = {}) {
   if (options.session_id && String(options.session_id).trim()) {
     payload.session_id = String(options.session_id).trim()
   }
+  if (options.assistant_mode === 'query' || options.assistant_mode === 'action') {
+    payload.assistant_mode = options.assistant_mode
+  }
 
   const controller = new AbortController()
   const timeoutMs = 70000
@@ -343,9 +371,9 @@ export async function performAIAction(payload) {
   // timer was cleared after the first fetch, leaving the follow-up with no time limit.
   const controller = new AbortController()
   const timeoutMs = 120000
-  const timer = setTimeout(() => controller.abort(), timeoutMs)
-
   const normalizedAction = String(payload?.action || '').trim().toLowerCase().replace(/-/g, '_')
+  const requestTimeoutMs = normalizedAction === 'rewrite' ? 300000 : timeoutMs
+  const actionTimer = setTimeout(() => controller.abort(), requestTimeoutMs)
 
   try {
     const res = await fetch(`${API_BASE}/api/ai/action`, {
@@ -369,7 +397,7 @@ export async function performAIAction(payload) {
     }
     throw err
   } finally {
-    clearTimeout(timer)
+    clearTimeout(actionTimer)
   }
 }
 

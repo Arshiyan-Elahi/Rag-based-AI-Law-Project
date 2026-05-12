@@ -1,12 +1,15 @@
 from uuid import UUID
 
+import logging
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from .auth_routes import get_current_user
+from .auth_routes import get_current_user, get_current_user_optional
 from .database import get_db
 from .models import ChatMessage, ChatSession, User
+
+logger = logging.getLogger(__name__)
 
 
 router = APIRouter(prefix="/api/chat", tags=["Chat History"])
@@ -31,14 +34,18 @@ class AddMessageRequest(BaseModel):
 @router.get("/sessions")
 def list_sessions(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User | None = Depends(get_current_user_optional),
 ):
+    if current_user is None:
+        logger.info("[chat-history-load] list_sessions unauthenticated count=0")
+        return []
     sessions = (
         db.query(ChatSession)
         .filter(ChatSession.user_id == current_user.id, ChatSession.is_active == True)
         .order_by(ChatSession.created_at.desc())
         .all()
     )
+    logger.info("[chat-history-load] list_sessions user_id=%s count=%s", current_user.id, len(sessions))
     return [
         {
             "id": str(s.id),
@@ -79,14 +86,16 @@ def create_session(
 def list_messages(
     session_id: UUID,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
+    """
+    Load messages for a session by id. Works without auth (anonymous sessions use user_id NULL).
+    Does not list other sessions; knowledge of session_id is required.
+    """
     session = (
         db.query(ChatSession)
         .filter(
             ChatSession.id == session_id,
-            ChatSession.user_id == current_user.id,
-            ChatSession.is_active == True,
+            ChatSession.is_active == True,  # noqa: E712
         )
         .first()
     )
@@ -98,6 +107,12 @@ def list_messages(
         .filter(ChatMessage.session_id == session_id)
         .order_by(ChatMessage.created_at.asc())
         .all()
+    )
+    logger.info(
+        "[chat-history-load] list_messages session_id=%s user_id=%s count=%s",
+        session_id,
+        session.user_id or "anon",
+        len(messages),
     )
     return [
         {

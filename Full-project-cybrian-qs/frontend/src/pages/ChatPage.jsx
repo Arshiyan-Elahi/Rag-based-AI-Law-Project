@@ -1,10 +1,17 @@
-import React, { useCallback, useMemo, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { ArrowLeft } from 'lucide-react'
 import ConversationList from '../components/Chat/ConversationList'
 import ChatPanel from '../components/Chat/ChatPanel'
-import { createDocument } from '../api/editorApi'
 import {
+  createChatSession,
+  createDocument,
+  getChatSessionMessages,
+  hasChatAuthToken,
+  listChatSessions,
+} from '../api/editorApi'
+import {
+  formatChatTimeFromIso,
   getAssistantRouteMeta,
   nowTime,
   runUnifiedAssistantQuery,
@@ -15,57 +22,210 @@ import { deriveSopTitleFromText, htmlToPlainText, plainTextToTiptapDoc } from '.
 import { getAssistantContextStorageKeys, resetAssistantStateOnce } from '../utils/assistantContext'
 import './ChatPage.css'
 
-const CHAT_STORAGE_KEY = 'chat_page_conversations_v3_reset'
-const CHAT_ACTIVE_STORAGE_KEY = 'chat_page_active_conversation_v3_reset'
+/** Only persisted pointer: which server chat_sessions row is active (UUID). Full history loads from GET /api/chat/... */
+const LS_ACTIVE_SESSION_ID = 'cybrain_chat_active_session_id'
+
 resetAssistantStateOnce()
 
-function createInitialConversation() {
+const WELCOME_ID = 'm-welcome'
+
+function buildWelcomeMessage() {
   return {
-    id: 'live-chat',
-    title: 'Live Chatbot',
-    description: 'Stelle eine Frage an den RAG-Chatbot',
+    id: WELCOME_ID,
+    sender: 'ai',
     time: nowTime(),
-    dateGroup: 'Heute',
+    content: '<p>Chatbot ist verbunden. Stelle eine Frage zu SOPs, Abweichungen, CAPAs, Audits oder Entscheidungen.</p>',
+    tags: [],
+    showActions: false,
+  }
+}
+
+function mapDbRowsToMessages(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return [buildWelcomeMessage()]
+  }
+  return rows.map((m) => ({
+    id: m.id,
+    sender: m.role === 'user' ? 'user' : 'ai',
+    time: formatChatTimeFromIso(m.created_at),
+    content: toHtml(String(m.content || '')),
+    tags: [],
+    showActions: m.role === 'assistant',
+  }))
+}
+
+function sessionRowToConversation(s) {
+  return {
+    id: s.id,
+    serverSessionId: s.id,
+    title: s.title || 'Chat',
+    description: '',
+    time: formatChatTimeFromIso(s.updated_at || s.created_at),
+    dateGroup: 'Gespeichert',
     hasAlert: false,
-    tags: [{ id: 'source-sops', label: 'SOPs', type: 'sop' }],
-    /** Server-side chat_sessions id when authenticated; reused for follow-up turns. */
-    serverSessionId: null,
-    messages: [
-      {
-        id: 'm-welcome',
-        sender: 'ai',
-        time: nowTime(),
-        content: '<p>Chatbot ist verbunden. Stelle eine Frage zu SOPs, Abweichungen, CAPAs, Audits oder Entscheidungen.</p>',
-        tags: [],
-        showActions: false,
-      },
-    ],
+    tags: [],
+    messages: [],
     activeSources: [],
     contextTags: [],
+    _messagesLoaded: false,
+  }
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+function createAnonDraftConversation() {
+  const id = `anon-draft-${Date.now()}`
+  return {
+    id,
+    serverSessionId: null,
+    title: 'Neues Gespräch',
+    description: '',
+    time: nowTime(),
+    dateGroup: 'Entwurf',
+    hasAlert: false,
+    tags: [],
+    messages: [buildWelcomeMessage()],
+    activeSources: [],
+    contextTags: [],
+    _messagesLoaded: true,
   }
 }
 
 /**
- * ChatPage — integrated chatbot UI backed by real /api/ai/query endpoint.
+ * ChatPage — DB-backed chat; session_id pointer in localStorage; works with or without login.
  */
 export default function ChatPage() {
   const location = useLocation()
   const navigate = useNavigate()
   const routeMeta = useMemo(() => getAssistantRouteMeta(location.pathname), [location.pathname])
-  const [conversations, setConversations] = useState(() => {
-    try {
-      const raw = localStorage.getItem(CHAT_STORAGE_KEY)
-      const parsed = raw ? JSON.parse(raw) : null
-      return Array.isArray(parsed) && parsed.length > 0 ? parsed : [createInitialConversation()]
-    } catch {
-      return [createInitialConversation()]
-    }
-  })
-  const [activeConvId, setActiveConvId] = useState(() => localStorage.getItem(CHAT_ACTIVE_STORAGE_KEY) || 'live-chat')
+  const [conversations, setConversations] = useState([])
+  const [activeConvId, setActiveConvId] = useState(null)
   const [showChat, setShowChat] = useState(false)
   const [isSending, setIsSending] = useState(false)
   const [pendingDeleteAction, setPendingDeleteAction] = useState(null)
   const [actionToast, setActionToast] = useState('')
+  const [historiesLoading, setHistoriesLoading] = useState(true)
+  const [historiesError, setHistoriesError] = useState('')
+
+  const loadMessagesIntoConversation = useCallback(async (sessionId, matchConvId = null) => {
+    const sid = String(sessionId || '').trim()
+    if (!sid) return
+    const rows = await getChatSessionMessages(sid)
+    const mapped = mapDbRowsToMessages(rows)
+    const mid = matchConvId != null ? String(matchConvId) : null
+    setConversations((prev) =>
+      prev.map((c) => {
+        const match = c.serverSessionId === sid || (mid && c.id === mid)
+        return match ? { ...c, serverSessionId: sid, id: sid, messages: mapped, _messagesLoaded: true } : c
+      }),
+    )
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    async function boot() {
+      setHistoriesLoading(true)
+      setHistoriesError('')
+
+      async function bootAnonymousFromStorage() {
+        const preferred = (typeof localStorage !== 'undefined' && localStorage.getItem(LS_ACTIVE_SESSION_ID)) || ''
+        const trimmed = preferred.trim()
+        if (trimmed && UUID_RE.test(trimmed)) {
+          try {
+            const rows = await getChatSessionMessages(trimmed)
+            if (cancelled) return
+            const firstUser = Array.isArray(rows) ? rows.find((r) => r.role === 'user') : null
+            const titleHint = firstUser?.content
+              ? String(firstUser.content).replace(/\s+/g, ' ').trim().slice(0, 45)
+              : 'Chat'
+            const conv = {
+              id: trimmed,
+              serverSessionId: trimmed,
+              title: titleHint || 'Chat',
+              description: '',
+              time: formatChatTimeFromIso(rows?.[0]?.created_at),
+              dateGroup: 'Gespeichert',
+              hasAlert: false,
+              tags: [],
+              messages: mapDbRowsToMessages(rows || []),
+              activeSources: [],
+              contextTags: [],
+              _messagesLoaded: true,
+            }
+            setConversations([conv])
+            setActiveConvId(trimmed)
+            return
+          } catch (e) {
+            console.error('[chat-history-load] anon session from storage', e)
+            try {
+              localStorage.removeItem(LS_ACTIVE_SESSION_ID)
+            } catch {
+              // ignore
+            }
+          }
+        }
+        if (cancelled) return
+        const draft = createAnonDraftConversation()
+        setConversations([draft])
+        setActiveConvId(draft.id)
+      }
+
+      if (hasChatAuthToken()) {
+        try {
+          const sessions = await listChatSessions()
+          if (cancelled) return
+          const mapped = (sessions || []).map(sessionRowToConversation)
+          let preferred = localStorage.getItem(LS_ACTIVE_SESSION_ID)
+          if (preferred && !mapped.some((c) => c.id === preferred)) {
+            preferred = null
+          }
+          const activeId = preferred || mapped[0]?.id || null
+          if (mapped.length === 0) {
+            setConversations([])
+            setActiveConvId(null)
+          } else {
+            setConversations(mapped)
+            setActiveConvId(activeId || mapped[0].id)
+            if (activeId || mapped[0].id) {
+              const sid = activeId || mapped[0].id
+              const rows = await getChatSessionMessages(sid)
+              if (cancelled) return
+              const msgs = mapDbRowsToMessages(rows)
+              setConversations((prev) =>
+                prev.map((c) => (c.id === sid ? { ...c, messages: msgs, _messagesLoaded: true } : c)),
+              )
+            }
+          }
+        } catch (err) {
+          if (cancelled) return
+          setHistoriesError(err?.message || 'Konnte Chat-Verlauf nicht laden.')
+          await bootAnonymousFromStorage()
+        }
+      } else {
+        await bootAnonymousFromStorage()
+      }
+      if (!cancelled) setHistoriesLoading(false)
+    }
+    boot()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!activeConvId) return
+    if (String(activeConvId).startsWith('anon-draft-')) return
+    const conv = conversations.find((c) => c.id === activeConvId)
+    const sid = (conv?.serverSessionId || activeConvId || '').trim()
+    if (sid && UUID_RE.test(sid)) {
+      localStorage.setItem(LS_ACTIVE_SESSION_ID, sid)
+    }
+  }, [activeConvId, conversations])
+
+  const activeConversation = useMemo(
+    () => conversations.find((c) => c.id === activeConvId) || null,
+    [conversations, activeConvId],
+  )
 
   const emitSOPRefresh = useCallback((reason, sopId) => {
     if (typeof window === 'undefined') return
@@ -80,6 +240,7 @@ export default function ChatPage() {
     setActionToast(text)
     window.setTimeout(() => setActionToast(''), 2400)
   }, [])
+
   const clearAssistantActiveContext = useCallback(() => {
     const keys = getAssistantContextStorageKeys()
     localStorage.removeItem('current_document_id')
@@ -96,55 +257,64 @@ export default function ChatPage() {
     console.info('[assistant-delete-ui] cleared active assistant context')
   }, [])
 
-  React.useEffect(() => {
-    localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(conversations))
-  }, [conversations])
-
-  React.useEffect(() => {
-    if (!activeConvId && conversations.length > 0) {
-      setActiveConvId(conversations[0].id)
-      return
-    }
-    if (!activeConvId) return
-    const exists = conversations.some((c) => c.id === activeConvId)
-    if (!exists && conversations.length > 0) {
-      setActiveConvId(conversations[0].id)
-      return
-    }
-    localStorage.setItem(CHAT_ACTIVE_STORAGE_KEY, activeConvId)
-  }, [activeConvId, conversations])
-
-  const activeConversation = useMemo(
-    () => conversations.find((c) => c.id === activeConvId) || null,
-    [conversations, activeConvId],
+  const handleSelect = useCallback(
+    async (id) => {
+      setActiveConvId(id)
+      setShowChat(true)
+      const conv = conversations.find((c) => c.id === id)
+      if (conv?.serverSessionId && !conv._messagesLoaded) {
+        try {
+          await loadMessagesIntoConversation(conv.serverSessionId)
+        } catch (e) {
+          console.error('[chat-history-load] failed lazy messages', e)
+        }
+      }
+    },
+    [conversations, loadMessagesIntoConversation],
   )
-
-  const handleSelect = useCallback((id) => {
-    setActiveConvId(id)
-    setShowChat(true) // On mobile, switch to chat view
-  }, [])
 
   const handleBack = useCallback(() => {
     setShowChat(false)
   }, [])
 
-  const handleNewConversation = useCallback(() => {
-    const id = `conv-${Date.now()}`
-    const next = {
-      id,
-      title: 'Neues Gespräch',
-      description: 'Noch keine Nachrichten',
-      time: nowTime(),
-      dateGroup: 'Heute',
-      hasAlert: false,
-      tags: [],
-      messages: [],
-      activeSources: [],
-      contextTags: [],
-      serverSessionId: null,
+  const handleNewConversation = useCallback(async () => {
+    if (hasChatAuthToken()) {
+      try {
+        const created = await createChatSession({ title: 'Neues Gespräch' })
+        const sid = created?.id
+        if (!sid) return
+        const next = {
+          id: sid,
+          serverSessionId: sid,
+          title: created.title || 'Neues Gespräch',
+          description: '',
+          time: formatChatTimeFromIso(created.created_at),
+          dateGroup: 'Gespeichert',
+          hasAlert: false,
+          tags: [],
+          messages: [buildWelcomeMessage()],
+          activeSources: [],
+          contextTags: [],
+          _messagesLoaded: true,
+        }
+        setConversations((prev) => [next, ...prev])
+        setActiveConvId(sid)
+        localStorage.setItem(LS_ACTIVE_SESSION_ID, sid)
+        setShowChat(true)
+      } catch (err) {
+        console.error('[chat-history-session-create] failed', err)
+        window.alert(err?.message || 'Neuer Chat konnte nicht angelegt werden.')
+      }
+      return
     }
+    const next = createAnonDraftConversation()
     setConversations((prev) => [next, ...prev])
-    setActiveConvId(id)
+    setActiveConvId(next.id)
+    try {
+      localStorage.removeItem(LS_ACTIVE_SESSION_ID)
+    } catch {
+      // ignore
+    }
     setShowChat(true)
   }, [])
 
@@ -167,7 +337,7 @@ export default function ChatPage() {
           c.id === activeConvId
             ? {
                 ...c,
-                messages: [...c.messages, userMsg],
+                messages: [...(c.messages || []).filter((m) => m.id !== WELCOME_ID), userMsg],
                 description: text.trim().slice(0, 80),
                 time: nowTime(),
               }
@@ -176,8 +346,9 @@ export default function ChatPage() {
       )
 
       try {
+        const msgsForHist = (activeConversation?.messages || []).filter((m) => m.id !== WELCOME_ID)
         const chatHistoryPayload = [
-          ...(activeConversation?.messages || []).map((msg) => ({
+          ...msgsForHist.map((msg) => ({
             role: msg.sender === 'ai' ? 'assistant' : 'user',
             content: stripHtml(msg.content),
           })),
@@ -192,6 +363,7 @@ export default function ChatPage() {
           surface: 'global_chatbot',
           sessionId: activeConversation?.serverSessionId || null,
         })
+
         const action = result?.assistant_action
         if (action?.requires_confirmation && action?.type === 'delete_sop') {
           setPendingDeleteAction({
@@ -219,36 +391,58 @@ export default function ChatPage() {
             navigate('/sops')
           }
         }
-        const strictInventory = Boolean(result?.retrieval_stats?.strict_mode)
-        const sourceTags = strictInventory
-          ? []
-          : (result.sources || []).slice(0, 5).map((s, idx) => ({
-              id: `src-${Date.now()}-${idx}`,
-              label: s.label || s.id || `Quelle ${idx + 1}`,
-              type: (s.type || 'sop').toLowerCase(),
-            }))
-        const aiMsg = {
-          id: `a-${Date.now()}`,
-          sender: 'ai',
-          time: nowTime(),
-          content: toHtml(result.answer || 'Keine Antwort erhalten.'),
-          tags: sourceTags,
-          showActions: true,
+
+        if (result?.session_id) {
+          const newSid = String(result.session_id).trim()
+          localStorage.setItem(LS_ACTIVE_SESSION_ID, newSid)
+          const rows = await getChatSessionMessages(newSid)
+          const mapped = mapDbRowsToMessages(rows)
+          setConversations((prev) =>
+            prev.map((c) =>
+              c.id === activeConvId
+                ? {
+                    ...c,
+                    id: newSid,
+                    serverSessionId: newSid,
+                    title: c.title === 'Neues Gespräch' ? text.trim().slice(0, 45) : c.title,
+                    messages: mapped,
+                    _messagesLoaded: true,
+                  }
+                : c,
+            ),
+          )
+          setActiveConvId(newSid)
+        } else {
+          const strictInventory = Boolean(result?.retrieval_stats?.strict_mode)
+          const sourceTags = strictInventory
+            ? []
+            : (result.sources || []).slice(0, 5).map((s, idx) => ({
+                id: `src-${Date.now()}-${idx}`,
+                label: s.label || s.id || `Quelle ${idx + 1}`,
+                type: (s.type || 'sop').toLowerCase(),
+              }))
+          const aiMsg = {
+            id: `a-${Date.now()}`,
+            sender: 'ai',
+            time: nowTime(),
+            content: toHtml(result.answer || 'Keine Antwort erhalten.'),
+            tags: sourceTags,
+            showActions: true,
+          }
+          setConversations((prev) =>
+            prev.map((c) =>
+              c.id === activeConvId
+                ? {
+                    ...c,
+                    title: c.title === 'Neues Gespräch' ? text.trim().slice(0, 45) : c.title,
+                    messages: [...(c.messages || []), aiMsg],
+                    activeSources: sourceTags,
+                    contextTags: sourceTags.slice(0, 2),
+                  }
+                : c,
+            ),
+          )
         }
-        setConversations((prev) =>
-          prev.map((c) =>
-            c.id === activeConvId
-              ? {
-                  ...c,
-                  title: c.title === 'Neues Gespräch' ? text.trim().slice(0, 45) : c.title,
-                  messages: [...c.messages, aiMsg],
-                  activeSources: sourceTags,
-                  contextTags: sourceTags.slice(0, 2),
-                  serverSessionId: result.session_id || c.serverSessionId || null,
-                }
-              : c,
-          ),
-        )
       } catch (err) {
         const errMsg = {
           id: `e-${Date.now()}`,
@@ -260,9 +454,7 @@ export default function ChatPage() {
         }
         setConversations((prev) =>
           prev.map((c) =>
-            c.id === activeConvId
-              ? { ...c, messages: [...c.messages, errMsg], hasAlert: true }
-              : c,
+            c.id === activeConvId ? { ...c, messages: [...(c.messages || []), errMsg], hasAlert: true } : c,
           ),
         )
       } finally {
@@ -279,6 +471,7 @@ export default function ChatPage() {
       emitSOPRefresh,
       showToast,
       clearAssistantActiveContext,
+      loadMessagesIntoConversation,
     ],
   )
 
@@ -321,33 +514,33 @@ export default function ChatPage() {
         let created
         try {
           created = await createDocument({
-          title,
-          doc_type: 'sop',
-          doc_json: docJson,
-          metadata_json: {
-            sopStatus: 'draft',
-            sopMetadata: {
-              title,
-              author: 'AI Assistant',
-              reviewer: '',
-              riskLevel: 'Medium',
-              department: 'Quality',
-              documentId: '',
-              references: [],
-              reviewDate: '',
-              effectiveDate: '',
-              regulatoryReferences: [],
-            },
-            auditTrail: [
-              {
-                action: 'generated_from_chatbot',
-                note: 'SOP created from chatbot-generated content.',
-                actor: 'AI Assistant',
-                createdAt: new Date().toISOString(),
+            title,
+            doc_type: 'sop',
+            doc_json: docJson,
+            metadata_json: {
+              sopStatus: 'draft',
+              sopMetadata: {
+                title,
+                author: 'AI Assistant',
+                reviewer: '',
+                riskLevel: 'Medium',
+                department: 'Quality',
+                documentId: '',
+                references: [],
+                reviewDate: '',
+                effectiveDate: '',
+                regulatoryReferences: [],
               },
-            ],
-          },
-        })
+              auditTrail: [
+                {
+                  action: 'generated_from_chatbot',
+                  note: 'SOP created from chatbot-generated content.',
+                  actor: 'AI Assistant',
+                  createdAt: new Date().toISOString(),
+                },
+              ],
+            },
+          })
         } catch (createErr) {
           if (createErr?.status === 409) {
             window.alert(
@@ -376,8 +569,19 @@ export default function ChatPage() {
           {actionToast}
         </div>
       ) : null}
+      {historiesLoading ? (
+        <div className="chat-page__detail" style={{ padding: 16 }}>
+          <p>Lade Gespräche…</p>
+        </div>
+      ) : null}
+      {historiesError ? (
+        <div className="chat-page__detail" style={{ padding: 16, color: 'var(--error, #c00)' }}>
+          <p>{historiesError}</p>
+        </div>
+      ) : null}
+
       <ConversationList
-        conversations={conversations}
+        conversations={conversations.length ? conversations : []}
         activeId={activeConvId}
         onSelect={handleSelect}
         onNewConversation={handleNewConversation}
@@ -399,7 +603,11 @@ export default function ChatPage() {
                     activeConversation.messages?.length
                       ? `${activeConversation.messages.length} Nachrichten`
                       : 'Noch keine Nachrichten',
-                    isSending ? 'Antwort wird generiert…' : 'Live verbunden',
+                    isSending
+                      ? 'Antwort wird generiert…'
+                      : activeConversation?.serverSessionId
+                        ? 'Server gespeichert'
+                        : 'Neuer Chat',
                     routeMeta.contextLabel,
                   ],
                   dateDivider: 'Heute',
@@ -414,7 +622,9 @@ export default function ChatPage() {
       {pendingDeleteAction ? (
         <div className="sop-delete-modal-overlay" role="presentation">
           <div className="sop-delete-modal" role="dialog" aria-modal="true" aria-labelledby="chat-delete-title">
-            <h3 id="chat-delete-title" className="sop-delete-title">SOP wirklich löschen?</h3>
+            <h3 id="chat-delete-title" className="sop-delete-title">
+              SOP wirklich löschen?
+            </h3>
             <p className="sop-delete-message">
               Der KL Assistant wird die aktive SOP nach Ihrer Bestätigung sicher entfernen (Soft Delete).
             </p>

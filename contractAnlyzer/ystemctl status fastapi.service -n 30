@@ -1,0 +1,11 @@
+[0;1;32m●[0m fastapi.service - FastAPI app
+     Loaded: loaded (]8;;file://v2202507287959363600/etc/systemd/system/fastapi.service/etc/systemd/system/fastapi.service]8;;; [0;1;32menabled[0m; preset: [0;1;32menabled[0m)
+     Active: [0;1;32mactive (running)[0m since Fri 2025-07-25 13:30:48 CEST; 2s ago
+   Main PID: 83006 (uvicorn)
+      Tasks: 4[0;38;5;245m (limit: 9466)[0m
+     Memory: 311.5M
+        CPU: 2.724s
+     CGroup: /system.slice/fastapi.service
+             └─[0;38;5;245m83006 /root/contractAnlyzer/venv/bin/python3 /root/contractAnlyzer/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000[0m
+
+Jul 25 13:30:48 v2202507287959363600 systemd[1]: Started fastapi.service - FastAPI app.
