@@ -43,16 +43,20 @@ from app.models import SOP, Deviation, Capa, AuditFinding, Decision
 load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
 
 
-MAX_QUERY_CHARS = int(os.getenv("RAG_MAX_QUERY_CHARS", "4000"))
-MAX_CONTEXT_CHARS = int(os.getenv("RAG_MAX_CONTEXT_CHARS", "12000"))
-MAX_HISTORY_MESSAGE_CHARS = int(os.getenv("RAG_MAX_HISTORY_MESSAGE_CHARS", "800"))
-MAX_HISTORY_MESSAGES = int(os.getenv("RAG_MAX_HISTORY_MESSAGES", "8"))
+MAX_QUERY_CHARS = int(os.getenv("RAG_MAX_QUERY_CHARS", "3000"))
+MAX_CONTEXT_CHARS = int(os.getenv("RAG_MAX_CONTEXT_CHARS", "8000"))
+MAX_HISTORY_MESSAGE_CHARS = int(os.getenv("RAG_MAX_HISTORY_MESSAGE_CHARS", "600"))
+MAX_HISTORY_MESSAGES = int(os.getenv("RAG_MAX_HISTORY_MESSAGES", "6"))
 RAG_DEBUG_RETRIEVAL = os.getenv("RAG_DEBUG_RETRIEVAL", "false").strip().lower() == "true"
 RAG_DEBUG_MAX_CHUNKS = int(os.getenv("RAG_DEBUG_MAX_CHUNKS", "8"))
 logger = logging.getLogger(__name__)
 RAG_STRICT_INVENTORY_MODE = os.getenv("RAG_STRICT_INVENTORY_MODE", "false").strip().lower() == "true"
 # When false (default), SOP count/list still runs from query intent (recommended for QA).
 RAG_DISABLE_SOP_INVENTORY = os.getenv("RAG_DISABLE_SOP_INVENTORY", "false").strip().lower() == "true"
+
+NO_SOP_CONTEXT_FALLBACK = (
+    "No SOP data is currently available in the system, so I cannot answer this from SOP context."
+)
 
 
 def _console_safe(value) -> str:
@@ -92,6 +96,20 @@ def _db_active_sop_count() -> int:
         return int(db.query(SOP).filter(SOP.is_active == True).count())  # noqa: E712
     finally:
         db.close()
+
+
+def _user_query_expects_sop_context(query: str) -> bool:
+    """True when the question is primarily about SOPs / procedures (not generic chat)."""
+    q = (query or "").lower()
+    if not q.strip():
+        return False
+    if re.search(r"\b(sop|sops|standard operating procedures?|work instruction|wi-|procedure document)\b", q):
+        return True
+    if re.search(r"\b(procedure|procedures)\b", q) and re.search(
+        r"\b(compliance|qms|quality|controlled document|document control)\b", q
+    ):
+        return True
+    return False
 
 
 def _db_active_sop_rows(limit: int) -> List[Tuple[str, str, str]]:
@@ -788,6 +806,14 @@ def _classify_sop_inventory_query(query: str) -> Optional[Literal["count", "list
         r"\b(how many|count|number)\b", q
     ):
         return "count"
+    if re.search(r"\b(how many|count|number of|total)\b", q) and re.search(
+        r"\b(relevant|related|applicable)\b.*\b(sop|sops)\b", q
+    ):
+        return "count"
+    if re.search(r"\b(how many|count|number of|total)\b", q) and re.search(
+        r"\b(sop|sops)\b.*\b(relevant|related|applicable)\b", q
+    ):
+        return "count"
     return None
 
 
@@ -814,12 +840,15 @@ def _strict_sop_inventory_response(
 
     inventory_docs: List[Document] = list(docs or [])
     allowed_ids: set[str] = set()
+    raw_ids = None
     if retriever is not None:
         mf = getattr(retriever, "metadata_filters", {}) or {}
         raw_ids = mf.get("allowed_entity_ids") if isinstance(mf, dict) else None
         if isinstance(raw_ids, list):
-            allowed_ids = {str(v) for v in raw_ids}
-    if retriever is not None:
+            allowed_ids = {_canonical_entity_id_key(str(v)) for v in raw_ids if str(v).strip()}
+    if isinstance(raw_ids, list) and len(raw_ids) == 0:
+        inventory_docs = []
+    elif retriever is not None:
         try:
             corpus_docs, _ = retriever._get_bm25_corpus()
             if corpus_docs:
@@ -827,9 +856,12 @@ def _strict_sop_inventory_response(
                     inventory_docs = [
                         d
                         for d in corpus_docs
-                        if str((d.metadata or {}).get("entity_id", "")) in allowed_ids
+                        if _canonical_entity_id_key(
+                            str((d.metadata or {}).get("entity_id", ""))
+                        )
+                        in allowed_ids
                     ]
-                else:
+                elif raw_ids is None:
                     inventory_docs = corpus_docs
         except Exception:
             pass
@@ -924,11 +956,8 @@ def _strict_sop_inventory_response(
 
     if mode == "count":
         count_citations: List[dict] = []
-        if db_total == 0 and indexed_distinct == 0:
-            count_answer = (
-                "No active SOP records were found in the database or in the indexed knowledge set.\n\n"
-                "If SOPs were recently added, run indexing and ask again."
-            )
+        if db_total == 0:
+            count_answer = NO_SOP_CONTEXT_FALLBACK
         else:
             lines = []
             if indexed_distinct != db_total:
@@ -968,6 +997,30 @@ def _strict_sop_inventory_response(
                 "timestamp": time.time(),
                 "model": "deterministic",
                 "strict_mode": "sop_inventory_count",
+            },
+        }
+
+    if db_total == 0:
+        return {
+            "answer": NO_SOP_CONTEXT_FALLBACK,
+            "citations": [],
+            "suggestions": [
+                "How many SOPs are in the database?",
+                "Summarize the active SOP",
+                "What deviations link to this SOP?",
+            ],
+            "retrieval_stats": {},
+            "routed_to": "SOPs",
+            "cached": False,
+            "metadata_snapshot": [],
+            "audit_log_snapshot": [],
+            "action_metadata": {
+                "query": query,
+                "routing": ["sops"],
+                "latency_ms": 0.0,
+                "timestamp": time.time(),
+                "model": "deterministic",
+                "strict_mode": "sop_inventory_list_empty",
             },
         }
 
@@ -1133,21 +1186,24 @@ class SmartRAGChain:
             else:
                 retriever.category_filter = None
             docs = retriever.invoke(query_for_routing)
-            allowed_raw = section_filters.get("allowed_entity_ids") or []
-            allowed_ids = {
-                _canonical_entity_id_key(str(x))
-                for x in allowed_raw
-                if str(x).strip()
-            }
-            if allowed_ids:
-                docs = [
-                    d
-                    for d in docs
-                    if _canonical_entity_id_key(
-                        str((d.metadata or {}).get("entity_id") or (d.metadata or {}).get("source_id") or "")
-                    )
-                    in allowed_ids
-                ]
+            allowed_raw = section_filters.get("allowed_entity_ids")
+            if isinstance(allowed_raw, list) and len(allowed_raw) == 0:
+                docs = []
+            else:
+                allowed_ids = {
+                    _canonical_entity_id_key(str(x))
+                    for x in (allowed_raw or [])
+                    if str(x).strip()
+                }
+                if allowed_ids:
+                    docs = [
+                        d
+                        for d in docs
+                        if _canonical_entity_id_key(
+                            str((d.metadata or {}).get("entity_id") or (d.metadata or {}).get("source_id") or "")
+                        )
+                        in allowed_ids
+                    ]
             top_n = 20 if num_target_sections == 1 else 10
             ranked = self.federated.reranker.rerank_top_n(query_for_routing, docs, top_n)
             max_chunks = 6 if active_doc_id else 4
@@ -1426,8 +1482,15 @@ class SmartRAGChain:
                 llm_cfg.provider,
                 llm_cfg.model,
             )
+            refusal_msg = "Sorry, I do not have enough information about this."
+            if (
+                _db_active_sop_count() == 0
+                and "sops" in target_sections
+                and _user_query_expects_sop_context(query_for_routing)
+            ):
+                refusal_msg = NO_SOP_CONTEXT_FALLBACK
             return {
-                "answer": "Sorry, I do not have enough information about this.",
+                "answer": refusal_msg,
                 "citations": [],
                 "suggestions": [
                     "Ask about a specific SOP number",

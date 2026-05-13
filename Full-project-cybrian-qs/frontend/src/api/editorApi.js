@@ -87,6 +87,35 @@ async function throwApiError(res, fallbackMsg) {
   throw err
 }
 
+/**
+ * Sort chat message rows for display: oldest first; when created_at ties (same DB flush),
+ * user must precede assistant so the transcript reads in conversation order.
+ * @param {unknown[]} rows
+ * @returns {unknown[]}
+ */
+export function sortChatMessageRows(rows) {
+  if (!Array.isArray(rows) || rows.length < 2) {
+    return Array.isArray(rows) ? [...rows] : []
+  }
+  const roleRank = (r) => {
+    const role = String(r?.role ?? '').toLowerCase()
+    if (role === 'user') return 0
+    if (role === 'assistant') return 1
+    return 2
+  }
+  const timeMs = (r) => {
+    const raw = r?.created_at
+    if (raw == null) return 0
+    const ms = new Date(raw).getTime()
+    return Number.isFinite(ms) ? ms : 0
+  }
+  return [...rows].sort((a, b) => {
+    const dt = timeMs(a) - timeMs(b)
+    if (dt !== 0) return dt
+    return roleRank(a) - roleRank(b)
+  })
+}
+
 export async function listChatSessions() {
   const res = await fetch(`${API_BASE}/api/chat/sessions`, {
     headers: { ...buildOptionalAuthHeaders() },
@@ -115,7 +144,8 @@ export async function getChatSessionMessages(sessionId) {
     headers: { ...buildOptionalAuthHeaders() },
   })
   if (!res.ok) await throwApiError(res, 'Failed to load chat messages')
-  return res.json()
+  const data = await res.json()
+  return sortChatMessageRows(Array.isArray(data) ? data : [])
 }
 
 // ─────────────────────────────────────────────────────
@@ -386,6 +416,8 @@ export async function performAIAction(payload) {
         section_name: payload?.section_name || payload?.section_title || null,
         section_type: payload?.section_type || null,
         client_structured_json: payload?.client_structured_json || null,
+        sop_entity_id: payload?.sop_entity_id || null,
+        triggered_by: payload?.triggered_by || null,
       }),
       signal: controller.signal,
     })

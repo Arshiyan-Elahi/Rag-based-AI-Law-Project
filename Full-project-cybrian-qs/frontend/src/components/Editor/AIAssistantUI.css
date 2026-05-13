@@ -87,6 +87,40 @@
   animation: ai-spin 0.9s linear infinite;
 }
 
+.editor-ai-bridge-loading {
+  position: fixed;
+  inset: 0;
+  z-index: 999;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 96px;
+  pointer-events: none;
+}
+
+.editor-ai-bridge-loading__inner {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 18px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.86);
+  color: #f8fafc;
+  font-size: 13px;
+  font-weight: 600;
+  box-shadow: 0 12px 28px rgba(15, 23, 42, 0.25);
+  pointer-events: auto;
+}
+
+.editor-ai-bridge-loading__spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(248, 250, 252, 0.6);
+  border-top-color: transparent;
+  border-radius: 999px;
+  animation: ai-spin 0.9s linear infinite;
+}
+
 .ai-modal-overlay {
   position: fixed;
   inset: 0;

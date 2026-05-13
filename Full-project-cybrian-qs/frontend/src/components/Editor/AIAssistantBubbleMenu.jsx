@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react'
 import { Sparkles, ShieldAlert, Wand2 } from 'lucide-react'
 
 import { performAIAction } from '../../api/editorApi'
+import { AI_ACTION_TRIGGERED_BY } from '../../utils/editorAiBridge'
 import AIComparisonModal from './AIComparisonModal'
 import './AIAssistantUI.css'
 import { formatAiSuggestionForUi } from '../../utils/aiOutputFormatter'
@@ -337,6 +338,8 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true, onPrevi
         section_name: sectionName,
         section_type: sectionType,
         client_structured_json: clientStructured,
+        sop_entity_id: sopMetadata?.sop_entity_id || null,
+        triggered_by: AI_ACTION_TRIGGERED_BY.EDITOR_BUBBLE,
       })
 
       const safeSuggestedText = formatAiSuggestionForUi({

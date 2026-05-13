@@ -42,7 +42,6 @@ from .schemas import (
     LinkSuggestionResponse,
     SemanticStatusResponse,
 )
-from .services.profile_detection_store import persist_profile_detection_for_sop_version
 from .services.semantic_pipeline import (
     SemanticPipelineService,
     ENTITY_TYPES,
@@ -200,7 +199,7 @@ def _create_new_version_for_existing_sop(
     resolved_title: str,
     department: str,
     sop_number: str,
-    background_tasks: BackgroundTasks | None,
+    background_tasks: BackgroundTasks,
 ) -> dict:
     """
     Add a new sop_version row, point current_version_id to it, refresh SOP header.
@@ -264,11 +263,8 @@ def _create_new_version_for_existing_sop(
     db.refresh(existing)
     db.refresh(new_version)
 
-    _persist_nlp_analysis_for_version(db, new_version)
-
     _upsert_import_context_entities(db, existing, new_version, background_tasks)
-    if background_tasks:
-        _schedule_semantic_job(background_tasks, "sop", existing.id, new_version.id)
+    _schedule_semantic_job(background_tasks, "sop", existing.id, new_version.id)
 
     return _build_editor_doc_response(existing, new_version)
 
@@ -347,15 +343,16 @@ def _schedule_semantic_job(background_tasks: BackgroundTasks, entity_type: str, 
             version_id=version_id,
             job_type=job_type,
         )
-        if job_id:
-            # Fire-and-forget with bounded worker pool to avoid spawning unbounded
-            # per-request threads and exhausting DB connection pool.
-            def _run_one_async() -> None:
-                try:
-                    SemanticPipelineService.process_job(job_id)
-                except Exception as exc:
-                    print(f"[semantic-job] {job_id} failed: {exc}", flush=True)
-            _semantic_job_executor.submit(_run_one_async)
+        if not job_id:
+            return
+        # Fire-and-forget with bounded worker pool to avoid spawning unbounded
+        # per-request threads and exhausting DB connection pool.
+        def _run_one_async() -> None:
+            try:
+                SemanticPipelineService.process_job(job_id)
+            except Exception as exc:
+                print(f"[semantic-job] {job_id} failed: {exc}", flush=True)
+        _semantic_job_executor.submit(_run_one_async)
     except Exception as exc:
         print(f"[semantic-job] ERROR: Failed to schedule job for {entity_type} {entity_id}: {exc}", flush=True)
 
@@ -374,11 +371,6 @@ def _extract_plain_text_from_tiptap(doc_json: dict | None) -> str:
 
     walk(doc_json)
     return " ".join(out).strip()
-
-
-def _persist_nlp_analysis_for_version(db: Session, version: SOPVersion) -> None:
-    """Run NLP and persist to `profile_detections` (current SOP only; no legacy document fields)."""
-    persist_profile_detection_for_sop_version(db, version)
 
 
 def _parse_uuid_or_400(value: str, field_name: str = "id") -> uuid.UUID:
@@ -1014,8 +1006,8 @@ _DUP_SOP_MSG = (
 @router.post("/api/editor/docs", response_model=EditorDocResponse)
 def create_document(
     payload: CreateDocumentRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
-    background_tasks: BackgroundTasks = None,
     _=Depends(check_mock_mode),
 ):
     """
@@ -1130,10 +1122,10 @@ def create_document(
 
     db.refresh(sop)
     db.refresh(initial_version)
-
-    _persist_nlp_analysis_for_version(db, initial_version)
+    logger.info("[sop-editor] upload saved sop_id=%s version_id=%s", sop.id, initial_version.id)
 
     _upsert_import_context_entities(db, sop, initial_version, background_tasks)
+    _schedule_semantic_job(background_tasks, "sop", sop.id, initial_version.id)
 
     return _build_editor_doc_response(sop, initial_version)
 
@@ -1166,8 +1158,8 @@ def get_document(doc_id: str, db: Session = Depends(get_db)):
 def update_document(
     doc_id: str,
     payload: UpdateDocumentRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
-    background_tasks: BackgroundTasks = None,
     _=Depends(check_mock_mode),
 ):
     """
@@ -1226,10 +1218,10 @@ def update_document(
     db.commit()
     db.refresh(sop)
     db.refresh(current_version)
-
-    _persist_nlp_analysis_for_version(db, current_version)
+    logger.info("[sop-editor] document saved sop_id=%s version_id=%s", sop.id, current_version.id)
 
     _upsert_import_context_entities(db, sop, current_version, background_tasks)
+    _schedule_semantic_job(background_tasks, "sop", sop.id, current_version.id)
 
     return _build_editor_doc_response(sop, current_version)
 
@@ -1387,8 +1379,8 @@ def list_versions(doc_id: str, db: Session = Depends(get_db)):
 def create_version(
     doc_id: str,
     payload: CreateVersionRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
-    background_tasks: BackgroundTasks = None,
     _=Depends(check_mock_mode),
 ):
     """
@@ -1450,10 +1442,7 @@ def create_version(
     db.refresh(version)
     db.refresh(sop)
 
-    _persist_nlp_analysis_for_version(db, version)
-
-    if background_tasks:
-        _schedule_semantic_job(background_tasks, "sop", sop.id, version.id)
+    _schedule_semantic_job(background_tasks, "sop", sop.id, version.id)
     return _build_editor_version_response(version)
 
 
@@ -1482,8 +1471,8 @@ def get_version(doc_id: str, version_id: str, db: Session = Depends(get_db)):
 def duplicate_document(
     doc_id: str,
     payload: CreateDocumentRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
-    background_tasks: BackgroundTasks = None,
     _=Depends(check_mock_mode),
 ):
     """
@@ -1534,9 +1523,7 @@ def duplicate_document(
     db.commit()
     db.refresh(new_sop)
     db.refresh(new_version)
-    _persist_nlp_analysis_for_version(db, new_version)
-    if background_tasks:
-        _schedule_semantic_job(background_tasks, "sop", new_sop.id, new_version.id)
+    _schedule_semantic_job(background_tasks, "sop", new_sop.id, new_version.id)
     return _build_editor_doc_response(new_sop, new_version)
 
 
@@ -2657,3 +2644,62 @@ def get_semantic_status(entity_type: str = Query(...), entity_id: UUID = Query(.
     if normalized_type not in ENTITY_TYPES:
         raise HTTPException(status_code=400, detail=f"Unsupported entity_type '{entity_type}'.")
     return SemanticPipelineService.get_entity_status(db, normalized_type, entity_id)
+
+
+# ==========================================
+# MAINTENANCE / RAG STATE
+# ==========================================
+
+@router.post("/api/semantic/maintenance/purge")
+def purge_rag_state(
+    recreate_collection: bool = Query(True),
+    clear_embedding_jobs: bool = Query(True),
+    clear_source_references: bool = Query(True),
+    clear_link_suggestions: bool = Query(False),
+):
+    """
+    [rag-maintenance] Wipe Qdrant + knowledge_chunks for a clean rebuild.
+
+    Use this when the RAG index is stale or corrupted. SOP / business tables
+    (sops, sop_versions, deviations, capas, audit_findings, decisions, links)
+    are NEVER touched.
+    """
+    counts = SemanticPipelineService.purge_all_semantic_state(
+        recreate_collection=recreate_collection,
+        clear_embedding_jobs=clear_embedding_jobs,
+        clear_source_references=clear_source_references,
+        clear_link_suggestions=clear_link_suggestions,
+    )
+    return {"status": "purged", "counts": counts}
+
+
+@router.post("/api/semantic/maintenance/rebuild")
+def rebuild_rag_state(background_tasks: BackgroundTasks):
+    """
+    [rag-maintenance] Enqueue indexing jobs for every active entity, then drain the
+    queue in the background so RAG retrieval rehydrates from scratch.
+    """
+    counts = SemanticPipelineService.queue_full_reindex()
+
+    def _drain_embedding_queue():
+        while True:
+            s = SessionLocal()
+            try:
+                nxt = (
+                    s.query(EmbeddingJob)
+                    .filter(EmbeddingJob.status == "pending")
+                    .order_by(asc(EmbeddingJob.created_at))
+                    .first()
+                )
+                if not nxt:
+                    return
+                jid = nxt.id
+            finally:
+                s.close()
+            try:
+                SemanticPipelineService.process_job(jid)
+            except Exception as exc:
+                logger.warning("[rag-maintenance] job %s failed: %s", jid, exc)
+
+    background_tasks.add_task(_drain_embedding_queue)
+    return {"status": "rebuild_queued", "counts": counts}

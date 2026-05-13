@@ -28,6 +28,7 @@ Fields excluded from all public responses:
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
+import os
 from .database import get_db
 from .models import SOP, SOPVersion, KnowledgeChunk
 import uuid
@@ -41,6 +42,12 @@ public_router = APIRouter(prefix="/api/public", tags=["Public Chatbot API"])
 
 # Fixed tenant for this dev/seed environment
 FIXED_TENANT_ID = uuid.UUID("11111111-1111-1111-1111-111111111111")
+
+
+def _require_rag_ready_chunks() -> bool:
+    """When true, only expose knowledge_chunks that finished the indexing pipeline (rag_ready)."""
+    return os.getenv("SEMANTIC_REQUIRE_RAG_READY", "false").strip().lower() == "true"
+
 
 # ─────────────────────────────────────────
 # Internal helpers
@@ -394,10 +401,13 @@ def get_public_sop_chunks(doc_id: str, db: Session = Depends(get_db)):
         .filter(
             KnowledgeChunk.entity_id == uid,
             KnowledgeChunk.entity_type == "sop",
+            KnowledgeChunk.entity_version_id == version.id,
         )
         .order_by(KnowledgeChunk.chunk_order.asc())
         .all()
     )
+    if _require_rag_ready_chunks() and db_chunks:
+        db_chunks = [c for c in db_chunks if (c.metadata_json or {}).get("rag_ready") is True]
 
     if db_chunks:
         return [
@@ -412,6 +422,9 @@ def get_public_sop_chunks(doc_id: str, db: Session = Depends(get_db)):
             }
             for c in db_chunks
         ]
+
+    if _require_rag_ready_chunks():
+        return []
 
     # ── Fallback: auto-generate chunks from sections on-the-fly ──
     # Each section becomes one chunk. This is Section-level chunking,
@@ -499,10 +512,13 @@ def list_all_chunks(
             .filter(
                 KnowledgeChunk.entity_id == sop.id,
                 KnowledgeChunk.entity_type == "sop",
+                KnowledgeChunk.entity_version_id == version.id,
             )
             .order_by(KnowledgeChunk.chunk_order.asc())
             .all()
         )
+        if _require_rag_ready_chunks() and db_chunks:
+            db_chunks = [c for c in db_chunks if (c.metadata_json or {}).get("rag_ready") is True]
 
         if db_chunks:
             for c in db_chunks:
@@ -515,7 +531,7 @@ def list_all_chunks(
                     "tokens_est": _estimate_tokens(c.chunk_text),
                     "retrieval_metadata": retrieval_meta,
                 })
-        else:
+        elif not _require_rag_ready_chunks():
             # Auto-generate from sections
             sections = _tiptap_to_sections(version.content_json or {})
             for i, section in enumerate(sections):
@@ -591,10 +607,13 @@ def _build_chunks_for_full(
         .filter(
             KnowledgeChunk.entity_id == uid,
             KnowledgeChunk.entity_type == "sop",
+            KnowledgeChunk.entity_version_id == version.id,
         )
         .order_by(KnowledgeChunk.chunk_order.asc())
         .all()
     )
+    if _require_rag_ready_chunks() and db_chunks:
+        db_chunks = [c for c in db_chunks if (c.metadata_json or {}).get("rag_ready") is True]
 
     if db_chunks:
         return [
@@ -622,6 +641,9 @@ def _build_chunks_for_full(
             }
             for c in db_chunks
         ]
+
+    if _require_rag_ready_chunks():
+        return []
 
     # ── Fallback: one chunk per section (section-level chunking) ──
     chunks = []

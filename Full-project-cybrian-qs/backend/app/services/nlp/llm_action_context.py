@@ -185,7 +185,7 @@ def build_nlp_structure_parameters_inner_body(
 
     nlp_tail = ""
     if (
-        action in ("improve", "rewrite")
+        action in ("improve", "rewrite", "summarize", "analyze")
         and (saved_prompt_block or "").strip()
     ):
         tail = (saved_prompt_block or "").strip()

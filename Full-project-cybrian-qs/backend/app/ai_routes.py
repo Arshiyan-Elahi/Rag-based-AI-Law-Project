@@ -24,10 +24,13 @@ from sqlalchemy import or_
 from langchain_core.messages import AIMessage
 
 from action.prompts import (
+    AI_ACTION_PROMPT_SOURCE_FILE,
     IMPROVE_REWRITE_NO_RAG_CONTEXT,
+    build_analyze_prompt,
     build_gap_check_prompt,
     build_improve_prompt,
     build_rewrite_prompt,
+    build_summarize_prompt,
 )
 from action.runtime import create_action_runtime
 from action.utils import (
@@ -1193,6 +1196,12 @@ def _render_dynamic_gap_check(gaps: list[dict[str, str]]) -> str:
 
 
 def _build_action_request(payload: AIActionRequest) -> ActionRequest:
+    entity = ""
+    try:
+        raw_e = getattr(payload, "sop_entity_id", None)
+        entity = str(raw_e).strip() if raw_e is not None else ""
+    except Exception:
+        entity = ""
     return ActionRequest(
         document_id=payload.sop_title or "editor-document",
         section_id=(payload.section_name or "selected-text").lower().replace(" ", "-"),
@@ -1200,26 +1209,37 @@ def _build_action_request(payload: AIActionRequest) -> ActionRequest:
         section_title=payload.section_name or "Selected text",
         section_type=payload.section_type or "Selected Text",
         section_text=payload.text,
+        sop_entity_id=entity or None,
     )
 
 
 def _load_uploaded_sop_context(request: ActionRequest) -> dict[str, Any]:
     """
-    Resolve uploaded SOP from DB using SOP number/title and return text context,
-    compact `sop_versions.metadata_json`, and active ProfileDetection snapshot.
+    Resolve uploaded SOP from DB using optional SOP UUID (``sop_entity_id``) or
+    SOP number/title match, and return text context, compact ``sop_versions.metadata_json``,
+    and active ProfileDetection snapshot.
     """
     db = SessionLocal()
     try:
-        sop_ref = str(request.sop_title or "").strip()
-        if not sop_ref:
-            return {"detected": False, "reason": "missing_sop_title"}
+        sop = None
+        entity_raw = str(getattr(request, "sop_entity_id", None) or "").strip()
+        if entity_raw:
+            try:
+                uid = uuid.UUID(entity_raw)
+                sop = db.query(SOP).filter(SOP.id == uid, SOP.is_active == True).first()  # noqa: E712
+            except Exception:
+                sop = None
 
-        sop = db.query(SOP).filter(SOP.is_active == True).filter(  # noqa: E712
-            (SOP.sop_number.ilike(sop_ref)) | (SOP.title.ilike(sop_ref))
-        ).first()
+        if sop is None:
+            sop_ref = str(request.sop_title or "").strip()
+            if not sop_ref:
+                return {"detected": False, "reason": "missing_sop_title"}
+            sop = db.query(SOP).filter(SOP.is_active == True).filter(  # noqa: E712
+                (SOP.sop_number.ilike(sop_ref)) | (SOP.title.ilike(sop_ref))
+            ).first()
 
-        if not sop:
-            return {"detected": False, "reason": "not_found", "query": sop_ref}
+            if not sop:
+                return {"detected": False, "reason": "not_found", "query": sop_ref}
 
         version = None
         if sop.current_version_id:
@@ -1287,7 +1307,7 @@ def _load_uploaded_sop_context(request: ActionRequest) -> dict[str, Any]:
 
 def _ensure_profile_detection_row(sop_ctx: dict[str, Any], action: str) -> None:
     """If no active ProfileDetection row, persist one (NLP + metadata) then refresh sop_ctx."""
-    if action not in ("improve", "rewrite", "gap_check"):
+    if action not in ("improve", "rewrite", "gap_check", "summarize", "analyze"):
         return
     if not sop_ctx.get("detected") or not sop_ctx.get("version_id"):
         return
@@ -1372,6 +1392,23 @@ def _try_client_structured_ai_response(
                 explanation="Applied structured gap analysis from client (validated; no new LLM call).",
                 structured_data={
                     "analysis": txt,
+                    "style_profile": style_profile,
+                    "client_supplied": True,
+                },
+            )
+        if action in ("summarize", "analyze"):
+            txt = str(data.get("improved_text") or data.get("improved_version") or "").strip()
+            if len(txt) < 2:
+                return None
+            ImproveResponse.model_validate({"improved_text": txt})
+            return AIActionResponse(
+                action=action,
+                original_text=request.section_text,
+                suggested_text=_render_dynamic_text(txt),
+                explanation="Applied structured client payload (validated; no new LLM call).",
+                structured_data={
+                    "improved_text": txt,
+                    "improved_version": txt,
                     "style_profile": style_profile,
                     "client_supplied": True,
                 },
@@ -1721,6 +1758,66 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
             original_text=request.section_text,
             suggested_text=_render_dynamic_text(parsed.improved_text),
             explanation="Text verbessert / Text improved.",
+            structured_data={
+                "improved_text": parsed.improved_text,
+                "improved_version": parsed.improved_text,
+                "style_profile": style_profile,
+                "nlp_action_summary": nlp_summary,
+            },
+        )
+
+    if action == "summarize":
+        prompt = build_summarize_prompt(request, context, nlp_block)
+        parsed = parse_with_retry(
+            raw=_call_action_llm(runtime, prompt, input_char_budget=ch_budget, action=action),
+            schema=ImproveResponse,
+            prompt=prompt,
+            call_llm=lambda rp: _call_action_llm(
+                runtime, rp, input_char_budget=ch_budget, action=action
+            ),
+            audit_log=[],
+        )
+        logger.info(
+            "[ai-action-result] action=summarize ok=1 provider=%s model=%s suggested_chars=%s",
+            cfg.provider,
+            cfg.model,
+            len(parsed.improved_text or ""),
+        )
+        return AIActionResponse(
+            action="summarize",
+            original_text=request.section_text,
+            suggested_text=_render_dynamic_text(parsed.improved_text),
+            explanation="Executive summary generated from the current SOP text.",
+            structured_data={
+                "improved_text": parsed.improved_text,
+                "improved_version": parsed.improved_text,
+                "style_profile": style_profile,
+                "nlp_action_summary": nlp_summary,
+            },
+        )
+
+    if action == "analyze":
+        prompt = build_analyze_prompt(request, context, nlp_block)
+        parsed = parse_with_retry(
+            raw=_call_action_llm(runtime, prompt, input_char_budget=ch_budget, action=action),
+            schema=ImproveResponse,
+            prompt=prompt,
+            call_llm=lambda rp: _call_action_llm(
+                runtime, rp, input_char_budget=ch_budget, action=action
+            ),
+            audit_log=[],
+        )
+        logger.info(
+            "[ai-action-result] action=analyze ok=1 provider=%s model=%s suggested_chars=%s",
+            cfg.provider,
+            cfg.model,
+            len(parsed.improved_text or ""),
+        )
+        return AIActionResponse(
+            action="analyze",
+            original_text=request.section_text,
+            suggested_text=_render_dynamic_text(parsed.improved_text),
+            explanation="Compliance-oriented analysis of the current SOP text.",
             structured_data={
                 "improved_text": parsed.improved_text,
                 "improved_version": parsed.improved_text,
@@ -2246,8 +2343,23 @@ async def perform_ai_action(payload: AIActionRequest):
         _truncate_text(raw_in.replace("\n", " "), 220),
     )
 
+    triggered_by = (getattr(payload, "triggered_by", None) or "").strip() or "unknown"
+    logger.info(
+        "[ai-action-prompt-source] action=%s source_file=%s triggered_by=%s",
+        action,
+        AI_ACTION_PROMPT_SOURCE_FILE,
+        triggered_by,
+    )
+
     try:
-        return await asyncio.to_thread(_run_dynamic_ai_action, payload, action)
+        out = await asyncio.to_thread(_run_dynamic_ai_action, payload, action)
+        logger.info(
+            "[ai-action-result] action=%s ok=1 original_len=%s suggested_len=%s",
+            action,
+            len(out.original_text or ""),
+            len(out.suggested_text or ""),
+        )
+        return out
     except HTTPException:
         raise
     except Exception:
@@ -2257,6 +2369,24 @@ async def perform_ai_action(payload: AIActionRequest):
             return _fallback_rewrite(payload)
         if action == "improve":
             return _fallback_improve(payload)
+        if action == "summarize":
+            fb = _fallback_improve(payload)
+            return AIActionResponse(
+                action="summarize",
+                original_text=fb.original_text,
+                suggested_text=fb.suggested_text,
+                explanation="Kurzfassung (Fallback) / Executive summary (fallback).",
+                structured_data=fb.structured_data,
+            )
+        if action == "analyze":
+            fb = _fallback_improve(payload)
+            return AIActionResponse(
+                action="analyze",
+                original_text=fb.original_text,
+                suggested_text=fb.suggested_text,
+                explanation="Analyse (Fallback) / Analysis (fallback).",
+                structured_data=fb.structured_data,
+            )
 
     raise HTTPException(status_code=400, detail=f"Action '{payload.action}' is not supported.")
 

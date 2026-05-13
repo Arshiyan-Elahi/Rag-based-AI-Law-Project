@@ -16,6 +16,18 @@ import {
 } from '../../api/editorApi'
 import { htmlToPlainText, deriveSopTitleFromText, plainTextToTiptapDoc } from '../../utils/chatSopSave'
 import { getAssistantContextStorageKeys, resetAssistantStateOnce } from '../../utils/assistantContext'
+import {
+  EDITOR_AI_ACTIONS,
+  EDITOR_AI_ACTION_STATUS,
+  describeEditorAiResult,
+  detectEditorIntent,
+  dispatchEditorAiActionRequest,
+  editorActionFromChipId,
+  getActiveEditorDocumentId,
+  isEditorRoute,
+  makeEditorAiRequestId,
+  subscribeEditorAiActionResult,
+} from '../../utils/editorAiBridge'
 import './DashboardComponents.css'
 
 const LS_SESSION_BY_PATH = 'cybrain_kl_chat_session_by_path'
@@ -87,7 +99,10 @@ export default function AIWidget() {
   const [pendingDeleteAction, setPendingDeleteAction] = useState(null)
   const [actionToast, setActionToast] = useState('')
   const chatEndRef = useRef(null)
+  const messagesScrollRef = useRef(null)
   const messagesRef = useRef(messages)
+  /** requestId -> { messageId, action } for in-flight editor bridge requests. */
+  const pendingBridgeRef = useRef(new Map())
   const suggestions = routeMeta.suggestions
 
   useEffect(() => {
@@ -132,6 +147,11 @@ export default function AIWidget() {
   }, [messages])
 
   useEffect(() => {
+    const el = messagesScrollRef.current
+    if (el) {
+      el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
+      return
+    }
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, sending])
 
@@ -159,12 +179,137 @@ export default function AIWidget() {
     }
   }, [location.pathname])
 
+  useEffect(() => {
+    const pending = pendingBridgeRef.current
+    const unsubscribe = subscribeEditorAiActionResult((detail) => {
+      const requestId = detail?.requestId
+      if (!requestId) return
+      const entry = pending.get(requestId)
+      if (!entry) return
+      console.info('[kl-editor-bridge-received]', { requestId, status: detail?.status, action: detail?.action })
+      pending.delete(requestId)
+      const statusText = describeEditorAiResult(detail)
+      const isError = detail?.status === EDITOR_AI_ACTION_STATUS.ERROR
+      setMessages((prev) => prev.map((m) => (
+        m.id === entry.messageId
+          ? { ...m, text: statusText, isError, _pendingBridge: false, time: nowTime() }
+          : m
+      )))
+    })
+    return () => {
+      unsubscribe()
+      pending.clear()
+    }
+  }, [])
+
+  /**
+   * Try to handle the message as an editor-side action (rewrite / improve /
+   * gap_check / read of the active SOP) instead of a chat-only RAG query.
+   * Returns true when the message was routed to the editor bridge.
+   */
+  const tryBridgeEditorAction = useCallback((text, userMessage, opts = {}) => {
+    const { explicitAction = null } = opts
+    if (assistantMode !== 'action') return false
+    if (!isEditorRoute(location.pathname)) return false
+    const intent = explicitAction || detectEditorIntent(text)
+    if (!intent) return false
+
+    const activeDocumentId = getActiveEditorDocumentId()
+    if (!activeDocumentId) {
+      const noSopMsg = {
+        id: `no-sop-${Date.now()}`,
+        role: 'ai',
+        text: 'Please open an SOP in the editor first.',
+        tags: [],
+        time: nowTime(),
+      }
+      setMessages((prev) => [...prev, userMessage, noSopMsg])
+      setInput('')
+      return true
+    }
+
+    const placeholderId = `bridge-${Date.now()}`
+    const placeholderText =
+      intent === EDITOR_AI_ACTIONS.READ
+        ? 'Bestätige aktive SOP im Editor…'
+        : intent === EDITOR_AI_ACTIONS.GAP_CHECK
+          ? 'Gap Check im Editor wird vorbereitet…'
+          : intent === EDITOR_AI_ACTIONS.IMPROVE
+            ? 'Verbesserungen werden im Editor vorbereitet…'
+            : intent === EDITOR_AI_ACTIONS.SUMMARIZE
+              ? 'Zusammenfassung wird im Editor vorbereitet…'
+              : intent === EDITOR_AI_ACTIONS.ANALYZE
+                ? 'Analyse wird im Editor vorbereitet…'
+                : intent === EDITOR_AI_ACTIONS.COMPARE
+                  ? 'Versionsvergleich wird geöffnet…'
+                  : 'Rewrite wird im Editor vorbereitet…'
+    const placeholderMsg = {
+      id: placeholderId,
+      role: 'ai',
+      text: placeholderText,
+      tags: [],
+      time: nowTime(),
+      _pendingBridge: true,
+    }
+    setMessages((prev) => [...prev, userMessage, placeholderMsg])
+
+    const requestId = makeEditorAiRequestId()
+    pendingBridgeRef.current.set(requestId, { messageId: placeholderId, action: intent })
+    dispatchEditorAiActionRequest({
+      action: intent,
+      prompt: text || '',
+      requestId,
+      source: 'kl_assistant',
+    })
+
+    window.setTimeout(() => {
+      const stillPending = pendingBridgeRef.current.get(requestId)
+      if (!stillPending) return
+      pendingBridgeRef.current.delete(requestId)
+      setMessages((prev) => prev.map((m) => (
+        m.id === stillPending.messageId
+          ? { ...m, text: 'Editor-Aktion hat zu lange gedauert. Bitte erneut versuchen.', isError: true, _pendingBridge: false }
+          : m
+      )))
+    }, 360000)
+
+    return true
+  }, [assistantMode, location.pathname])
+
+  const handleQuickActionChip = useCallback((chip) => {
+    console.info('[kl-action-chip-click]', { chipId: chip.id, label: chip.label, mode: assistantMode })
+    if (assistantMode !== 'action' || !isEditorRoute(location.pathname)) {
+      setInput(chip.text)
+      return
+    }
+    const explicit = editorActionFromChipId(chip.id)
+    const userMsg = { id: Date.now(), role: 'user', text: chip.text }
+    if (explicit && tryBridgeEditorAction(chip.text, userMsg, { explicitAction: explicit })) {
+      return
+    }
+    if (tryBridgeEditorAction(chip.text, userMsg)) {
+      return
+    }
+    setInput(chip.text)
+  }, [assistantMode, location.pathname, tryBridgeEditorAction])
+
   const sendMessage = useCallback(async (text, opts = {}) => {
     const trimmed = text.trim()
     if (!trimmed || sending) return
 
     // Append user message immediately
     const userMsg = { id: Date.now(), role: 'user', text: trimmed }
+
+    // Editor-bridge fast path: when the user is in the SOP editor and the
+    // message clearly targets the active SOP (rewrite/improve/gap_check/read),
+    // run the structured /api/ai/action flow against the editor instead of a
+    // chat-only RAG response. Chat output is then a status line confirming
+    // the editor change so the assistant stays editor-connected.
+    if (!opts.assistantActionConfirmation && tryBridgeEditorAction(trimmed, userMsg)) {
+      setInput('')
+      return
+    }
+
     setMessages(prev => [...prev, userMsg])
     setInput('')
     setSending(true)
@@ -241,7 +386,7 @@ export default function AIWidget() {
     } finally {
       setSending(false)
     }
-  }, [sending, location.pathname, navigate, emitSOPRefresh, showToast, clearAssistantActiveContext, assistantMode])
+  }, [sending, location.pathname, navigate, emitSOPRefresh, showToast, clearAssistantActiveContext, assistantMode, tryBridgeEditorAction])
 
   const handleSend = () => sendMessage(input)
 
@@ -368,9 +513,10 @@ export default function AIWidget() {
                 type="button"
                 className="ai-action-chip"
                 disabled={sending}
-                onClick={() => setInput(c.text)}
+                aria-label={c.label}
+                onClick={() => handleQuickActionChip(c)}
               >
-                {c.label}
+                <span className="ai-action-chip__text">{c.label}</span>
               </button>
             ))}
           </div>
@@ -401,7 +547,7 @@ export default function AIWidget() {
       <div className="ai-widget-divider" />
 
       {/* Chat messages (DB-backed when authenticated) */}
-      <div className="ai-messages-section">
+      <div className="ai-messages-section" ref={messagesScrollRef}>
         {messages.map((m, idx) => (
           <div
             key={m.id}

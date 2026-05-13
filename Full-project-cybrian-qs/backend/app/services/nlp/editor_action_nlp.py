@@ -50,7 +50,7 @@ def build_nlp_bundle_for_action(
     combined = "\n\n".join(parts).strip()
 
     reuse_improve_rewrite = bool(
-        profile and action in ("improve", "rewrite") and _profile_nlp_usable(profile)
+        profile and action in ("improve", "rewrite", "summarize", "analyze") and _profile_nlp_usable(profile)
     )
 
     if reuse_improve_rewrite and profile is not None:

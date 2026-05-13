@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -205,6 +206,8 @@ def persist_chat_query_exchange(
             "route": (route or "")[:500] or None,
         }
 
+        pair_t0 = datetime.now(timezone.utc)
+        pair_t1 = pair_t0 + timedelta(milliseconds=1)
         user_msg = ChatMessage(
             session_id=session_row.id,
             role="user",
@@ -214,6 +217,7 @@ def persist_chat_query_exchange(
             metadata_snapshot=meta_snap,
             action_metadata=trace_meta,
             category_filter=cat_filter,
+            created_at=pair_t0,
         )
         asst_msg = ChatMessage(
             session_id=session_row.id,
@@ -224,6 +228,7 @@ def persist_chat_query_exchange(
             metadata_snapshot=meta_snap,
             action_metadata=trace_meta,
             category_filter=cat_filter,
+            created_at=pair_t1,
         )
         db.add(user_msg)
         db.add(asst_msg)

@@ -1,0 +1,46 @@
+# Validates Docker images for Cybrain QS build on every change under Full-project-cybrian-qs/.
+name: CI Docker
+
+on:
+  pull_request:
+    paths:
+      - "Full-project-cybrian-qs/**"
+      - ".github/workflows/ci-docker.yml"
+      - ".github/workflows/deploy-vps.yml"
+  push:
+    branches: [main, master]
+    paths:
+      - "Full-project-cybrian-qs/**"
+      - ".github/workflows/ci-docker.yml"
+      - ".github/workflows/deploy-vps.yml"
+
+concurrency:
+  group: ci-docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Prepare backend/.env for compose
+        run: |
+          set -e
+          if [ ! -f Full-project-cybrian-qs/backend/.env ]; then
+            cp Full-project-cybrian-qs/backend/.env.example Full-project-cybrian-qs/backend/.env
+          fi
+          if [ ! -f Full-project-cybrian-qs/.env ]; then
+            cp Full-project-cybrian-qs/.env.compose.example Full-project-cybrian-qs/.env
+          fi
+
+      - name: Docker Compose config
+        working-directory: Full-project-cybrian-qs
+        run: docker compose config
+
+      - name: Build images
+        working-directory: Full-project-cybrian-qs
+        run: docker compose build --parallel

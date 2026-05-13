@@ -7,6 +7,8 @@ const TITLES = {
   gap_check: 'QA Gap Check',
   rewrite: 'SOP Rewrite Preview',
   improve: 'Improvement Preview',
+  summarize: 'Executive Summary Preview',
+  analyze: 'Compliance Analysis Preview',
 }
 
 const StructuredDetails = ({ action, structuredData, suggestedText }) => {

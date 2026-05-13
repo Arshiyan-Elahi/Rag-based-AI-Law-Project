@@ -3,6 +3,7 @@ from uuid import UUID
 import logging
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
+from sqlalchemy import case
 from sqlalchemy.orm import Session
 
 from .auth_routes import get_current_user, get_current_user_optional
@@ -105,7 +106,12 @@ def list_messages(
     messages = (
         db.query(ChatMessage)
         .filter(ChatMessage.session_id == session_id)
-        .order_by(ChatMessage.created_at.asc())
+        .order_by(
+            ChatMessage.created_at.asc(),
+            # User and assistant rows from the same exchange often share identical
+            # server_default timestamps; tie-break so user always precedes assistant.
+            case((ChatMessage.role == "user", 0), else_=1).asc(),
+        )
         .all()
     )
     logger.info(

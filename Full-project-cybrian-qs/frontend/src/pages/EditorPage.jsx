@@ -24,6 +24,7 @@ import SOPMetadataPanel from '../components/Editor/SOP/SOPMetadataPanel'
 import LinkModal from '../components/Common/LinkModal'
 import LinkingModal from '../components/Common/LinkingModal'
 import EditorToolbarSection from '../components/Editor/EditorToolbarSection'
+import EditorAIBridge from '../components/Editor/EditorAIBridge'
 import StatusBar from '../components/Editor/StatusBar'
 import AIWidget from '../components/Dashboard/AIWidget'
 import FloatingAskAIButton from '../components/Common/FloatingAskAIButton'
@@ -475,6 +476,15 @@ const EditorPage = ({
   }, [documentId, sopStatus])
 
   useEffect(() => {
+    if (!documentId) return
+    try {
+      localStorage.setItem(STORAGE_KEY, documentId)
+    } catch {
+      // ignore
+    }
+  }, [documentId])
+
+  useEffect(() => {
     if (!initialDocId || !openRequestKey || !editor || !isEditorMounted || editor.isDestroyed) return
     // Explicit re-hydration when user clicks Open/Open again for the same tab.
     // This updates metadata for mounted editor tabs without affecting normal typing flow.
@@ -625,6 +635,17 @@ const EditorPage = ({
     }, 1600),
     [persistDocument]
   )
+
+  const handleAfterAiBridgeApply = useCallback(() => {
+    try {
+      debouncedSave.flush()
+    } catch {
+      // ignore
+    }
+    persistDocument({ showSavingIndicator: false }).catch((err) => {
+      console.error('[kl-editor-action] persist after AI apply', err)
+    })
+  }, [debouncedSave, persistDocument])
 
   useEffect(() => {
     if (!editor || !isEditorMounted || editor.isDestroyed) return
@@ -801,6 +822,7 @@ const EditorPage = ({
     ...metadata,
     title: metadata?.title?.trim() || 'Untitled SOP',
     documentId: metadata?.documentId || documentId || 'SOP-NEW',
+    sop_entity_id: documentId || null,
   }), [metadata, documentId])
 
   const openLinkModal = () => {
@@ -908,6 +930,53 @@ const EditorPage = ({
     }
   }, [documentId, compareBaseVersionId, compareTargetVersionId])
 
+  const openCompareFromAssistant = useCallback(async () => {
+    if (!documentId) {
+      const msg = 'Bitte öffnen Sie zuerst eine SOP im Editor.'
+      window.alert(msg)
+      throw new Error(msg)
+    }
+    if (!versions.length) {
+      const msg = 'Keine Versionen zum Vergleichen.'
+      window.alert(msg)
+      throw new Error(msg)
+    }
+    const sorted = [...versions].sort(
+      (a, b) => (Number(a.versionNumber) || 0) - (Number(b.versionNumber) || 0),
+    )
+    const base = sorted[0]
+    const target = sorted[sorted.length - 1]
+    if (!base?.id || !target?.id || base.id === target.id) {
+      const msg =
+        'Nur eine Version vorhanden. Bitte im Editor zwei Versionen in der Werkzeugleiste wählen und den Versionsvergleich dort starten.'
+      window.alert(msg)
+      throw new Error(msg)
+    }
+    try {
+      const [baseVersion, targetVersion] = await Promise.all([
+        getVersion(documentId, base.id),
+        getVersion(documentId, target.id),
+      ])
+      setDiffVersions({
+        oldVersion: {
+          id: base.id,
+          versionNumber: base.versionNumber || 1,
+          json: baseVersion.doc_json || EMPTY_DOC,
+        },
+        newVersion: {
+          id: target.id,
+          versionNumber: target.versionNumber || 1,
+          json: targetVersion.doc_json || EMPTY_DOC,
+        },
+      })
+    } catch (error) {
+      console.error('Failed to compare versions from assistant:', error)
+      const msg = error?.message || 'Versionsvergleich fehlgeschlagen.'
+      window.alert(msg)
+      throw error instanceof Error ? error : new Error(msg)
+    }
+  }, [documentId, versions])
+
   if (!editor || !isEditorMounted || editor.isDestroyed) {
     return <div className="editor-loading">Loading editor...</div>
   }
@@ -1001,6 +1070,15 @@ const EditorPage = ({
                         onPreviewSessionChange={handleAiPreviewSessionChange}
                       />
                     </Suspense>
+                    <EditorAIBridge
+                      editor={editor}
+                      documentId={documentId}
+                      sopMetadata={aiSopContext}
+                      isEditable={!isHistoricalView && isEditorMounted}
+                      onPreviewSessionChange={handleAiPreviewSessionChange}
+                      onAfterApply={handleAfterAiBridgeApply}
+                      onVersionCompareRequest={openCompareFromAssistant}
+                    />
                   </div>
                 </EditorSurfaceErrorBoundary>
               </section>

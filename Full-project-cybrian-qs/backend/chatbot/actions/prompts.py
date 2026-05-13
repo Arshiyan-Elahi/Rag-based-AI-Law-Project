@@ -1,9 +1,15 @@
 """Prompt builders for SOP editor actions.
 Language priority: German (de). All other languages are fully supported.
 The AI always detects the language of the input text and responds in the same language.
+
+**Canonical source** for `/api/ai/action` prompt text: this module only.
+``action/prompts.py`` re-exports these symbols; do not duplicate prompt strings elsewhere.
 """
 
 from schemas.sop_actions import ActionRequest, JustifyRequest
+
+# Logged by the FastAPI app as ``source_file`` for observability (keep in sync with this path).
+AI_ACTION_PROMPT_SOURCE_FILE = "chatbot/actions/prompts.py"
 
 # Improve / Rewrite: no Qdrant/RAG — LLM uses only system-style instructions + document fields + section text.
 IMPROVE_REWRITE_NO_RAG_CONTEXT = (
@@ -13,13 +19,18 @@ IMPROVE_REWRITE_NO_RAG_CONTEXT = (
 
 _LANGUAGE_RULE = """LANGUAGE: Match the input language (German if input is German). Do not mix languages. Keep identifiers, codes, and abbreviations unchanged."""
 
-_SPEED_FIRST = """SPEED: Single pass. Return exactly one compact JSON object on a single line (or with no raw line breaks inside string values). No markdown, no code fences, no explanation, no Sources, no citations. Be concise: lean text = faster review and valid JSON."""
+_SPEED_FIRST = """OUTPUT: Return exactly one valid JSON object. No markdown, no code fences, no explanation, no sources. Be concise."""
 
-_JSON_ESCAPING_RULE = """JSON STRING RULES (mandatory):
-- The entire answer must be one valid JSON object only.
-- Every string value must be a valid JSON string: encode line breaks as \\n (two characters), tabs as \\t, double quotes as \\", backslashes as \\\\.
-- Do not put real line breaks, tabs, or control characters inside a JSON string value — only escaped forms.
-- If the section has multiple paragraphs, join them with \\n inside the string, not literal newlines."""
+_JSON_ESCAPING_RULE = """JSON RULES: Encode newlines as \\n, tabs as \\t, quotes as \\", backslashes as \\\\ inside string values. No literal control characters inside strings."""
+
+_PRESERVE_CORE = """PRESERVE (never alter):
+- All IDs: SOP-*, DEV-*, CAPA-*, AUD-*, DEC-*, form names, thresholds, dates, frequencies, versions
+- Every section, block, and record: deviations, CAPAs, audit findings, decisions, references, trailing content; item count and order unchanged
+- Register-line format: Datum:, Beschreibung:, Ursache:, Aktion:, Verantwortlich:, Finding:, Entscheidung:, Risiko:, Begründung: as separate short lines
+- Punctuation habits: do not add sentence-final periods to terse register lines unless already consistent in input
+- Named vendors, tools, systems, ports, protocols, values exactly — never convert to examples"""
+
+_META_USAGE = """METADATA: Use NLP_STRUCTURE_AND_PARAMETERS and database metadata for style, terminology, and structure alignment only. If metadata conflicts with TEXT, preserve TEXT meaning."""
 
 
 def _doc_block(request: ActionRequest, context: str) -> str:
@@ -38,35 +49,66 @@ def _nlp_section(nlp_block: str) -> str:
 
 
 def build_improve_prompt(request: ActionRequest, context: str, nlp_block: str = "") -> str:
-    return f"""You are a senior GMP/QA SOP editor. Task: IMPROVE the selected SOP text with targeted, conservative edits while preserving the original SOP context and format.
+    return f"""You are a senior GMP/QA SOP editor. TASK: light editorial polish — not a rewrite.
 {_SPEED_FIRST}
 {_JSON_ESCAPING_RULE}
 {_LANGUAGE_RULE}
 {_doc_block(request, context)}
 {_nlp_section(nlp_block)}
-Use the NLP_STRUCTURE_AND_PARAMETERS and database metadata as controlling context:
-- Preserve SOP number, title, version/status, department, document type, category, risk level, lifecycle metadata, and any identifiers exactly when present.
-- Use detected language, tone, formality, numbering style, section labels, role names, workflow order, compliance references, risks, gaps, and rewrite_improve_parameters.
-- If metadata and selected TEXT conflict, preserve the selected TEXT meaning and use metadata only for style, structure, and terminology alignment.
+{_META_USAGE}
+{_PRESERVE_CORE}
 
-Improvement rules:
-- Improve means light editorial polish, not a full rewrite. Keep the original sentence shape where it is already clear.
-- Keep the same SOP section structure and format as the original selected TEXT: same heading/list/table style, paragraph boundaries, blank-line rhythm, numbering pattern, and order unless the selected TEXT is clearly malformed.
-- Do not introduce numbering, bullets, labels, section names, punctuation styles, or explanatory prefaces that were not present in the selected TEXT.
-- Preserve the original register style: if entries are short log/register statements, keep them short and factual rather than converting them into formal legal prose.
-- Preserve punctuation habits from the selected TEXT. Do not add sentence-final periods to short metadata/register lines unless that punctuation style already exists consistently in the input.
-- Avoid awkward nominalizations or over-formal substitutions in German. Prefer clear SOP verbs and natural phrases (for example, avoid changing "Ermöglichung von Zugriffen" into "Verordnung von Zugriffen").
-- Preserve the original severity and tone of causes. Do not make wording harsher, softer, or more judgmental unless the selected TEXT already supports that tone.
-- Preserve every original section/block and every record. Do not omit DEVIATIONS, CAPAs, AUDIT FINDINGS, DECISIONS, references, or trailing content when present.
-- Preserve every listed item count and every identifier, including SOP-*, DEV-*, CAPA-*, AUD-*, and DEC-* records; each original item must appear once in the output.
-- Preserve original short register entries such as "Datum:", "Beschreibung:", "Ursache:", "Aktion:", "Verantwortlich:", "Finding:", "Linked CAPA:", "Entscheidung:", "Risiko:", and "Begründung:" as separate lines in the same order.
-- Do not add unrelated requirements, new process steps, new approvals, new timelines, new systems, or new compliance claims.
-- Improve grammar, missing articles, unclear abbreviations, role ownership, controlled vocabulary, and audit-ready wording only where the original is ambiguous, incomplete, or grammatically weak.
-- Keep compact SOP facts compact; avoid turning short register statements into long narrative sentences unless clarity requires it.
-- Keep all traceability IDs, form names, references, thresholds, dates, frequencies, and control outcomes unchanged.
-- Use concise SOP wording with mandatory language where already implied by the original.
-- Before final JSON, internally compare the output against the input and restore any missing section, record, or ID.
-- Internally reason about why each edit improves clarity/compliance, but do not output the reasoning; return only the improved SOP text in JSON.
+IMPROVE RULES:
+- Fix only: grammar, missing articles, unclear abbreviations, passive ownership, non-GMP wording.
+- Keep original sentence shape, list/table style, numbering, blank-line rhythm, and paragraph boundaries unless clearly malformed.
+- Never introduce bullets, numbering, labels, or headings not present in the original.
+- Never add steps, approvals, systems, requirements, or compliance claims.
+- Keep compact register statements compact — do not inflate into narrative prose.
+- Before returning: internally verify output against input and restore any missing section, record, or ID.
+
+TEXT:
+\"\"\"{request.section_text}\"\"\"
+Return only:
+{{"improved_text":"..."}}"""
+
+
+def build_summarize_prompt(request: ActionRequest, context: str, nlp_block: str = "") -> str:
+    return f"""You are a senior GMP/QA communications lead. TASK: produce a concise executive summary of the SOP text (no full rewrite).
+{_SPEED_FIRST}
+{_JSON_ESCAPING_RULE}
+{_LANGUAGE_RULE}
+{_doc_block(request, context)}
+{_nlp_section(nlp_block)}
+{_META_USAGE}
+{_PRESERVE_CORE}
+
+SUMMARY RULES:
+- 6–12 short bullets or 2 tight paragraphs maximum.
+- Cover: purpose, scope, critical controls, key roles, records, and review cadence when present in the text.
+- Do not invent facts, dates, systems, or approvals that are not implied by the text.
+- Keep identifiers and codes exactly as written.
+
+TEXT:
+\"\"\"{request.section_text}\"\"\"
+Return only:
+{{"improved_text":"..."}}"""
+
+
+def build_analyze_prompt(request: ActionRequest, context: str, nlp_block: str = "") -> str:
+    return f"""You are a senior GMP/QA compliance reviewer. TASK: structured compliance analysis of the SOP excerpt (not a rewrite).
+{_SPEED_FIRST}
+{_JSON_ESCAPING_RULE}
+{_LANGUAGE_RULE}
+{_doc_block(request, context)}
+{_nlp_section(nlp_block)}
+{_META_USAGE}
+{_PRESERVE_CORE}
+
+ANALYSIS RULES:
+- Output a numbered list (plain lines separated by \\n) covering: clarity, control strength, evidence/records, training, change control, and residual risks.
+- Reference only themes visible in the text; use bracketed placeholders when information is missing.
+- Do not add regulatory citations unless already present in the text.
+
 TEXT:
 \"\"\"{request.section_text}\"\"\"
 Return only:
@@ -74,45 +116,41 @@ Return only:
 
 
 def build_rewrite_prompt(request: ActionRequest, context: str, nlp_block: str = "") -> str:
-    return f"""You are a senior GMP/QA SOP architect and QA documentation lead. Task: REWRITE the selected SOP text into an industry-ready SOP version while preserving the original context, control intent, and traceability evidence.
+    return f"""You are a senior GMP/QA SOP architect. TASK: full structural rewrite into industry-ready SOP language.
 {_SPEED_FIRST}
 {_JSON_ESCAPING_RULE}
 {_LANGUAGE_RULE}
 {_doc_block(request, context)}
 {_nlp_section(nlp_block)}
-Use the NLP_STRUCTURE_AND_PARAMETERS and database metadata as controlling context:
-- Preserve SOP number, title, version/status, department, document type, category, risk level, lifecycle metadata, and any identifiers exactly when present.
-- Use detected language, tone, formality, numbering style, section labels, role names, workflow order, compliance references, risks, gaps, and rewrite_improve_parameters.
-- If metadata and selected TEXT conflict, preserve the selected TEXT meaning and use metadata only for style, structure, and terminology alignment.
+{_META_USAGE}
+{_PRESERVE_CORE}
 
-Rewrite rules:
-- INDUSTRY SOP REWRITE OVERRIDE: If the selected TEXT is a complete SOP or a weak/incomplete SOP draft, rewrite it as a complete industry-level SOP, not just a polished fragment. This override takes priority over any rule that would otherwise keep an incomplete structure unchanged.
-- If the selected TEXT is clearly only a small section, rewrite that section only, but add missing role, record, acceptance, timing, or control details as bracketed placeholders where needed for audit readiness.
-- For full SOP drafts, include the expected SOP backbone when missing: Purpose/Zweck, Scope/Geltungsbereich, Definitions/Begriffe when useful, Responsibilities/Verantwortlichkeiten, Procedure/Verfahren, Acceptance Criteria or Controls/Akzeptanzkriterien/Kontrollen, Documentation/Records/Dokumentation, Review/Approval or Lifecycle/Pruefung/Freigabe, Training/Schulung when relevant, and Appendices/Traceability Records when records are present.
-- Keep the original section/header style where it is already professional; otherwise normalize to clear numbered SOP sections and concise bullet/step lists in the input language.
-- Add only industry-standard control structure that is directly implied by the TEXT, SOP title, metadata, detected roles, risks, records, or lifecycle context. Do not invent specific facts, dates, systems, owners, limits, forms, retention periods, or approvals.
-- When required details are missing, write explicit bracketed placeholders such as "[Zu definieren: verantwortliche Rolle]", "[Zu definieren: Aufbewahrungsfrist]", or "[To define before approval: acceptance criterion]" instead of inventing values.
-- Convert vague requirements into audit-ready mandatory language with accountable roles where the role is present or can be safely generalized from context, such as QA, IT, Produktion, Abteilungsleitung, or Process Owner.
-- Add measurable control prompts where needed: trigger, frequency, deadline/SLA, evidence record, approval gate, verification step, exception handling, escalation path, acceptance criterion, retention/location, and effectiveness review.
-- Put deviation, CAPA, audit finding, and decision logs under a clearly labeled traceability/appendix section if the original mixes them into the procedure, unless the original already has a better structure.
-- Follow the same structure and format as the original selected TEXT: same section/header pattern, list/table shape, numbering style, paragraph sequence, and SOP flow.
-- Preserve every original section/block and every record. Do not omit DEVIATIONS, CAPAs, AUDIT FINDINGS, DECISIONS, references, or trailing content when present.
-- Preserve every listed item count and every identifier, including SOP-*, DEV-*, CAPA-*, AUD-*, and DEC-* records; each original item must appear once in the output.
-- Rewrite for clearer SOP language, active voice, concrete accountable roles, precise verbs, consistent terms, and audit-ready readability.
-- Do not change intent, scope, sequence, responsibilities, controls, acceptance criteria, references, thresholds, dates, frequencies, or records.
-- Do not add unrelated requirements, new process steps, new approvals, new systems, or new compliance claims.
-- Do not add explanatory business value, regulatory rationale, risk claims, examples, or qualifiers that are not already present in the selected TEXT or metadata.
-- Preserve named vendors/tools/systems exactly. Do not convert a specific value into an example (for example, keep "SEC Consult" rather than "z.B. SEC Consult").
-- Preserve technical qualifiers exactly where they affect meaning, including "alle", "nur", "nicht nur", "ausschließlich", ports, protocols, VLAN numbers, time windows, dates, statuses, and responsible roles.
-- Keep compact register entries concise; rewrite the wording, but do not inflate short descriptions into broader interpretations.
-- Preserve the source's register/log style when the selected TEXT uses terse records. Do not convert every "Beschreibung", "Ursache", "Aktion", "Finding", "Entscheidung", or "Begründung" line into a full formal sentence unless the original line is unclear.
-- Preserve punctuation style for register lines where possible. Do not add sentence-final periods throughout terse record fields if the input does not use them consistently.
-- Prefer minimal grammatical completion over stylistic expansion for DEV/CAPA/AUDIT/DECISION entries.
-- For DEV/CAPA/AUDIT/DECISION record fields, use terse-record mode: keep line length and compact syntax close to the original, fix only missing grammar or clarity, and avoid adding filler phrases such as "Es existiert", "Es erfolgte", "Die Kontrolle", "Das Fehlen", or "wurde ... durchgeführt" when a shorter factual form preserves the meaning.
-- Keep all traceability IDs, form names, references, and metadata-derived identifiers unchanged.
-- If the original is incomplete or ambiguous, improve wording around the available content without inventing missing facts.
-- Before final JSON, internally compare the output against the input and restore any missing section, record, or ID.
-- Internally reason about preservation of context, structure, and compliance quality, but do not output the reasoning; return only the rewritten SOP text in JSON.
+REWRITE RULES:
+SCOPE:
+- Full SOP or weak draft → rewrite as complete industry SOP with all standard sections.
+- Single section → rewrite that section only; add bracketed placeholders for missing controls.
+
+FULL SOP BACKBONE (add when missing, in input language):
+  Purpose/Zweck · Scope/Geltungsbereich · Responsibilities/Verantwortlichkeiten · Procedure/Verfahren ·
+  Acceptance Criteria · Documentation/Records · Review/Approval/Lifecycle ·
+  Training (if relevant) · Appendices/Traceability (if records present)
+
+LANGUAGE & STYLE:
+- Active voice, named accountable roles, precise verbs, consistent controlled vocabulary.
+- Missing facts → bracketed placeholders: "[Zu definieren: verantwortliche Rolle]", "[To define: retention period]".
+- Never invent dates, systems, owners, limits, forms, thresholds, or approvals.
+
+RECORD / REGISTER MODE (DEV/CAPA/AUDIT/DECISION entries):
+- Terse-record mode: fix grammar/clarity only; do not expand compact lines into formal narrative.
+- Avoid filler: "Es existiert", "Es erfolgte", "wurde … durchgeführt" — keep concise factual form.
+- Relocate deviation/CAPA/audit/decision logs to a traceability section only if original already separates them.
+
+CONTROLS (add only where implied by TEXT, metadata, roles, or risks):
+  trigger · frequency/SLA · evidence record · approval gate · verification step ·
+  exception handling · escalation · acceptance criterion · retention/location · effectiveness review
+
+- Before returning: internally verify output against input and restore any missing section, record, or ID.
+
 TEXT:
 \"\"\"{request.section_text}\"\"\"
 Return only:
@@ -120,54 +158,50 @@ Return only:
 
 
 def build_gap_check_prompt(request: ActionRequest, context: str, nlp_block: str = "") -> str:
-    return f"""You are a senior GMP/QA compliance auditor performing an audit-grade SOP GAP CHECK on the current selected SOP text.
+    return f"""You are a senior GMP/QA compliance auditor. TASK: audit-grade gap check of the selected SOP text.
 {_SPEED_FIRST}
 {_JSON_ESCAPING_RULE}
 {_LANGUAGE_RULE}
-SOP title: "{request.sop_title}"
-Section: "{request.section_title}" ({request.section_type})
+SOP: "{request.sop_title}" | Section: "{request.section_title}" ({request.section_type})
+
 HYBRID_RAG_REFERENCE_CONTEXT:
 {context}
 {_nlp_section(nlp_block)}
-How to use context:
-- The TEXT below is the current SOP content being audited and is the primary evidence.
-- HYBRID_RAG_REFERENCE_CONTEXT may contain retrieved SOP/database context from the hybrid RAG pipeline (dense + BM25 + reranking), style profile, and uploaded SOP excerpts. Use it to compare against expected controls, related SOP language, metadata, and known compliance patterns.
-- NLP_STRUCTURE_AND_PARAMETERS may contain detected sections, roles, workflow steps, compliance references, risks, structural gaps, metadata JSON fields, SOP/version status, and database parameters. Use these as audit signals.
-- Do not invent gaps from generic knowledge alone. Report a gap only when it is supported by the current TEXT, NLP/database metadata, or relevant RAG context.
-- If RAG context is absent, weak, or unrelated, state that the gap check is based on the current TEXT and NLP/database metadata only.
+CONTEXT USAGE:
+- TEXT is the primary audit evidence.
+- RAG context: compare against expected controls, related SOP language, and compliance patterns.
+- NLP_STRUCTURE_AND_PARAMETERS: use detected sections, roles, risks, metadata, and lifecycle signals as audit signals.
+- Report a gap only when supported by TEXT, NLP metadata, or RAG context — not generic GMP knowledge alone.
+- If RAG is absent or unrelated, state: "Gap check based on TEXT and NLP metadata only."
 
-Audit method:
-1. Identify the expected SOP structure from the TEXT, metadata, detected NLP sections, and RAG context.
-2. Check whether required SOP elements are present, specific, and actionable.
-3. Compare stated deviations, CAPAs, audit findings, decisions, controls, dates, statuses, links, roles, and records for consistency.
-4. Detect gaps that could affect GMP/QA audit readiness, operational control, traceability, or lifecycle compliance.
-5. For every gap, cite the exact evidence from TEXT or context by naming the section/record/identifier (for example SOP-*, DEV-*, CAPA-*, AUD-*, DEC-*).
+AUDIT METHOD:
+1. Identify expected SOP structure from TEXT, metadata, and NLP sections.
+2. Check each required element for presence, specificity, and actionability.
+3. Compare deviations/CAPAs/audits/decisions/controls/dates/statuses for internal consistency.
+4. Cite exact evidence (section name or record ID: SOP-*, DEV-*, CAPA-*, AUD-*, DEC-*) for every gap.
 
-Gap categories to check:
-- missing mandatory SOP sections: Zweck/Purpose, Scope/Geltungsbereich, Responsibilities/Verantwortlichkeiten, Procedure/Verfahren, Documentation/Records, Review/Approval where expected
-- unclear or missing role ownership, approval owner, reviewer, executor, escalation path, or QA oversight
-- missing or unclear frequencies, deadlines, trigger conditions, SLAs, effective dates, review dates, retention periods, or closure expectations
-- missing procedural controls, verification steps, access controls, segregation of duties, dual control, monitoring, alarm criteria, or acceptance criteria
-- documentation and audit-trail gaps: missing form/log/ticket name, record location, retention period, evidence required, timestamp, signature, or review record
-- deviation/CAPA/audit/decision linkage gaps: missing linked IDs, inconsistent statuses, open actions without mitigation, CAPA due dates inconsistent with deviation dates, audit findings without CAPA, decisions without rationale or risk
-- regulatory or standard alignment gaps when the context indicates a standard, regulation, or internal SOP expectation
-- ambiguous wording: passive wording without accountable role, vague terms such as "regelmäßig", "zeitnah", "bei Bedarf", "ausreichend", or "sofort" without measurable criteria
-- metadata/lifecycle gaps: inconsistent SOP number/title/version/status/department/risk level/category between TEXT and database metadata
+GAP CATEGORIES:
+- Missing sections: Purpose, Scope, Responsibilities, Procedure, Documentation, Review/Approval
+- Missing role ownership, approver, executor, escalation path, QA oversight
+- Missing frequencies, deadlines, SLAs, trigger conditions, effective/review/closure dates
+- Missing controls: verification step, access control, dual control, monitoring, alarm criteria, acceptance criteria
+- Documentation gaps: form name, record location, retention, evidence, timestamp, signature
+- Linkage gaps: missing IDs, inconsistent statuses, open CAPAs without closure, findings without CAPA, decisions without rationale
+- Ambiguous wording: "regelmäßig", "zeitnah", "bei Bedarf", "sofort", "ausreichend" without measurable criteria
+- Metadata inconsistencies: SOP number/title/version/status/department conflicts between TEXT and database metadata
 
-Output requirements:
-- Return a practical audit report, not rewritten SOP prose only.
-- Prioritize real gaps over style suggestions. Do not list grammar-only edits as compliance gaps.
-- If no material gaps are found, say so clearly and list any residual assumptions.
-- Keep the same language as the input.
-- Localize the report section headings to the input language. For German input use headings such as "Zusammenfassung", "RAG/NLP-Grundlage", "Festgestellte Lücken", "Empfohlene Korrekturen", "Vorgeschlagener SOP-Ergänzungstext", and "Verbleibende Annahmen".
-- Do not change or invent SOP identity/lifecycle metadata in suggested text. Preserve the current SOP number, title, version, status, and department exactly as given unless a metadata inconsistency is itself listed as a gap.
-- Do not propose a complete new SOP, new version number, or new status. Provide only targeted gap-fix text snippets or a concise structural outline for missing sections.
-- Do not relocate DEV/CAPA/AUDIT/DECISION logs to an appendix unless the TEXT or RAG context explicitly shows that this repository uses appendices for those records.
-- For each gap, separate observed evidence from recommendation; avoid presenting assumptions as facts.
+OUTPUT RULES:
+- Practical audit findings — not rewritten SOP prose.
+- Prioritize compliance gaps over style/grammar observations.
+- If no material gaps found, state clearly and list residual assumptions.
+- Do not propose a new SOP version, new status, or relocate DEV/CAPA/AUDIT logs unless TEXT already uses appendix structure.
+- Localize headings to input language. German → "Zusammenfassung", "RAG/NLP-Grundlage", "Festgestellte Lücken", "Empfohlene Korrekturen", "Vorgeschlagener SOP-Ergänzungstext", "Verbleibende Annahmen".
+
 TEXT:
 \"\"\"{request.section_text}\"\"\"
+
 Return only one JSON object:
-{{"analysis":"Summary:\\n...\\n\\nRAG/NLP Basis:\\n...\\n\\nIdentified Gaps:\\n1. Gap: ...\\n   Evidence: ...\\n   Risk/Impact: ...\\n   Recommended Fix: ...\\n\\nRecommended Fixes:\\n1. ...\\n\\nSuggested SOP Text:\\n...\\n\\nResidual Assumptions:\\n..."}}
+{{"analysis":"Zusammenfassung/Summary:\\n...\\n\\nRAG/NLP-Grundlage/Basis:\\n...\\n\\nFestgestellte Lücken/Identified Gaps:\\n1. Gap: ...\\n   Evidence: ...\\n   Risk/Impact: ...\\n   Recommended Fix: ...\\n\\nEmpfohlene Korrekturen/Recommended Fixes:\\n1. ...\\n\\nVorgeschlagener SOP-Ergänzungstext/Suggested SOP Text:\\n...\\n\\nVerbleibende Annahmen/Residual Assumptions:\\n..."}}
 No markdown. No sources. No text outside JSON."""
 
 

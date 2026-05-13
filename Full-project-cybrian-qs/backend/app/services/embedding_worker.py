@@ -25,7 +25,7 @@ def _claim_next_pending_job():
         if not job:
             return None
 
-        job.status = "running"
+        job.status = "processing"
         job.started_at = datetime.utcnow()
         db.commit()
         db.refresh(job)

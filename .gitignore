@@ -30,6 +30,7 @@ venv/
 .kombai/
 .cursor/
 .claude/
+.codex/
 # Note: Do NOT ignore .git itself; git handles this automatically.
 
 # --- Project Specific Large Files ---

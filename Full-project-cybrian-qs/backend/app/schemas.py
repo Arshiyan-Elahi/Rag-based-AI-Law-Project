@@ -308,6 +308,10 @@ class AIActionRequest(BaseModel):
     section_type: Optional[str] = None
     # When the client already holds a validated structured result (e.g. re-apply), skip LLM.
     client_structured_json: Optional[dict] = None
+    # UUID of the SOP row for precise DB + ProfileDetection context (editor bubble / KL assistant).
+    sop_entity_id: Optional[str] = None
+    # Who invoked the action: ``editor_bubble`` | ``kl_assistant`` (for logs only).
+    triggered_by: Optional[str] = None
 
 class AIActionResponse(BaseModel):
     action: str
@@ -344,9 +348,16 @@ class LinkSuggestionResponse(BaseModel):
 class SemanticStatusResponse(BaseModel):
     entity_type: str
     entity_id: UUID
+    latest_job_id: Optional[UUID] = None
     latest_job_status: Optional[str] = None
     latest_job_error: Optional[str] = None
     latest_job_finished_at: Optional[datetime] = None
+    active_pipeline_job_id: Optional[UUID] = None
+    chunking_status: Optional[str] = None
+    embeddings_status: Optional[str] = None
+    qdrant_status: Optional[str] = None
+    nlp_status: Optional[str] = None
+    semantic_linking_status: Optional[str] = None
     pending_suggestions: int = 0
     accepted_suggestions: int = 0
     rejected_suggestions: int = 0

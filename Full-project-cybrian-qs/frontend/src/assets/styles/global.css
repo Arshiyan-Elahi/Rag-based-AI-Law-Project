@@ -1792,6 +1792,7 @@ select {
   right: 0;
   width: min(360px, 92vw);
   height: 100dvh;
+  max-height: 100dvh;
   z-index: 230;
   border-left: 1px solid rgba(0, 0, 0, 0.1);
   background: #fff;
@@ -1799,6 +1800,16 @@ select {
   opacity: 0;
   pointer-events: none;
   transition: transform 220ms ease, opacity 180ms ease;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Match MainLayout.ai-assistant-sidebar: widget fills panel and can shrink for inner scroll */
+.editor-ai-assistant-sidebar > * {
+  flex: 1 1 0%;
+  min-height: 0;
+  min-width: 0;
 }
 
 .editor-ai-assistant-sidebar.ai-sidebar-open {

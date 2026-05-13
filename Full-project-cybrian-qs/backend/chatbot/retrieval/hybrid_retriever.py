@@ -1,4 +1,6 @@
+import logging
 import os
+import threading
 import time
 import numpy as np
 from langchain_core.retrievers import BaseRetriever
@@ -10,11 +12,18 @@ from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchAny
 from rank_bm25 import BM25Okapi
 from typing import Optional, List
 
+logger = logging.getLogger(__name__)
+
 # Module-level cache to store BM25 index and documents per collection, avoiding RAM leaks.
 # Schema: { collection_name: {"docs": [...], "bm25": BM25Okapi, "time": float} }
-_GLOBAL_BM25_CACHE = {}
-RAG_DEBUG_RETRIEVAL = os.getenv("RAG_DEBUG_RETRIEVAL", "true").strip().lower() == "true"
-BM25_CACHE_TTL_SECONDS = int(os.getenv("RAG_BM25_CACHE_TTL_SECONDS", "60"))
+_GLOBAL_BM25_CACHE: dict[str, dict] = {}
+_BM25_CACHE_LOCK = threading.Lock()
+RAG_DEBUG_RETRIEVAL = os.getenv("RAG_DEBUG_RETRIEVAL", "false").strip().lower() == "true"
+# Bigger default TTL — qa_semantic_chunks updates are explicit (invalidate_bm25_cache),
+# so we should not refetch the whole corpus every 60s by default.
+BM25_CACHE_TTL_SECONDS = int(os.getenv("RAG_BM25_CACHE_TTL_SECONDS", "600"))
+BM25_SCROLL_PAGE = int(os.getenv("RAG_BM25_SCROLL_PAGE", "2048"))
+BM25_SCROLL_MAX_POINTS = int(os.getenv("RAG_BM25_SCROLL_MAX_POINTS", "50000"))
 
 # Federated "section" (router) -> payload entity_type in qa_semantic_chunks (semantic index).
 SECTION_TO_ENTITY_TYPE = {
@@ -40,10 +49,13 @@ def invalidate_bm25_cache(collection_name: str | None = None) -> None:
     sees the latest indexed chunks.
     """
     global _GLOBAL_BM25_CACHE
-    if collection_name:
-        _GLOBAL_BM25_CACHE.pop(collection_name, None)
-        return
-    _GLOBAL_BM25_CACHE = {}
+    with _BM25_CACHE_LOCK:
+        if collection_name:
+            _GLOBAL_BM25_CACHE.pop(collection_name, None)
+            logger.info("[rag-retrieval] bm25_cache_invalidated collection=%s", collection_name)
+            return
+        _GLOBAL_BM25_CACHE = {}
+        logger.info("[rag-retrieval] bm25_cache_invalidated all")
 
 class HybridRetriever(BaseRetriever):
     vectorstore: QdrantVectorStore
@@ -83,6 +95,19 @@ class HybridRetriever(BaseRetriever):
         }
         return mapping.get(raw, raw)
 
+    def _empty_allowed_entity_ids(self) -> bool:
+        """
+        True when metadata explicitly scopes retrieval to zero entities.
+        Must not be confused with a missing key (legacy callers without allowlists).
+        """
+        mf = self.metadata_filters
+        if not isinstance(mf, dict):
+            return False
+        if "allowed_entity_ids" not in mf:
+            return False
+        raw = mf.get("allowed_entity_ids")
+        return isinstance(raw, list) and len(raw) == 0
+
     def _build_filter(self) -> Optional[Filter]:
         must_list = []
 
@@ -107,17 +132,43 @@ class HybridRetriever(BaseRetriever):
         # 2) Arbitrary metadata / identifier filters
         if self.metadata_filters:
             for key, val in self.metadata_filters.items():
-                if not val:
-                    continue
-                if str(key) == "allowed_entity_ids" and isinstance(val, list) and self._uses_unified_semantic_collection():
-                    must_list.append(
-                        FieldCondition(
-                            key="entity_id",
-                            match=MatchAny(any=[str(v) for v in val[:5000]]),
-                        )
-                    )
-                    continue
                 if str(key) == "allowed_entity_ids" and isinstance(val, list):
+                    # Empty allowlist = no live entities (e.g. zero active SOPs). Must match nothing,
+                    # not "skip filter and return the whole collection" (stale Qdrant points).
+                    if len(val) == 0:
+                        if self._uses_unified_semantic_collection():
+                            must_list.append(
+                                FieldCondition(
+                                    key="entity_id",
+                                    match=MatchValue(value="__no_allowed_entities__"),
+                                )
+                            )
+                        else:
+                            must_list.append(
+                                Filter(
+                                    should=[
+                                        FieldCondition(
+                                            key="entity_id",
+                                            match=MatchValue(value="__no_allowed_entities__"),
+                                        ),
+                                        FieldCondition(
+                                            key="source_id",
+                                            match=MatchValue(value="__no_allowed_entities__"),
+                                        ),
+                                    ]
+                                )
+                            )
+                        continue
+                    if not val:
+                        continue
+                    if self._uses_unified_semantic_collection():
+                        must_list.append(
+                            FieldCondition(
+                                key="entity_id",
+                                match=MatchAny(any=[str(v) for v in val[:5000]]),
+                            )
+                        )
+                        continue
                     allow = [str(v) for v in val[:5000]]
                     must_list.append(
                         Filter(
@@ -129,6 +180,8 @@ class HybridRetriever(BaseRetriever):
                             ]
                         )
                     )
+                    continue
+                if not val:
                     continue
                 if str(key) == "ref_number":
                     must_list.append(
@@ -159,6 +212,13 @@ class HybridRetriever(BaseRetriever):
                         FieldCondition(key=str(key), match=MatchValue(value=val))
                     )
 
+        if (
+            os.getenv("SEMANTIC_REQUIRE_RAG_READY", "false").strip().lower() == "true"
+            and self._uses_unified_semantic_collection()
+            and self._target_entity_type() == "sop"
+        ):
+            must_list.append(FieldCondition(key="rag_ready", match=MatchValue(value=True)))
+
         if not must_list:
             return None
 
@@ -166,55 +226,81 @@ class HybridRetriever(BaseRetriever):
 
     def _get_bm25_corpus(self) -> tuple[List[Document], BM25Okapi]:
         now = time.time()
-        # Check cache: refresh frequently enough to avoid stale counts/context.
         cache_entry = _GLOBAL_BM25_CACHE.get(self.collection_name)
         if cache_entry and (now - cache_entry["time"] < max(1, BM25_CACHE_TTL_SECONDS)):
             return cache_entry["docs"], cache_entry["bm25"]
 
-        points, _ = self.client.scroll(
-            collection_name=self.collection_name,
-            limit=100_000,
-            with_payload=True,
-            with_vectors=False,
-        )
-        docs, tokenized = [], []
-        for p in points:
-            pl = p.payload or {}
-            text = (pl.get("page_content") or pl.get("chunk_text") or "").strip()
-            nested = pl.get("metadata") or {}
-            if not isinstance(nested, dict):
-                nested = {}
-            meta = {
-                **nested,
-                "qdrant_id": p.id,
+        # Guard concurrent rebuilds; only one thread should re-scroll Qdrant.
+        with _BM25_CACHE_LOCK:
+            cache_entry = _GLOBAL_BM25_CACHE.get(self.collection_name)
+            if cache_entry and (now - cache_entry["time"] < max(1, BM25_CACHE_TTL_SECONDS)):
+                return cache_entry["docs"], cache_entry["bm25"]
+
+            t0 = time.perf_counter()
+            docs: List[Document] = []
+            tokenized: list[list[str]] = []
+            next_offset = None
+            scrolled = 0
+            try:
+                while True:
+                    points, next_offset = self.client.scroll(
+                        collection_name=self.collection_name,
+                        limit=BM25_SCROLL_PAGE,
+                        with_payload=True,
+                        with_vectors=False,
+                        offset=next_offset,
+                    )
+                    if not points:
+                        break
+                    for p in points:
+                        pl = p.payload or {}
+                        text = (pl.get("page_content") or pl.get("chunk_text") or "").strip()
+                        nested = pl.get("metadata") or {}
+                        if not isinstance(nested, dict):
+                            nested = {}
+                        meta = {**nested, "qdrant_id": p.id}
+                        for k in (
+                            "entity_type",
+                            "entity_id",
+                            "ref_number",
+                            "title",
+                            "department",
+                            "status",
+                            "version_id",
+                        ):
+                            if k in pl and pl[k] is not None and k not in meta:
+                                meta[k] = pl[k]
+                        docs.append(Document(page_content=text, metadata=meta))
+                        tokenized.append(text.lower().split())
+                    scrolled += len(points)
+                    if scrolled >= BM25_SCROLL_MAX_POINTS or not next_offset:
+                        break
+            except Exception as exc:
+                logger.warning(
+                    "[rag-retrieval] bm25_scroll_failed collection=%s scrolled=%s err=%s",
+                    self.collection_name,
+                    scrolled,
+                    exc,
+                )
+
+            if not docs:
+                result_docs, result_bm25 = docs, BM25Okapi([["_empty_"]])
+            else:
+                result_docs, result_bm25 = docs, BM25Okapi(tokenized)
+
+            _GLOBAL_BM25_CACHE[self.collection_name] = {
+                "docs": result_docs,
+                "bm25": result_bm25,
+                "time": now,
             }
-            for k in (
-                "entity_type",
-                "entity_id",
-                "ref_number",
-                "title",
-                "department",
-                "status",
-                "version_id",
-            ):
-                if k in pl and pl[k] is not None and k not in meta:
-                    meta[k] = pl[k]
-            docs.append(Document(page_content=text, metadata=meta))
-            tokenized.append(text.lower().split())
-        
-        if not docs:
-            result_docs, result_bm25 = docs, BM25Okapi([["_empty_"]])
-        else:
-            result_docs, result_bm25 = docs, BM25Okapi(tokenized)
-            
-        # Update cache
-        _GLOBAL_BM25_CACHE[self.collection_name] = {
-            "docs": result_docs,
-            "bm25": result_bm25,
-            "time": now
-        }
-        
-        return result_docs, result_bm25
+            elapsed_ms = int((time.perf_counter() - t0) * 1000)
+            logger.info(
+                "[rag-retrieval] bm25_cache_built collection=%s docs=%d ms=%d",
+                self.collection_name,
+                len(docs),
+                elapsed_ms,
+            )
+            return result_docs, result_bm25
 
     def _get_relevant_documents(
         self,
@@ -222,11 +308,15 @@ class HybridRetriever(BaseRetriever):
         *,
         run_manager: CallbackManagerForRetrieverRun,
     ) -> List[Document]:
+        if self._empty_allowed_entity_ids():
+            return []
         filt = self._build_filter()
+        t_dense0 = time.perf_counter()
         if RAG_DEBUG_RETRIEVAL:
-            print(
-                f"[rag-debug] retrieval_start collection={self.collection_name} filter={bool(filt)}",
-                flush=True,
+            logger.debug(
+                "[rag-retrieval] start collection=%s filter=%s",
+                self.collection_name,
+                bool(filt),
             )
         try:
             dense_results = self.vectorstore.similarity_search_with_score(
@@ -234,8 +324,14 @@ class HybridRetriever(BaseRetriever):
                 k=self.dense_top_k,
                 filter=filt,
             )
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "[rag-retrieval] dense_search_failed collection=%s err=%s",
+                self.collection_name,
+                exc,
+            )
             dense_results = []
+        dense_ms = int((time.perf_counter() - t_dense0) * 1000)
         if dense_results:
             patched = []
             for d, s in dense_results:
@@ -259,6 +355,15 @@ class HybridRetriever(BaseRetriever):
                 for d in corpus_docs
                 if str((d.metadata or {}).get("entity_type", "")) == want
             ]
+            if (
+                os.getenv("SEMANTIC_REQUIRE_RAG_READY", "false").strip().lower() == "true"
+                and want == "sop"
+            ):
+                filtered_corpus = [
+                    d
+                    for d in filtered_corpus
+                    if (d.metadata or {}).get("rag_ready") is True
+                ]
         else:
             normalized = self._normalized_doc_type_filter()
             if not normalized:
@@ -314,4 +419,14 @@ class HybridRetriever(BaseRetriever):
                      }
 
         ranked = sorted(combined.values(), key=lambda x: x["score"], reverse=True)
-        return [r["doc"] for r in ranked[:self.final_top_k]]
+        result = [r["doc"] for r in ranked[: self.final_top_k]]
+        if RAG_DEBUG_RETRIEVAL:
+            logger.debug(
+                "[rag-retrieval] done collection=%s dense=%d bm25=%d kept=%d dense_ms=%d",
+                self.collection_name,
+                len(dense_results),
+                len(bm25_results),
+                len(result),
+                dense_ms,
+            )
+        return result

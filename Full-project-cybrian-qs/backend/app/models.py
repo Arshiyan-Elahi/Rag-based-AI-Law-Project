@@ -80,8 +80,17 @@ class EmbeddingJob(Base):
     entity_id = Column(UUID(as_uuid=True), nullable=False, index=True)
     version_id = Column(UUID(as_uuid=True), nullable=True)
     job_type = Column(String(50), nullable=False, default="entity_reindex")
+    # Overall job: pending | processing | completed | failed | cancelled
     status = Column(String(30), nullable=False, default="pending", index=True)
     error_message = Column(Text, nullable=True)
+    # Content fingerprint at enqueue time (SOP version body); used to drop stale work.
+    enqueued_content_hash = Column(String(64), nullable=True, index=True)
+    # Per-stage lifecycle for SOP pipeline (pending|processing|completed|failed|skipped|cancelled)
+    chunking_status = Column(String(30), nullable=False, default="pending")
+    embeddings_status = Column(String(30), nullable=False, default="pending")
+    qdrant_status = Column(String(30), nullable=False, default="pending")
+    nlp_status = Column(String(30), nullable=False, default="pending")
+    semantic_linking_status = Column(String(30), nullable=False, default="pending")
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
     started_at = Column(TIMESTAMP, nullable=True)
     finished_at = Column(TIMESTAMP, nullable=True)
@@ -117,6 +126,8 @@ class SOP(Base):
     
     # We add this purely for UI Editor compatibility mapping. The domain schema doesn't strictly need it to find versions, but it helps the editor mock workflow.
     current_version_id = Column(UUID(as_uuid=True), nullable=True)
+    # Latest accepted background pipeline job for this SOP (chunk/embed/qdrant/nlp).
+    active_pipeline_job_id = Column(UUID(as_uuid=True), nullable=True, index=True)
 
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)

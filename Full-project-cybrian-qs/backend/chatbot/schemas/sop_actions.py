@@ -32,6 +32,7 @@ class ActionRequest(BaseModel):
     section_title: str = "Selected text"
     section_type: str = "Selected Text"
     section_text: str
+    sop_entity_id: str | None = None
 
     @field_validator("section_type", mode="before")
     @classmethod
