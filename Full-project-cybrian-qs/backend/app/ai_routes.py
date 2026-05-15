@@ -6,7 +6,6 @@ Keep this module so existing imports (`app.ai_routes`) continue to work.
 """
 
 from chatbot.routes.ai_routes import *  # noqa: F401,F403
-
 from html import escape
 import re
 import os

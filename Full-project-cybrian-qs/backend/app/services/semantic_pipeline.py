@@ -11,7 +11,7 @@ from typing import Any
 
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
-# from sentence_transformers import SentenceTransformer  <-- Moved inside _get_embedder
+from sentence_transformers import SentenceTransformer 
 from sqlalchemy import and_, func, exists, not_, or_, select
 from sqlalchemy.orm import Session
 
