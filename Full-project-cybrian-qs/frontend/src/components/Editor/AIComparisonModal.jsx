@@ -1,4 +1,5 @@
 import React from 'react'
+import { createPortal } from 'react-dom'
 import { AlertTriangle, Check, Info, Sparkles, Wand2, X } from 'lucide-react'
 import './AIAssistantUI.css'
 import { formatAiSuggestionForUi } from '../../utils/aiOutputFormatter'
@@ -141,7 +142,7 @@ const AIComparisonModal = ({
     structuredData,
   })
 
-  return (
+  const modal = (
     <div className="ai-modal-overlay">
       <div className="ai-modal">
         <div className="ai-modal__header">
@@ -214,6 +215,9 @@ const AIComparisonModal = ({
       </div>
     </div>
   )
+
+  if (typeof document === 'undefined') return modal
+  return createPortal(modal, document.body)
 }
 
 const SparkleIcon = ({ size, className }) => (

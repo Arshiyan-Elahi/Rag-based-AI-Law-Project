@@ -1,4 +1,5 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { Sparkles, ShieldAlert, Wand2 } from 'lucide-react'
 
 import { performAIAction } from '../../api/editorApi'
@@ -51,6 +52,66 @@ const buildAcceptedContent = (aiResult, selectionMeta) => {
 
 const isEditorViewReady = (editor) =>
   Boolean(editor && editor.view && editor.view.dom && !editor.isDestroyed)
+
+/** Viewport-fixed menu position anchored to the active end of the selection (caret). */
+function computeBubbleMenuPosition(editor, menuEl) {
+  const { selection } = editor.state
+  if (selection.empty) return null
+
+  const { from, to } = selection
+  const selectedText = editor.state.doc.textBetween(from, to, ' ').trim()
+  if (!selectedText) return null
+
+  const headPos = selection.$head?.pos ?? to
+  const head = editor.view.coordsAtPos(headPos)
+  const fromCoords = editor.view.coordsAtPos(from)
+  const toCoords = editor.view.coordsAtPos(to)
+
+  const editorRect = editor.view.dom.getBoundingClientRect()
+  const visibleRect = {
+    left: Math.max(editorRect.left, 8),
+    right: Math.min(editorRect.right, window.innerWidth - 8),
+    top: Math.max(editorRect.top, 8),
+    bottom: Math.min(editorRect.bottom, window.innerHeight - 8),
+  }
+
+  const menuWidth = menuEl?.offsetWidth || 320
+  const menuHeight = menuEl?.offsetHeight || 120
+  const margin = 12
+  const offset = 12
+  const selectionRatio = Math.abs(to - from) / Math.max(1, editor.state.doc.content.size)
+  const isLargeSelection = selectedText.length > 900 || selectionRatio > 0.6
+
+  const selLeft = Math.min(fromCoords.left, toCoords.left, head.left)
+  const selRight = Math.max(fromCoords.right, toCoords.right, head.right)
+  const selTop = Math.min(fromCoords.top, toCoords.top, head.top)
+  const selBottom = Math.max(fromCoords.bottom, toCoords.bottom, head.bottom)
+
+  // Anchor at caret / selection end so the bar follows where the user is selecting.
+  const anchorLeft = isLargeSelection ? (head.left + head.right) / 2 : (selLeft + selRight) / 2
+  const anchorTop = head.top
+  const anchorBottom = head.bottom
+
+  let left = anchorLeft
+  const leftMin = Math.max(margin + menuWidth / 2, visibleRect.left + margin + menuWidth / 2)
+  const leftMax = Math.min(
+    window.innerWidth - margin - menuWidth / 2,
+    visibleRect.right - margin - menuWidth / 2,
+  )
+  left = Math.max(leftMin, Math.min(leftMax, left))
+
+  const spaceAbove = anchorTop - visibleRect.top
+  const spaceBelow = visibleRect.bottom - anchorBottom
+  const placement =
+    spaceAbove >= menuHeight + offset + margin || spaceAbove >= spaceBelow ? 'above' : 'below'
+
+  let top = placement === 'above' ? anchorTop - offset : anchorBottom + offset
+  const topMin = visibleRect.top + margin + (placement === 'below' ? menuHeight + offset : 0)
+  const topMax = visibleRect.bottom - margin - (placement === 'above' ? menuHeight + offset : 0)
+  top = Math.max(topMin, Math.min(topMax, top))
+
+  return { top, left, placement, isLargeSelection }
+}
 
 const ACTION_TEXT_WARNING_CHARS = 7000
 
@@ -130,49 +191,16 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true, onPrevi
         }
 
         const structuredText = buildStructuredSelectionText(editor, from, to)
-        // Anchor to current head position so reverse selection and Ctrl+A remain stable.
-        const headPos = selection.$head?.pos || to
-        const head = editor.view.coordsAtPos(headPos)
-        const editorRect = editor.view.dom.getBoundingClientRect()
-        const visibleRect = {
-          left: Math.max(editorRect.left, 8),
-          right: Math.min(editorRect.right, window.innerWidth - 8),
-          top: Math.max(editorRect.top, 8),
-          bottom: Math.min(editorRect.bottom, window.innerHeight - 8),
+        const nextPos = computeBubbleMenuPosition(editor, menuRef.current)
+        if (!nextPos) {
+          selectionRef.current = null
+          lastMenuPositionRef.current = null
+          setMenuPosition(null)
+          return
         }
-
-        const menuWidth = menuRef.current?.offsetWidth || 360
-        const menuHeight = menuRef.current?.offsetHeight || 70
-        const margin = 8
-        const offset = 12
-        const selectionRatio = Math.abs(to - from) / Math.max(1, editor.state.doc.content.size)
-        const isLargeSelection = selectedText.length > 900 || selectionRatio > 0.6
-
-        let left = isLargeSelection
-          ? visibleRect.right - margin - menuWidth / 2
-          : head.left
-        const leftMin = Math.max(margin + menuWidth / 2, visibleRect.left + margin + menuWidth / 2)
-        const leftMax = Math.min(
-          window.innerWidth - margin - menuWidth / 2,
-          visibleRect.right - margin - menuWidth / 2,
-        )
-        left = Math.max(leftMin, Math.min(leftMax, left))
-
-        const preferredTop = isLargeSelection
-          ? visibleRect.bottom - margin - menuHeight - offset
-          : head.top
-        const spaceAbove = preferredTop - visibleRect.top
-        const spaceBelow = visibleRect.bottom - head.bottom
-        const placement = spaceAbove >= (menuHeight + offset + margin) || spaceAbove >= spaceBelow ? 'above' : 'below'
-
-        let top = placement === 'above' ? preferredTop : head.bottom
-        const topMin = visibleRect.top + margin + (placement === 'below' ? 0 : menuHeight + offset)
-        const topMax = visibleRect.bottom - margin - (placement === 'below' ? menuHeight + offset : 0)
-        top = Math.max(topMin, Math.min(topMax, top))
 
         const selectedFraction = Math.abs(to - from) / Math.max(1, editor.state.doc.content.size)
         selectionRef.current = { from, to, selectedText, structuredText, selectedFraction }
-        const nextPos = { top, left, placement }
         const prev = lastMenuPositionRef.current
         if (
           prev &&
@@ -222,10 +250,16 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true, onPrevi
     const dom = editor.view?.dom
     if (!dom) return undefined
 
+    const scrollRoot =
+      dom.closest('.figma-editor-canvas') ||
+      dom.closest('[data-editor-scroll-root]') ||
+      dom.parentElement
+
     dom.addEventListener('mousedown', startPointerSelection)
     window.addEventListener('mouseup', endPointerSelection)
     // Avoid global keyup/selectionchange — they fire on every keystroke and caused repaint loops.
     window.addEventListener('scroll', delayedUpdate, true)
+    scrollRoot?.addEventListener('scroll', delayedUpdate, { passive: true })
     window.addEventListener('resize', delayedUpdate)
     window.addEventListener('keydown', handleGlobalKeyDown)
     updatePosition()
@@ -241,10 +275,34 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true, onPrevi
       }
       window.removeEventListener('mouseup', endPointerSelection)
       window.removeEventListener('scroll', delayedUpdate, true)
+      scrollRoot?.removeEventListener('scroll', delayedUpdate)
       window.removeEventListener('resize', delayedUpdate)
       window.removeEventListener('keydown', handleGlobalKeyDown)
     }
   }, [editor, isEditable, isEditorReady])
+
+  // Re-measure after mount so stacked vs horizontal layout uses real width/height.
+  useLayoutEffect(() => {
+    if (!menuPosition || !menuRef.current || !editor || editor.isDestroyed) return
+    try {
+      if (editor.state.selection.empty || !selectionRef.current) return
+      const next = computeBubbleMenuPosition(editor, menuRef.current)
+      if (!next) return
+      const prev = menuPosition
+      if (
+        Math.abs(prev.top - next.top) < 0.5 &&
+        Math.abs(prev.left - next.left) < 0.5 &&
+        prev.placement === next.placement
+      ) {
+        lastMenuPositionRef.current = next
+        return
+      }
+      lastMenuPositionRef.current = next
+      setMenuPosition(next)
+    } catch {
+      // ignore
+    }
+  }, [menuPosition, editor])
 
   if (!editor || !isEditable || !isEditorReady) return null
 
@@ -380,13 +438,12 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true, onPrevi
     lastAiReplyRef.current = null
   }
 
-  return (
-    <>
-      {menuPosition ? (
-        <div
-          ref={menuRef}
+  const actionMenu = menuPosition ? (
+    <div
+      ref={menuRef}
           className="ai-action-menu"
           data-placement={menuPosition.placement || 'above'}
+          data-large-selection={menuPosition.isLargeSelection ? 'true' : 'false'}
           style={{
             top: menuPosition.top,
             left: menuPosition.left,
@@ -429,8 +486,14 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true, onPrevi
               <span>Generating suggestion...</span>
             </div>
           )}
-        </div>
-      ) : null}
+    </div>
+  ) : null
+
+  return (
+    <>
+      {actionMenu && typeof document !== 'undefined'
+        ? createPortal(actionMenu, document.body)
+        : actionMenu}
 
       <AIComparisonModal
         isOpen={isModalOpen}
