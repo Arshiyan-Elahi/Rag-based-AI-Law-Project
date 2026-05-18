@@ -18,6 +18,7 @@ export const EDITOR_AI_ACTION_RESULT_EVENT = 'kl-assistant-editor-action-result'
 export const AI_ACTION_TRIGGERED_BY = Object.freeze({
   EDITOR_BUBBLE: 'editor_bubble',
   KL_ASSISTANT: 'kl_assistant',
+  ACTIONS_TAB: 'actions_tab',
 })
 
 /** Status values reported back by the editor bridge to the assistant. */
@@ -66,9 +67,13 @@ const IMPROVE_PATTERNS = [
 const GAP_PATTERNS = [
   /\bgap\s*check\b/i,
   /\bgap\s*analysis\b/i,
+  /\bwhat\s+(?:is|are)\s+the\s+gaps?\b/i,
+  /\bwhat\s+gaps?\s+(?:are|exist)\b/i,
+  /\bgaps?\s+in\s+(?:this\s+)?sop\b/i,
   /\bcompliance\s+(check|gap)\b/i,
   /\bl(?:ü|ue)cken[\s-]?(analyse|pr(?:ü|ue)fung|check)\b/i,
   /\bqa\s*review\b/i,
+  /\bwelche\s+lücken\b/i,
 ]
 
 const READ_PATTERNS = [
@@ -175,6 +180,26 @@ export function getActiveEditorDocumentId() {
 export function isEditorRoute(pathname) {
   const path = String(pathname || '')
   return path === '/editor' || path.startsWith('/editor/')
+}
+
+/**
+ * True when an SOP is open in the editor (dedicated /editor route OR embedded tab on /sops).
+ * The sidebar Actions flow depends on this — not only on the URL path.
+ */
+export function hasActiveSopEditor(pathname) {
+  const docId = getActiveEditorDocumentId()
+  if (!docId) return false
+  const path = String(pathname || '')
+  if (isEditorRoute(path)) return true
+  if (path === '/sops' || path.startsWith('/sops')) return true
+  return false
+}
+
+export const SOP_EDITOR_CONTEXT_EVENT = 'sop-editor-context-changed'
+
+export function notifySopEditorContextChanged() {
+  if (typeof window === 'undefined') return
+  window.dispatchEvent(new CustomEvent(SOP_EDITOR_CONTEXT_EVENT))
 }
 
 /** Lightweight, opaque request id. */

@@ -1,7 +1,7 @@
 import React, { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import { debounce } from 'lodash'
-import { useEditor, EditorContent } from '@tiptap/react'
+import { useEditor } from '@tiptap/react'
 import { Extension } from '@tiptap/core'
 import StarterKit from '@tiptap/starter-kit'
 import HardBreak from '@tiptap/extension-hard-break'
@@ -24,8 +24,8 @@ import SOPMetadataPanel from '../components/Editor/SOP/SOPMetadataPanel'
 import LinkModal from '../components/Common/LinkModal'
 import LinkingModal from '../components/Common/LinkingModal'
 import EditorToolbarSection from '../components/Editor/EditorToolbarSection'
-import EditorAIBridge from '../components/Editor/EditorAIBridge'
-import StatusBar from '../components/Editor/StatusBar'
+import EditorDocStatsBar from '../components/Editor/EditorDocStatsBar'
+import EditorTypingSurface from '../components/Editor/EditorTypingSurface'
 import AIWidget from '../components/Dashboard/AIWidget'
 import FloatingAskAIButton from '../components/Common/FloatingAskAIButton'
 import { useLanguage } from '../context/LanguageContext'
@@ -46,10 +46,11 @@ import {
   normalizeSOPTitleForDisplay,
   prepareEditorSOPImport,
 } from '../utils/sopImportService'
+import { InlineAiSuggestion } from '../extensions/InlineAiSuggestion'
+import { notifySopEditorContextChanged } from '../utils/editorAiBridge'
 import '../assets/styles/global.css'
 
 const PreviewModal = lazy(() => import('../components/Common/PreviewModal'))
-const AIAssistantBubbleMenu = lazy(() => import('../components/Editor/AIAssistantBubbleMenu'))
 const SideBySideViewer = lazy(() => import('../components/Editor/Diff/SideBySideViewer'))
 
 class EditorSurfaceErrorBoundary extends React.Component {
@@ -343,6 +344,7 @@ const EditorPage = ({
     TableHeader,
     TableCell,
     EditorShortcuts,
+    InlineAiSuggestion,
   ]), [])
 
   const editor = useEditor({
@@ -479,6 +481,7 @@ const EditorPage = ({
     if (!documentId) return
     try {
       localStorage.setItem(STORAGE_KEY, documentId)
+      notifySopEditorContextChanged()
     } catch {
       // ignore
     }
@@ -537,7 +540,8 @@ const EditorPage = ({
     }
   }, [documentId, relatedContextRefreshToken])
 
-  useEffect(() => {
+  const persistKlEditorContext = useCallback(() => {
+    if (!editor || editor.isDestroyed) return
     const linked = {
       deviations: Array.isArray(relatedContextSnapshot?.related_deviations) ? relatedContextSnapshot.related_deviations : [],
       capas: Array.isArray(relatedContextSnapshot?.related_capas) ? relatedContextSnapshot.related_capas : [],
@@ -557,7 +561,7 @@ const EditorPage = ({
         references: Array.isArray(metadata?.references) ? metadata.references : [],
       },
       linked,
-      editor_text: editor?.getText?.() || '',
+      editor_text: editor.getText() || '',
     }
     try {
       localStorage.setItem(KL_EDITOR_CONTEXT_KEY, JSON.stringify(payload))
@@ -565,6 +569,22 @@ const EditorPage = ({
       // ignore storage failures
     }
   }, [documentId, metadata, sopStatus, editor, relatedContextSnapshot])
+
+  useEffect(() => {
+    persistKlEditorContext()
+  }, [documentId, metadata, sopStatus, relatedContextSnapshot, persistKlEditorContext])
+
+  useEffect(() => {
+    if (!editor || !isEditorMounted || editor.isDestroyed) return undefined
+    const syncContext = debounce(() => {
+      persistKlEditorContext()
+    }, 1200)
+    editor.on('update', syncContext)
+    return () => {
+      editor.off('update', syncContext)
+      syncContext.cancel()
+    }
+  }, [editor, isEditorMounted, persistKlEditorContext])
 
   const persistDocument = useCallback(async ({ showSavingIndicator = true } = {}) => {
     if (!editor || !isEditorMounted || editor.isDestroyed || isHistoricalView || hydrationRef.current) return
@@ -818,12 +838,23 @@ const EditorPage = ({
     }
   }, [documentId, applyVersionState, metadata.title])
 
-  const aiSopContext = useMemo(() => ({
-    ...metadata,
-    title: metadata?.title?.trim() || 'Untitled SOP',
-    documentId: metadata?.documentId || documentId || 'SOP-NEW',
-    sop_entity_id: documentId || null,
-  }), [metadata, documentId])
+  const aiSopContext = useMemo(
+    () => ({
+      ...metadata,
+      title: metadata?.title?.trim() || 'Untitled SOP',
+      documentId: metadata?.documentId || documentId || 'SOP-NEW',
+      sop_entity_id: documentId || null,
+    }),
+    [
+      documentId,
+      metadata?.title,
+      metadata?.documentId,
+      metadata?.department,
+      metadata?.category,
+      metadata?.sopVersion,
+      metadata?.docType,
+    ],
+  )
 
   const openLinkModal = () => {
     if (!editor || !isEditorMounted || editor.isDestroyed) return
@@ -986,16 +1017,6 @@ const EditorPage = ({
   const versionSelectValue = currentVersionId || (versions[0]?.id ?? '')
   const compareBaseValue = compareBaseVersionId || currentVersionId || (versions[0]?.id ?? '')
   const compareTargetValue = compareTargetVersionId || currentVersionId || (versions[0]?.id ?? '')
-  const plainText = editor?.getText() || ''
-  const wordCount = plainText.split(/\s+/).filter(Boolean).length
-  const charCount = plainText.length
-  let blockCount = 0
-  editor.state.doc.descendants((node) => {
-    if (node.type?.name && ['paragraph', 'heading', 'bulletList', 'orderedList', 'table'].includes(node.type.name)) {
-      blockCount += 1
-    }
-  })
-
   return (
     <div className={`editor-page-container figma-editor-page${isEmbedded ? ' editor-embedded' : ''}`}>
       <div className="figma-shell">
@@ -1060,26 +1081,15 @@ const EditorPage = ({
                 {isHistoricalView ? <span className="editor-stage-hint">{t.historicalVersionLoaded}</span> : null}
                 {isLoadingDocument ? <span className="editor-stage-hint">{t.loading}</span> : null}
                 <EditorSurfaceErrorBoundary>
-                  <div className="figma-paper">
-                    <EditorContent editor={editor} />
-                    <Suspense fallback={null}>
-                      <AIAssistantBubbleMenu
-                        editor={editor}
-                        sopMetadata={aiSopContext}
-                        isEditable={!isHistoricalView && isEditorMounted}
-                        onPreviewSessionChange={handleAiPreviewSessionChange}
-                      />
-                    </Suspense>
-                    <EditorAIBridge
-                      editor={editor}
-                      documentId={documentId}
-                      sopMetadata={aiSopContext}
-                      isEditable={!isHistoricalView && isEditorMounted}
-                      onPreviewSessionChange={handleAiPreviewSessionChange}
-                      onAfterApply={handleAfterAiBridgeApply}
-                      onVersionCompareRequest={openCompareFromAssistant}
-                    />
-                  </div>
+                  <EditorTypingSurface
+                    editor={editor}
+                    isEditable={!isHistoricalView && isEditorMounted}
+                    aiSopContext={aiSopContext}
+                    documentId={documentId}
+                    onPreviewSessionChange={handleAiPreviewSessionChange}
+                    onAfterApply={handleAfterAiBridgeApply}
+                    onVersionCompareRequest={openCompareFromAssistant}
+                  />
                 </EditorSurfaceErrorBoundary>
               </section>
             </main>
@@ -1168,10 +1178,8 @@ const EditorPage = ({
           </div>
         </div>
       </div>
-        <StatusBar
-          wordCount={wordCount}
-          charCount={charCount}
-          blockCount={blockCount}
+        <EditorDocStatsBar
+          editor={editor}
           lastSaved={lastSaved}
           isSaving={isSaving}
           profile="sop"

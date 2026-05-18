@@ -306,6 +306,8 @@ class AIActionRequest(BaseModel):
     sop_title: Optional[str] = None
     section_name: Optional[str] = None
     section_type: Optional[str] = None
+    # section_only | full_document — drives prompt scope (partial vs whole SOP)
+    edit_scope: Optional[str] = None
     # When the client already holds a validated structured result (e.g. re-apply), skip LLM.
     client_structured_json: Optional[dict] = None
     # UUID of the SOP row for precise DB + ProfileDetection context (editor bubble / KL assistant).

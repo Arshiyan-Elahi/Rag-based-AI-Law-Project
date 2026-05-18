@@ -350,6 +350,12 @@ class SemanticPipelineService:
                 ),
             )
             invalidate_bm25_cache(DEFAULT_COLLECTION)
+            try:
+                from .rag_cache import invalidate_runtime_rag_cache
+
+                invalidate_runtime_rag_cache()
+            except Exception:
+                pass
         except Exception as ex:
             print(f"[semantic-pipeline] purge warning for {entity_type} {entity_id}: {ex}", flush=True)
 
@@ -912,6 +918,12 @@ class SemanticPipelineService:
             job.finished_at = datetime.utcnow()
             job.error_message = None
             db.commit()
+            try:
+                from .rag_cache import invalidate_runtime_rag_cache
+
+                invalidate_runtime_rag_cache()
+            except Exception as cache_exc:
+                logger.warning("[semantic-job] rag cache invalidate failed: %s", cache_exc)
             logger.info("[semantic-job] completed job=%s did_reindex=%s", job_id, did_reindex)
         except Exception as exc:
             if job:

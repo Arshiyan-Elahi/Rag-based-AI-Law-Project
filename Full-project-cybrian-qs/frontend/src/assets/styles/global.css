@@ -1619,12 +1619,21 @@ select {
   overflow-y: auto;
 }
 
-.figma-paper {
+.figma-paper,
+.editor-typing-surface {
   border: 1px solid rgba(0, 0, 0, 0.1);
   border-radius: 12px;
   background: #ffffff;
   min-height: 680px;
   overflow: visible;
+}
+
+.editor-typing-surface {
+  contain: layout style;
+}
+
+.editor-typing-surface .tiptap {
+  min-height: 640px;
 }
 
 .figma-sidebar {

@@ -125,9 +125,65 @@ export function formatChatTimeFromIso(iso) {
   }
 }
 
+/** Remove backend retrieval/system markers before rendering assistant text. */
+export function sanitizeAnswerForDisplay(text) {
+  let s = String(text || '').trim()
+  if (!s) return ''
+
+  const blockMarkers = ['---SUGGESTIONS---', '---CITATIONS---', 'LIVE_ASSISTANT_CONTEXT']
+  for (const m of blockMarkers) {
+    const idx = s.toLowerCase().indexOf(m.toLowerCase())
+    if (idx >= 0) {
+      const rest = s.slice(idx + m.length)
+      const nextPara = rest.search(/\n\n(?:Summary|Details|Status|The |Die |Der )/i)
+      s = (s.slice(0, idx) + (nextPara >= 0 ? rest.slice(nextPara) : '')).trim()
+    }
+  }
+
+  const bracketedNames = ['LIVE_ASSISTANT_CONTEXT', 'LIVE_ASSISTANT', 'editor_context', 'RETRIEVED CONTEXT']
+  for (const name of bracketedNames) {
+    s = s.replace(new RegExp(`\\[\\s*${name}\\s*\\]`, 'gi'), ' ')
+    s = s.replace(new RegExp(`\\b${name}\\b`, 'gi'), ' ')
+  }
+
+  const inlinePatterns = [
+    /\s*\[REASONING\]\s*/gi,
+    /\s*\[CONFIDENCE\]\s*/gi,
+    /\s*\[ANSWER\]\s*/gi,
+    /\bSCOPE=ACTIVE_SOP_ONLY\b/gi,
+    /\bACTIVE_SOP_ID=[0-9a-fA-F-]{8,}\b/gi,
+    /\bRAG_HINTS:\s*[^\n\]]*/gi,
+    /\bPLANNED_ASSISTANT_ACTION:\s*[^\n\]]*/gi,
+    /\s*\[?\s*Retrieval scope:\s*[^\n\]]+\]?\s*/gi,
+  ]
+  for (const re of inlinePatterns) {
+    s = s.replace(re, ' ')
+  }
+
+  const dropLine = (line) => {
+    const low = line.trim().toLowerCase()
+    return (
+      low.startsWith('live_assistant_context')
+      || low.startsWith('- retrieval scope:')
+      || low.startsWith('- active sop:')
+      || low.startsWith('- linked ')
+      || low.startsWith('rag_hints:')
+    )
+  }
+  s = s
+    .split(/\r?\n/)
+    .filter((line) => !dropLine(line))
+    .join('\n')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+
+  return s
+}
+
 export function toHtml(text) {
   if (!text) return '<p></p>'
-  const raw = String(text || '').trim()
+  const raw = sanitizeAnswerForDisplay(String(text || '').trim())
   const escaped = raw
     .replaceAll('&', '&amp;')
     .replaceAll('<', '&lt;')
@@ -202,15 +258,16 @@ function matchRouteConfig(pathname = '/') {
   return matchedKey ? ROUTE_CONFIG[matchedKey] : DEFAULT_CONFIG
 }
 
-function buildContextualQuestion(question, pathname) {
-  const route = pathname || '/'
-  if (route.startsWith('/editor')) {
-    const activeDocumentId = localStorage.getItem('current_document_id')
-    if (activeDocumentId) {
-      return `Active SOP context: ${activeDocumentId}. User request: ${question}`
-    }
+/** Strip legacy injected SOP context prefix from stored/displayed user messages. */
+export function toVisibleUserMessage(text) {
+  const raw = String(text || '').trim()
+  if (!raw) return ''
+  const prefixMatch = raw.match(/^Active SOP context:\s*[\s\S]+?\.\s*User request:\s*/i)
+  if (prefixMatch) {
+    const visible = raw.slice(prefixMatch[0].length).trim()
+    return visible || raw
   }
-  return question
+  return raw
 }
 
 export function getAssistantRouteMeta(pathname = '/') {
@@ -227,7 +284,7 @@ export async function runUnifiedAssistantQuery({
   assistantMode = null,
 }) {
   const routeMeta = matchRouteConfig(pathname)
-  const contextualQuestion = buildContextualQuestion(question, pathname)
+  const visibleQuestion = String(question || '').trim()
   const assistantContext = getKLAssistantContext(pathname)
   const mode =
     assistantMode === 'query' || assistantMode === 'action'
@@ -235,7 +292,7 @@ export async function runUnifiedAssistantQuery({
       : surface === 'kl_assistant'
         ? readKlAssistantMode()
         : 'action'
-  return queryAI(contextualQuestion, {
+  return queryAI(visibleQuestion, {
     chat_history: chatHistory,
     category: routeMeta.category,
     assistant_context: assistantContext,

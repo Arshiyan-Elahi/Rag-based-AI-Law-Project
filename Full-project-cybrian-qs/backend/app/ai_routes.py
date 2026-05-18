@@ -29,7 +29,13 @@ from action.prompts import (
     build_gap_check_prompt,
     build_improve_prompt,
     build_rewrite_prompt,
+    build_section_only_improve_retry_prompt,
+    build_section_only_rewrite_retry_prompt,
     build_summarize_prompt,
+    extract_register_slice_from_output,
+    is_traceability_register_block,
+    resolve_edit_scope,
+    violates_section_only_scope,
 )
 from action.runtime import create_action_runtime
 from action.utils import (
@@ -43,7 +49,20 @@ from schemas.sop_actions import ActionRequest, GapCheckResponse, ImproveResponse
 from .schemas import AIActionRequest, AIActionResponse
 from .database import SessionLocal
 from .auth_routes import get_current_user_optional
-from .models import SOP, SOPVersion, Deviation, Capa, AuditFinding, Decision, User
+from .models import (
+    SOP,
+    SOPVersion,
+    Deviation,
+    Capa,
+    AuditFinding,
+    Decision,
+    User,
+    SopDeviationLink,
+    DeviationCapaLink,
+    CapaAuditLink,
+    AuditDecisionLink,
+    DecisionSopLink,
+)
 from .services.chat_query_persistence import persist_chat_query_exchange
 from .services.nlp.prompt_injector import get_style_prompt_injection
 from .services.nlp.editor_action_nlp import (
@@ -243,6 +262,12 @@ def _get_smart_rag_chain() -> Any:
             federated.retrievers[section].collection_name = collection_name
 
         _smart_rag_chain = SmartRAGChain(federated)
+        try:
+            from .services.rag_cache import register_rag_chain
+
+            register_rag_chain(_smart_rag_chain)
+        except Exception:
+            pass
         return _smart_rag_chain
 
 
@@ -1044,6 +1069,8 @@ def _response_looks_cut(text: str) -> bool:
     s = (text or "").rstrip()
     if not s:
         return False
+    if s.endswith(("}", '"}', "]}", '"]}')):
+        return False
     return s[-1].isalnum() and not s.endswith((".", "!", "?", "}", "]", '"'))
 
 
@@ -1058,6 +1085,17 @@ def _call_action_llm(runtime: Any, prompt: str, *, input_char_budget: int = 0, a
             or "4096"
         )
         base_n = min(configured_cap, max(base_n, 4096, int(input_char_budget * 1.4) + 1800))
+    if action == "gap_check" and input_char_budget:
+        configured_cap = int(
+            os.getenv("ACTION_GAP_CHECK_MAX_TOKENS")
+            or os.getenv("ACTION_LLM_MAX_TOKENS")
+            or os.getenv("ACTION_MAX_OUTPUT_TOKENS")
+            or "4096"
+        )
+        base_n = min(
+            int(os.getenv("ACTION_MAX_OUTPUT_TOKENS_CAP", "32768")),
+            max(base_n, int(configured_cap), 3500, int(input_char_budget * 0.65) + 2200),
+        )
     soft = _action_prompt_soft_limit_chars()
     cfg = get_local_llm_config()
 
@@ -1093,6 +1131,27 @@ def _call_action_llm(runtime: Any, prompt: str, *, input_char_budget: int = 0, a
                 usage.get("total_tokens"),
             )
             if finish_reason == "length":
+                if action == "gap_check":
+                    expanded = _safe_action_max_tokens(
+                        min(int(os.getenv("ACTION_MAX_OUTPUT_TOKENS_CAP", "32768")), int(used_tokens * 2.2) + 800),
+                        len(work),
+                        n_ctx=n_ctx_hint,
+                    )
+                    if expanded > used_tokens:
+                        try:
+                            msg2 = runtime.llm.bind(max_tokens=expanded).invoke(work)
+                            out2, meta2 = _extract_text_and_meta(msg2)
+                            fr2 = str(meta2.get("finish_reason") or "").lower()
+                            if (out2 or "").strip() and fr2 != "length":
+                                logger.info(
+                                    "[ai-action-gap-retry] expanded max_tokens %s -> %s finish_reason=%s",
+                                    used_tokens,
+                                    expanded,
+                                    fr2,
+                                )
+                                return out2
+                        except Exception:
+                            pass
                 length_limited_seen = True
                 continue
             if (out or "").strip():
@@ -1134,13 +1193,32 @@ def _call_action_llm(runtime: Any, prompt: str, *, input_char_budget: int = 0, a
         raise _context_error_http_exception(last_context_error)
 
     finish_reason = str(last_meta.get("finish_reason") or "").lower()
-    if finish_reason == "length" or length_limited_seen or _response_looks_cut(out):
+    looks_cut = _response_looks_cut(out)
+    if not (out or "").strip():
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "AI returned an empty response.",
+                "validation_or_parse_error": f"finish_reason={finish_reason or 'unknown'}",
+                "hint": "Check LOCAL_LLM_BASE_URL / LOCAL_LLM_MODEL and retry.",
+            },
+        )
+    if finish_reason == "length" or (length_limited_seen and finish_reason == "length"):
         raise HTTPException(
             status_code=422,
             detail={
                 "message": "AI response was truncated due to model/output limit.",
                 "validation_or_parse_error": f"finish_reason={finish_reason or 'unknown'}",
                 "hint": "Increase ACTION_LLM_MAX_TOKENS, shorten selection, or increase ACTION_MODEL_CONTEXT_TOKENS.",
+            },
+        )
+    if looks_cut and finish_reason not in ("stop", "end_turn", "end"):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "AI response appears truncated.",
+                "validation_or_parse_error": f"finish_reason={finish_reason or 'unknown'}",
+                "hint": "Increase ACTION_LLM_MAX_TOKENS or shorten the selection.",
             },
         )
 
@@ -1194,6 +1272,102 @@ def _render_dynamic_gap_check(gaps: list[dict[str, str]]) -> str:
     )
 
 
+def _infer_edit_scope_from_payload(payload: AIActionRequest) -> str | None:
+    raw = str(getattr(payload, "edit_scope", None) or "").strip().lower()
+    st = str(payload.section_type or "").strip().lower()
+    name = str(payload.section_name or "").strip().lower()
+    if raw == "full_document" or st in ("full document", "full sop") or name in (
+        "full document",
+        "full sop",
+        "gesamte sop",
+        "komplette sop",
+        "entire sop",
+        "whole sop",
+    ):
+        return "full_document"
+    text = str(payload.text or "")
+    if is_traceability_register_block(text):
+        return "section_only"
+    if raw in ("section_only", "full_document"):
+        return raw
+    return None
+
+
+def _build_improve_rewrite_context(
+    request: ActionRequest,
+    style_block: str,
+    sop_context_block: str,
+) -> str:
+    scope = resolve_edit_scope(request)
+    if scope == "section_only":
+        return (
+            f"{IMPROVE_REWRITE_NO_RAG_CONTEXT}\n"
+            "SCOPE_LOCK: Rewrite/improve ONLY the TEXT block in this request. "
+            "Ignore other SOP sections from metadata or NLP lists. "
+            "Do not output title, Version, Status, or backbone sections 1–5 unless they appear in TEXT.\n"
+            f"{style_block}"
+        ).strip()
+    return f"{IMPROVE_REWRITE_NO_RAG_CONTEXT}\n{style_block}\n{sop_context_block}".strip()
+
+
+def _enforce_section_only_action_text(
+    runtime: Any,
+    *,
+    action: str,
+    request: ActionRequest,
+    text: str,
+    context: str,
+    nlp_block: str,
+    ch_budget: int,
+) -> str:
+    """Retry or trim model output that expanded a section-only request into a full SOP."""
+    scope = resolve_edit_scope(request)
+    original = request.section_text or ""
+    out = (text or "").strip()
+    if scope != "section_only" or not out or not violates_section_only_scope(original, out):
+        return out
+
+    logger.warning(
+        "[ai-action-scope-violation] action=%s section=%s in_chars=%s out_chars=%s — retrying strict prompt",
+        action,
+        request.section_title,
+        len(original),
+        len(out),
+    )
+    retry_builder = (
+        build_section_only_rewrite_retry_prompt
+        if action == "rewrite"
+        else build_section_only_improve_retry_prompt
+    )
+    retry_prompt = retry_builder(request, context, nlp_block)
+    schema = RewriteResponse if action == "rewrite" else ImproveResponse
+    try:
+        retry_parsed = parse_with_retry(
+            raw=_call_action_llm(runtime, retry_prompt, input_char_budget=ch_budget, action=f"{action}_scope_retry"),
+            schema=schema,
+            prompt=retry_prompt,
+            call_llm=lambda rp: _call_action_llm(
+                runtime, rp, input_char_budget=ch_budget, action=f"{action}_scope_retry"
+            ),
+            audit_log=[],
+        )
+        retry_text = (
+            retry_parsed.rewritten_text
+            if action == "rewrite"
+            else retry_parsed.improved_text
+        )
+        if retry_text and not violates_section_only_scope(original, retry_text):
+            return retry_text.strip()
+    except Exception as exc:
+        logger.warning("[ai-action-scope-retry-failed] action=%s err=%s", action, exc)
+
+    extracted = extract_register_slice_from_output(out, original)
+    if extracted and not violates_section_only_scope(original, extracted):
+        logger.info("[ai-action-scope-extract] action=%s extracted_chars=%s", action, len(extracted))
+        return extracted
+    return out
+
+
 def _build_action_request(payload: AIActionRequest) -> ActionRequest:
     entity = ""
     try:
@@ -1201,14 +1375,19 @@ def _build_action_request(payload: AIActionRequest) -> ActionRequest:
         entity = str(raw_e).strip() if raw_e is not None else ""
     except Exception:
         entity = ""
+    edit_scope = _infer_edit_scope_from_payload(payload)
+    section_type = payload.section_type or "Selected Text"
+    if edit_scope == "full_document":
+        section_type = "Full Document"
     return ActionRequest(
         document_id=payload.sop_title or "editor-document",
         section_id=(payload.section_name or "selected-text").lower().replace(" ", "-"),
         sop_title=payload.sop_title or "Untitled SOP",
         section_title=payload.section_name or "Selected text",
-        section_type=payload.section_type or "Selected Text",
+        section_type=section_type,
         section_text=payload.text,
         sop_entity_id=entity or None,
+        edit_scope=edit_scope,
     )
 
 
@@ -1429,6 +1608,15 @@ def _build_gap_check_retrieval_query(request: ActionRequest) -> str:
 
 
 def _rewrite_should_use_industry_scaffold(request: ActionRequest) -> bool:
+    from chatbot.actions.prompts import resolve_edit_scope
+
+    if resolve_edit_scope(request) != "full_document":
+        return False
+    # Actions tab / API clients that set edit_scope explicitly expect the canonical
+    # build_rewrite_prompt FULL_DOCUMENT path (preserves TEXT order from title onward).
+    explicit = getattr(request, "edit_scope", None)
+    if explicit == "full_document":
+        return False
     text = request.section_text or ""
     section_type = (request.section_type or "").strip().lower()
     if section_type == "full document" and len(text) >= 1800:
@@ -1723,8 +1911,7 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
             flush=True,
         )
     else:
-        # improve / rewrite: no RAG — system prompt + rules + document fields + section text only
-        context = f"{IMPROVE_REWRITE_NO_RAG_CONTEXT}\n{style_block}\n{sop_context_block}".strip()
+        context = _build_improve_rewrite_context(request, style_block, sop_context_block)
 
     logger.info(
         "[ai-action-prompt] action=%s prompt_type=%s_json_nlp_v1 provider=%s model=%s nlp_block_chars=%s",
@@ -1746,22 +1933,32 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
             ),
             audit_log=[],
         )
+        improved_text = _enforce_section_only_action_text(
+            runtime,
+            action="improve",
+            request=request,
+            text=parsed.improved_text,
+            context=context,
+            nlp_block=nlp_block,
+            ch_budget=ch_budget,
+        )
         logger.info(
             "[ai-action-result] action=improve ok=1 provider=%s model=%s suggested_chars=%s",
             cfg.provider,
             cfg.model,
-            len(parsed.improved_text or ""),
+            len(improved_text or ""),
         )
         return AIActionResponse(
             action="improve",
             original_text=request.section_text,
-            suggested_text=_render_dynamic_text(parsed.improved_text),
+            suggested_text=_render_dynamic_text(improved_text),
             explanation="Text verbessert / Text improved.",
             structured_data={
-                "improved_text": parsed.improved_text,
-                "improved_version": parsed.improved_text,
+                "improved_text": improved_text,
+                "improved_version": improved_text,
                 "style_profile": style_profile,
                 "nlp_action_summary": nlp_summary,
+                "edit_scope": resolve_edit_scope(request),
             },
         )
 
@@ -1854,21 +2051,32 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
             ),
             audit_log=[],
         )
+        rewritten_text = _enforce_section_only_action_text(
+            runtime,
+            action="rewrite",
+            request=request,
+            text=parsed.rewritten_text,
+            context=context,
+            nlp_block=nlp_block,
+            ch_budget=ch_budget,
+        )
         logger.info(
-            "[ai-action-result] action=rewrite ok=1 provider=%s model=%s suggested_chars=%s",
+            "[ai-action-result] action=rewrite ok=1 provider=%s model=%s suggested_chars=%s edit_scope=%s",
             cfg.provider,
             cfg.model,
-            len(parsed.rewritten_text or ""),
+            len(rewritten_text or ""),
+            resolve_edit_scope(request),
         )
         return AIActionResponse(
             action="rewrite",
             original_text=request.section_text,
-            suggested_text=_render_dynamic_text(parsed.rewritten_text),
+            suggested_text=_render_dynamic_text(rewritten_text),
             explanation="Text neu formuliert / Text rewritten.",
             structured_data={
-                "rewritten_text": parsed.rewritten_text,
+                "rewritten_text": rewritten_text,
                 "style_profile": style_profile,
                 "nlp_action_summary": nlp_summary,
+                "edit_scope": resolve_edit_scope(request),
             },
         )
 
@@ -2093,10 +2301,179 @@ def _extract_refs(items: list, keys: list[str], limit: int = 8) -> list[str]:
     return refs
 
 
+def _visible_user_question(raw: str) -> str:
+    """User-facing chat text only (strip legacy frontend context prefix if present)."""
+    q = str(raw or "").strip()
+    if not q:
+        return ""
+    m = re.match(
+        r"^Active SOP context:\s*.+?\.\s*User request:\s*(.+)$",
+        q,
+        re.IGNORECASE | re.DOTALL,
+    )
+    return m.group(1).strip() if m else q
+
+
+def _user_requests_global_scope(question: str) -> bool:
+    q = (question or "").lower()
+    return bool(
+        re.search(
+            r"\b(all|every|entire|whole|global|across|system-wide)\b.*\b(sop|sops|database|system|records)\b",
+            q,
+        )
+        or re.search(r"\b(sop|sops)\b.*\b(all|every|entire|whole|global)\b", q)
+        or re.search(r"\b(alle|sämtliche|gesamt)\b.*\b(sop|sops)\b", q)
+    )
+
+
+def _linked_entity_ids_from_context(linked: dict, key: str) -> list[str]:
+    out: list[str] = []
+    for item in _ctx_list(linked.get(key)):
+        if not isinstance(item, dict):
+            continue
+        value = str(item.get("id") or "").strip()
+        if value:
+            out.append(value)
+    return out
+
+
+def _load_linked_entity_ids_from_db(sop_id: str) -> dict[str, list[str]]:
+    """Resolve linked entity UUIDs for an active SOP (same traversal as /api/sops/{id}/related)."""
+    try:
+        sop_uuid = uuid.UUID(str(sop_id).strip())
+    except ValueError:
+        return {}
+
+    db = SessionLocal()
+    try:
+        sop = db.query(SOP).filter(SOP.id == sop_uuid, SOP.is_active == True).first()  # noqa: E712
+        if not sop:
+            return {}
+
+        dev_ids = {
+            str(row[0])
+            for row in db.query(SopDeviationLink.deviation_id).filter(SopDeviationLink.sop_id == sop.id).all()
+        }
+        decision_ids = {
+            str(row[0])
+            for row in db.query(DecisionSopLink.decision_id).filter(DecisionSopLink.sop_id == sop.id).all()
+        }
+        audit_ids: set[str] = set()
+        capa_ids: set[str] = set()
+
+        if dev_ids:
+            capa_ids = {
+                str(row[0])
+                for row in db.query(DeviationCapaLink.capa_id)
+                .filter(DeviationCapaLink.deviation_id.in_(list(dev_ids)))
+                .all()
+            }
+        if decision_ids:
+            audit_ids = {
+                str(row[0])
+                for row in db.query(AuditDecisionLink.audit_finding_id)
+                .filter(AuditDecisionLink.decision_id.in_(list(decision_ids)))
+                .all()
+            }
+        if capa_ids:
+            audit_ids.update(
+                str(row[0])
+                for row in db.query(CapaAuditLink.audit_finding_id)
+                .filter(CapaAuditLink.capa_id.in_(list(capa_ids)))
+                .all()
+            )
+        if audit_ids:
+            capa_ids.update(
+                str(row[0])
+                for row in db.query(CapaAuditLink.capa_id)
+                .filter(CapaAuditLink.audit_finding_id.in_(list(audit_ids)))
+                .all()
+            )
+            dev_ids.update(
+                str(row[0])
+                for row in db.query(DeviationCapaLink.deviation_id)
+                .filter(DeviationCapaLink.capa_id.in_(list(capa_ids)))
+                .all()
+            )
+            decision_ids.update(
+                str(row[0])
+                for row in db.query(AuditDecisionLink.decision_id)
+                .filter(AuditDecisionLink.audit_finding_id.in_(list(audit_ids)))
+                .all()
+            )
+
+        related_sop_ids = {
+            str(row[0])
+            for row in db.query(DecisionSopLink.sop_id)
+            .filter(DecisionSopLink.decision_id.in_(list(decision_ids)))
+            .all()
+            if row[0] and str(row[0]) != str(sop.id)
+        }
+
+        return {
+            "linked_deviation_ids": sorted(dev_ids),
+            "linked_capa_ids": sorted(capa_ids),
+            "linked_audit_ids": sorted(audit_ids),
+            "linked_decision_ids": sorted(decision_ids),
+            "linked_sop_ids": sorted(related_sop_ids),
+        }
+    finally:
+        db.close()
+
+
+def _extract_active_sop_scope(assistant_context: dict | None) -> dict:
+    ctx = assistant_context or {}
+    current = ctx.get("current_sop") if isinstance(ctx.get("current_sop"), dict) else {}
+    linked = ctx.get("linked_context") if isinstance(ctx.get("linked_context"), dict) else {}
+    editor_active = bool(ctx.get("editor_surface_active"))
+    route = str(ctx.get("route") or "").strip().lower()
+    if not editor_active and not route.startswith("/editor"):
+        return {
+            "active_sop_id": "",
+            "active_sop_ref": "",
+            "title": "",
+            "linked_deviation_ids": [],
+            "linked_capa_ids": [],
+            "linked_audit_ids": [],
+            "linked_decision_ids": [],
+            "linked_sop_ids": [],
+        }
+    active_sop_id = str(
+        ctx.get("active_sop_id") or ctx.get("current_document_id") or current.get("id") or ""
+    ).strip()
+    active_sop_ref = str(current.get("sop_number") or current.get("documentId") or "").strip()
+    title = str(current.get("title") or "").strip()
+
+    scope = {
+        "active_sop_id": active_sop_id,
+        "active_sop_ref": active_sop_ref,
+        "title": title,
+        "linked_deviation_ids": _linked_entity_ids_from_context(linked, "deviations"),
+        "linked_capa_ids": _linked_entity_ids_from_context(linked, "capas"),
+        "linked_audit_ids": _linked_entity_ids_from_context(linked, "audits"),
+        "linked_decision_ids": _linked_entity_ids_from_context(linked, "decisions"),
+        "linked_sop_ids": _linked_entity_ids_from_context(linked, "related_sops"),
+    }
+
+    if active_sop_id:
+        db_linked = _load_linked_entity_ids_from_db(active_sop_id)
+        for key in (
+            "linked_deviation_ids",
+            "linked_capa_ids",
+            "linked_audit_ids",
+            "linked_decision_ids",
+            "linked_sop_ids",
+        ):
+            merged = sorted(set(scope.get(key) or []) | set(db_linked.get(key) or []))
+            scope[key] = merged
+
+    return scope
+
+
 def _query_intents(question: str) -> set[str]:
     q = (question or "").lower()
     intents: set[str] = set()
-    if re.search(r"\b(how many|count|number of|total)\b.*\b(sop|sops)\b", q):
+    if re.search(r"\b(how many|count|number of|total|wie viele|anzahl)\b.*\b(sop|sops)\b", q):
         intents.add("sop_count")
     if re.search(r"\b(list|show|which|what)\b.*\b(sop|sops)\b", q):
         intents.add("sop_list")
@@ -2121,20 +2498,65 @@ def _summarize_live_context(assistant_context: dict | None, question: str = "") 
     text = str(ctx.get("editor_excerpt") or "").strip()
     references = _ctx_list(current.get("references"))
     intents = _query_intents(question)
-    linked_devs = _extract_refs(_ctx_list(linked.get("deviations")), ["deviation_number", "ref_number", "id"])
-    linked_capas = _extract_refs(_ctx_list(linked.get("capas")), ["capa_number", "ref_number", "id"])
-    linked_audits = _extract_refs(_ctx_list(linked.get("audits")), ["finding_number", "audit_number", "ref_number", "id"])
-    linked_decisions = _extract_refs(_ctx_list(linked.get("decisions")), ["decision_number", "ref_number", "id"])
-    related_sops = _extract_refs(_ctx_list(linked.get("related_sops")), ["sop_number", "ref_number", "id"])
+    scope = _extract_active_sop_scope(assistant_context)
+    active_sop_ref = str(scope.get("active_sop_ref") or current.get("sop_number") or current.get("id") or "").strip()
+    active_sop_id = str(scope.get("active_sop_id") or "").strip()
     open_sop_tabs = _extract_refs(tabs, ["docId", "label"], limit=10)
     include_editor_excerpt = bool(text) and bool({"summary", "active_sop", "compare"} & intents)
     excerpt = text[:1200] if include_editor_excerpt else ""
     focus_note = ""
-    active_sop_ref = str(current.get("sop_number") or current.get("id") or "").strip()
     if "summary" in intents and active_sop_ref:
         focus_note = f"- Focus SOP for summary: {active_sop_ref}\n"
     elif "compare" in intents and open_sop_tabs:
         focus_note = f"- Compare candidates from open tabs: {', '.join(open_sop_tabs[:6])}\n"
+
+    if active_sop_id and not _user_requests_global_scope(question):
+        minimal = (
+            "LIVE_ASSISTANT_CONTEXT\n"
+            f"- Active SOP: {active_sop_ref or active_sop_id} | title={current.get('title') or 'unknown'} | "
+            f"id={active_sop_id} | version={current.get('version') or 'unknown'} | "
+            f"status={current.get('status') or 'unknown'}\n"
+            "- Retrieval scope: ACTIVE SOP ONLY — use this SOP and its linked entities; "
+            "do not search or summarize other SOPs unless the user explicitly asks for all SOPs.\n"
+            f"- Linked counts: deviations={len(scope.get('linked_deviation_ids') or [])}, "
+            f"capas={len(scope.get('linked_capa_ids') or [])}, "
+            f"audits={len(scope.get('linked_audit_ids') or [])}, "
+            f"decisions={len(scope.get('linked_decision_ids') or [])}\n"
+        )
+        if not {"summary", "linked", "compare"} & intents:
+            return minimal + f"{focus_note}- Answer only what was asked; avoid unsolicited summaries."
+
+        linked_devs = _extract_refs(_ctx_list(linked.get("deviations")), ["deviation_number", "ref_number", "id"])
+        linked_capas = _extract_refs(_ctx_list(linked.get("capas")), ["capa_number", "ref_number", "id"])
+        linked_audits = _extract_refs(
+            _ctx_list(linked.get("audits")), ["finding_number", "audit_number", "ref_number", "id"]
+        )
+        linked_decisions = _extract_refs(
+            _ctx_list(linked.get("decisions")), ["decision_number", "ref_number", "id"]
+        )
+        related_sops = _extract_refs(_ctx_list(linked.get("related_sops")), ["sop_number", "ref_number", "id"])
+        return (
+            minimal
+            + f"- Linked deviations: {len(scope.get('linked_deviation_ids') or [])} ({', '.join(linked_devs) or 'none'})\n"
+            + f"- Linked CAPAs: {len(scope.get('linked_capa_ids') or [])} ({', '.join(linked_capas) or 'none'})\n"
+            + f"- Linked audits: {len(scope.get('linked_audit_ids') or [])} ({', '.join(linked_audits) or 'none'})\n"
+            + f"- Linked decisions: {len(scope.get('linked_decision_ids') or [])} ({', '.join(linked_decisions) or 'none'})\n"
+            + f"- Related SOPs: {len(scope.get('linked_sop_ids') or [])} ({', '.join(related_sops) or 'none'})\n"
+            + f"- Open tabs: {len(tabs)}\n"
+            + f"{focus_note}"
+            + f"- References in editor metadata: {', '.join(str(r) for r in references[:10]) or 'none'}\n"
+            + f"- Editor text excerpt: {excerpt if excerpt else 'not injected for this query intent'}"
+        )
+
+    linked_devs = _extract_refs(_ctx_list(linked.get("deviations")), ["deviation_number", "ref_number", "id"])
+    linked_capas = _extract_refs(_ctx_list(linked.get("capas")), ["capa_number", "ref_number", "id"])
+    linked_audits = _extract_refs(
+        _ctx_list(linked.get("audits")), ["finding_number", "audit_number", "ref_number", "id"]
+    )
+    linked_decisions = _extract_refs(
+        _ctx_list(linked.get("decisions")), ["decision_number", "ref_number", "id"]
+    )
+    related_sops = _extract_refs(_ctx_list(linked.get("related_sops")), ["sop_number", "ref_number", "id"])
     return (
         "LIVE_ASSISTANT_CONTEXT\n"
         f"- Active SOP: {current.get('sop_number') or current.get('id') or 'unknown'} | "
@@ -2334,9 +2756,14 @@ async def perform_ai_action(payload: AIActionRequest):
     if not payload.text:
         raise HTTPException(status_code=422, detail="Selected text is required.")
 
+    request_preview = _build_action_request(payload)
+    edit_scope = resolve_edit_scope(request_preview)
     logger.info(
-        "[ai-action-request] action=%s text_in_len=%s text_norm_len=%s preview=%s",
+        "[ai-action-request] action=%s edit_scope=%s section=%s section_type=%s text_in_len=%s text_norm_len=%s preview=%s",
         action,
+        edit_scope,
+        request_preview.section_title,
+        request_preview.section_type,
         len(raw_in),
         len(payload.text),
         _truncate_text(raw_in.replace("\n", " "), 220),
@@ -2413,7 +2840,9 @@ async def query_ai(
     - ``query`` (or ``query_only``): RAG/QA only; SOP mutations and action execution are disabled.
     - ``action`` (default): existing behaviour with optional SOP create/update/delete flows.
     """
-    question = (payload.get("question") or payload.get("query") or "").strip()
+    question = _visible_user_question(
+        payload.get("display_question") or payload.get("user_question") or payload.get("question") or payload.get("query")
+    )
     if not question:
         raise HTTPException(status_code=422, detail="question is required")
 
@@ -2495,6 +2924,7 @@ async def query_ai(
 
     profile_context = _extract_profile_context(payload, assistant_context)
     intents = _query_intents(question)
+    active_scope = _extract_active_sop_scope(assistant_context)
     context_summary = _summarize_live_context(assistant_context, question)
     action_plan = None
     if assistant_mode == "action":
@@ -2514,17 +2944,29 @@ async def query_ai(
     question_for_rag = question
     context_hints: list[str] = []
     current_sop = assistant_context.get("current_sop") if isinstance(assistant_context.get("current_sop"), dict) else {}
-    active_ref = str(current_sop.get("sop_number") or current_sop.get("id") or "").strip()
+    active_ref = str(active_scope.get("active_sop_ref") or current_sop.get("sop_number") or current_sop.get("id") or "").strip()
+    active_id = str(active_scope.get("active_sop_id") or "").strip()
+    scoped_editor = bool(active_id) and not _user_requests_global_scope(question)
     logger.info(
-        "[chatbot-intent] surface=%s intents=%s active_ref=%s",
+        "[chatbot-intent] surface=%s intents=%s active_ref=%s active_id=%s scoped=%s",
         surface,
         sorted(intents),
         active_ref or "none",
+        active_id or "none",
+        scoped_editor,
     )
     print(
-        f"[chatbot-intent] surface={surface} intents={sorted(intents)} active_ref={active_ref or 'none'}",
+        f"[chatbot-intent] surface={surface} intents={sorted(intents)} active_ref={active_ref or 'none'} scoped={scoped_editor}",
         flush=True,
     )
+    if scoped_editor:
+        if active_id:
+            context_hints.append(f"ACTIVE_SOP_ID={active_id}")
+        if active_ref:
+            context_hints.append(f"ACTIVE_SOP={active_ref}")
+        context_hints.append("SCOPE=ACTIVE_SOP_ONLY")
+        if not {"sop_count", "sop_list"} & intents:
+            category = category or "sops"
     if ("active_sop" in intents) and active_ref:
         category = "sops"
     if "summary" in intents and active_ref:
@@ -2557,21 +2999,6 @@ async def query_ai(
             "Use this planned action and live context while answering."
         )
 
-    # RAG is the default source of truth. Local DB primary mode is opt-in only
-    # for diagnostics and should not be used in normal semantic chatbot flow.
-    allow_local_db_bypass = bool(payload.get("allow_local_db_primary")) and CHATBOT_USE_LOCAL_DB and CHATBOT_ALLOW_LOCAL_DB_PRIMARY
-    if allow_local_db_bypass:
-        # Run in a worker thread so SQLAlchemy work does not block the event loop
-        # (avoids piling up slow requests, nginx timeouts, and a stuck-feeling UI).
-        response = await asyncio.to_thread(
-            _build_local_db_chat_response, question_for_rag, chat_history, category
-        )
-        logger.info(
-            "[chatbot-response] source=local-db-primary latency_ms=%.1f",
-            (time.perf_counter() - t0) * 1000.0,
-        )
-        return response
-
     pipeline_timeout = get_chat_pipeline_timeout_seconds()
     logger.info(
         "[chatbot-timeout] pipeline_seconds=%s local_llm_seconds=%s",
@@ -2598,6 +3025,7 @@ async def query_ai(
                     question_for_rag,
                     category,
                     chat_history,
+                    active_scope if scoped_editor else None,
                 ),
                 timeout=pipeline_timeout,
             )
@@ -2614,6 +3042,7 @@ async def query_ai(
                         compact_q,
                         category,
                         compact_history,
+                        active_scope if scoped_editor else None,
                     ),
                     timeout=pipeline_timeout,
                 )
@@ -2773,7 +3202,9 @@ async def query_ai(
         dbg_preview = str(dbg_rows[0])[:480]
 
     if not had_evidence and (not answer_raw or boilerplate_unreachable):
-        response["answer"] = "Sorry, I do not have enough information about this."
+        from chatbot.rag.rag_chain import RAG_NO_CONTEXT_REFUSAL
+
+        response["answer"] = RAG_NO_CONTEXT_REFUSAL
         response["citations"] = []
         response["sources"] = []
         response["retrieval_debug"] = []
@@ -2798,15 +3229,10 @@ async def query_ai(
         )
 
     try:
-        from chatbot.rag.rag_chain import (
-            _strip_sources_footer_from_answer,
-            _strip_sources_lines_from_answer,
-        )
+        from chatbot.rag.rag_chain import sanitize_user_facing_answer
 
         if not bool((response.get("retrieval_stats") or {}).get("strict_mode")):
-            response["answer"] = _strip_sources_footer_from_answer(
-                _strip_sources_lines_from_answer(response.get("answer") or "")
-            )
+            response["answer"] = sanitize_user_facing_answer(response.get("answer") or "")
     except Exception:
         pass
 

@@ -41,12 +41,23 @@ def build_nlp_bundle_for_action(
     Gap check: always run window NLP on excerpt+selection; upload NLP from ProfileDetection when present.
     """
     profile = sop_ctx.get("profile_detection") if isinstance(sop_ctx.get("profile_detection"), dict) else None
+    from chatbot.actions.prompts import resolve_edit_scope
+
+    scope = resolve_edit_scope(request)
     sop_text = str(sop_ctx.get("text") or "")
+    selection = request.section_text or ""
     parts: list[str] = []
-    if sop_text.strip():
-        parts.append(_trunc(sop_text, 50_000))
-    parts.append("---SELECTED---")
-    parts.append(request.section_text or "")
+    if scope == "section_only":
+        parts.append(f"---TARGET_SECTION:{request.section_title or 'selection'}---")
+        parts.append(selection)
+        if sop_text.strip():
+            parts.append("---SOP_CONTEXT_EXCERPT (style reference only; do not rewrite)---")
+            parts.append(_trunc(sop_text, 8_000))
+    else:
+        if sop_text.strip():
+            parts.append(_trunc(sop_text, 50_000))
+        parts.append("---FULL_DOCUMENT_TEXT---")
+        parts.append(selection)
     combined = "\n\n".join(parts).strip()
 
     reuse_improve_rewrite = bool(

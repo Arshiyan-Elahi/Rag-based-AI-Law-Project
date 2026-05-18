@@ -200,6 +200,12 @@ def persist_chat_query_exchange(
         )
         retrieval_meta = _build_retrieval_metadata(response, llm_provider, llm_model)
         answer = str(response.get("answer") or "")
+        try:
+            from chatbot.rag.rag_chain import sanitize_user_facing_answer
+
+            answer = sanitize_user_facing_answer(answer)
+        except Exception:
+            pass
         citations = response.get("citations")
         trace_meta = {
             "surface": (surface or "")[:120] or None,

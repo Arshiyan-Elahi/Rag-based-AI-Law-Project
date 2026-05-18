@@ -51,11 +51,14 @@ RAG_DEBUG_RETRIEVAL = os.getenv("RAG_DEBUG_RETRIEVAL", "false").strip().lower() 
 RAG_DEBUG_MAX_CHUNKS = int(os.getenv("RAG_DEBUG_MAX_CHUNKS", "8"))
 logger = logging.getLogger(__name__)
 RAG_STRICT_INVENTORY_MODE = os.getenv("RAG_STRICT_INVENTORY_MODE", "false").strip().lower() == "true"
-# When false (default), SOP count/list still runs from query intent (recommended for QA).
-RAG_DISABLE_SOP_INVENTORY = os.getenv("RAG_DISABLE_SOP_INVENTORY", "false").strip().lower() == "true"
+# SOP inventory count/list bypasses RAG when false; default true = retrieval-only answers.
+RAG_DISABLE_SOP_INVENTORY = os.getenv("RAG_DISABLE_SOP_INVENTORY", "true").strip().lower() == "true"
 
-NO_SOP_CONTEXT_FALLBACK = (
-    "No SOP data is currently available in the system, so I cannot answer this from SOP context."
+RAG_NO_CONTEXT_REFUSAL = (
+    "No relevant information found in the current documents/context."
+)
+RAG_OUT_OF_SCOPE_REFUSAL = (
+    "I can only answer questions related to uploaded documents, SOPs, or retrieved system context."
 )
 
 
@@ -149,6 +152,21 @@ def _extract_active_sop_from_prompt(prompt: str) -> tuple[str, str]:
     return "", ""
 
 
+def _extract_active_sop_id_from_prompt(prompt: str) -> str:
+    raw = str(prompt or "")
+    m = re.search(r"ACTIVE_SOP_ID=([^\s\n|]+)", raw, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"\|\s*id=([0-9a-fA-F-]{36})\s*\|", raw)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
+def _prompt_requests_active_sop_scope(prompt: str) -> bool:
+    return bool(re.search(r"\bSCOPE=ACTIVE_SOP_ONLY\b", str(prompt or ""), re.IGNORECASE))
+
+
 def _strip_sources_footer_from_answer(text: str) -> str:
     """Remove trailing 'Sources:' / '📎 Sources:' blocks so UI + citations are single source."""
     s = (text or "").strip()
@@ -171,6 +189,103 @@ def _strip_sources_lines_from_answer(text: str) -> str:
             continue
         out.append(line)
     return "\n".join(out).rstrip()
+
+
+# Internal markers that must never appear in user-facing assistant text.
+_INTERNAL_ANSWER_LINE_PREFIXES = (
+    "- active sop:",
+    "- retrieval scope:",
+    "- linked deviations:",
+    "- linked capas:",
+    "- linked audits:",
+    "- linked decisions:",
+    "- related sops:",
+    "- open tabs:",
+    "- references in editor",
+    "- editor text excerpt:",
+    "- focus sop for",
+    "- compare candidates",
+    "- answer only what was asked",
+    "live_assistant_context",
+    "rag_hints:",
+    "planned_assistant_action:",
+)
+
+
+def sanitize_user_facing_answer(text: str) -> str:
+    """
+    Strip retrieval/system annotations from the final answer shown in chat UIs.
+    Citations like [SOP-IT-001] are kept; LIVE_ASSISTANT_CONTEXT and debug tags are removed.
+    """
+    s = (text or "").strip()
+    if not s:
+        return ""
+
+    # Drop machine blocks if the parser missed them.
+    for marker in ("---SUGGESTIONS---", "---CITATIONS---"):
+        if marker.lower() in s.lower():
+            s = re.split(re.escape(marker), s, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+
+    # Remove multiline injected context dumps.
+    s = re.sub(
+        r"LIVE_ASSISTANT_CONTEXT\b[\s\S]*?(?=\n\n(?:Summary|Details|Status|Cross-refs|The |Die |Der |In )|\Z)",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    )
+
+    # Inline / bracket system markers (keep document refs like [SOP-IT-001]).
+    bracketed = (
+        r"LIVE_ASSISTANT_CONTEXT",
+        r"LIVE_ASSISTANT",
+        r"editor_context",
+        r"RETRIEVED\s+CONTEXT",
+    )
+    for name in bracketed:
+        s = re.sub(rf"\[\s*{name}\s*\]", "", s, flags=re.IGNORECASE)
+        s = re.sub(rf"\b{name}\b", "", s, flags=re.IGNORECASE)
+
+    inline_patterns = (
+        r"\[REASONING\]",
+        r"\[CONFIDENCE\]",
+        r"\[ANSWER\]",
+        r"\bSCOPE=ACTIVE_SOP_ONLY\b",
+        r"\bACTIVE_SOP_ID=[0-9a-fA-F-]{8,}\b",
+        r"\bRAG_HINTS:\s*[^\n\]]*",
+        r"\bPLANNED_ASSISTANT_ACTION:\s*[^\n\]]*",
+        r"\[\s*Retrieval scope:\s*[^\]]+\]",
+        r"Retrieval scope:\s*ACTIVE SOP ONLY[^\n]*",
+    )
+    for pat in inline_patterns:
+        s = re.sub(pat, "", s, flags=re.IGNORECASE)
+
+    # Remove internal context bullet lines.
+    cleaned_lines: List[str] = []
+    for line in s.splitlines():
+        stripped = line.strip()
+        low = stripped.lower()
+        if not stripped:
+            cleaned_lines.append("")
+            continue
+        if any(low.startswith(p) for p in _INTERNAL_ANSWER_LINE_PREFIXES):
+            continue
+        if re.match(r"^\[?(LIVE_ASSISTANT|RAG_HINTS|ACTIVE_SOP|SCOPE=)", stripped, re.IGNORECASE):
+            continue
+        cleaned_lines.append(line)
+    s = "\n".join(cleaned_lines)
+
+    # Orphan brackets / punctuation left after stripping.
+    s = re.sub(r"\[\s*\]", "", s)
+    s = re.sub(r"\s+\[\s*(?=[,.;:!?\s]|$)", "", s)
+    s = re.sub(r"\s{2,}", " ", s)
+    s = re.sub(r" *\n *", "\n", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    s = re.sub(r"\s+([,.;:!?])", r"\1", s)
+    s = s.strip()
+
+    s = _strip_sources_lines_from_answer(s)
+    s = _strip_sources_footer_from_answer(s)
+    return s.strip()
 
 
 def _dedupe_citations_by_ref(cits: List[dict]) -> List[dict]:
@@ -351,11 +466,12 @@ class HybridRAGChain:
 
 SMART_SYSTEM = """\
 You are a precise, bilingual QMS/IT Compliance AI Assistant integrated with a
-production Hybrid RAG system. You act as a QA assistant inside the SOP editor: lead
-with a direct answer, stay query-focused (about 4–8 short lines unless the user asks
-for full detail), and use LIVE_ASSISTANT_CONTEXT / active SOP hints in the user message
-when the question is about "this SOP", "current", or linked deviations, CAPAs, audits,
-or decisions.
+production Hybrid RAG system.
+
+When LIVE_ASSISTANT_CONTEXT names an Active SOP or SCOPE=ACTIVE_SOP_ONLY is present,
+restrict every answer to that SOP and its linked entities only — never other SOPs.
+Use LIVE_ASSISTANT_CONTEXT / ACTIVE_SOP / ACTIVE_SOP_ID hints when the question is about
+"this SOP", "current", or linked deviations, CAPAs, audits, or decisions.
 
 You have access to a structured Qdrant vector database with the following SEPARATE
 collections. You MUST search the correct collection based on the user's intent:
@@ -461,14 +577,15 @@ governs that area.
 Example: DEV-IT-101 → SOP-IT-001 (OT access management)
 Proactively surface this link as: [RELATED SOP: SOP-IT-001]
 
-RULE 10 — REFUSAL RULE
-When RETRIEVED CONTEXT includes records that bear on the question, you MUST
-answer from that context (with citations). Refuse only when the retrieved
-snippets are empty, off-topic, or clearly unrelated to the question.
-If you must refuse, use one short sentence stating that no relevant records
-were found (do not copy boilerplate from these instructions).
-Never hallucinate fields, dates, or root causes that are null or missing
-in the data.
+RULE 10 — REFUSAL RULE (RETRIEVAL-GROUNDED ONLY)
+You are NOT a general-purpose chatbot. Answer ONLY using facts present in
+RETRIEVED CONTEXT below. Do not use outside knowledge, training data, or guesses.
+When RETRIEVED CONTEXT includes records that bear on the question, answer from
+that context with citations. Refuse when snippets are empty, off-topic, or when
+the user asks general knowledge unrelated to QMS documents (e.g. "what is an LLM?").
+If you must refuse, reply with exactly one sentence:
+"I can only answer questions related to uploaded documents, SOPs, or retrieved system context."
+Never hallucinate fields, dates, or root causes that are null or missing in the data.
 """
 
 SMART_USER = """\
@@ -503,22 +620,26 @@ STEP 2 — [ANSWER]
   • Cite every fact with bracket notation, e.g.
     [SOP-IT-001], [DEV-IT-401], [CAPA-22], [AUDIT-7], [DEC-15]
   • For deviations with impact_level Critical or Major, start that bullet or
-    sentence with the warning emoji (warning marker).
+    sentence with the warning marker (⚠️).
   • If a related SOP governs the topic, add a line:
     [RELATED SOP: SOP-XX-XXX — title]
   • If version or effective date appears in the context, you may include it
     in the citation line, e.g. [SOP-QA-010 v4.0 | effective: YYYY-MM-DD]
+  • If SCOPE=ACTIVE_SOP_ONLY: never cite or discuss records outside the active SOP scope.
 
-  For non-trivial answers, you may use short plain-text sections (no markdown tables):
+  For non-trivial answers, use this structure (plain text, no markdown tables):
   Summary: one short paragraph
-  Details: only the bullets needed to answer the question (each with [REF] citations)
+  Details: bullet lines, each with citations
   Status: current status / impact when known from context
-  Cross-refs: only if directly relevant to the question
+  Cross-refs: related SOPs, deviations, CAPAs, audits, or decisions if grounded in context
 
   Do not use markdown headings (no #), bold, tables, or code fences.
-  Stay within ~200 words unless the user explicitly asks for full detail.
-  Do NOT add a separate "Sources" or "📎 Sources" line in [ANSWER]; cite facts inline
-  with [SOP-…], [DEV-…], etc., and list structured citations only in ---CITATIONS--- below.
+  Never echo internal labels in [ANSWER] (e.g. LIVE_ASSISTANT_CONTEXT, RAG_HINTS,
+  ACTIVE_SOP_ID, SCOPE=ACTIVE_SOP_ONLY, editor_context, or retrieval-scope notes).
+  Stay within 400 words unless the user explicitly asks for full detail.
+  End the [ANSWER] section with a line:
+  Sources: list every cited record ID in brackets, comma-separated
+  (You may prefix that line with 📎 for example: "📎 Sources: [SOP-IT-001], [DEV-IT-401]")
 
 STEP 3 — [CONFIDENCE]
   One line, e.g.:
@@ -544,6 +665,34 @@ exactly (the application parses them). List each cited source once in
 ---SUGGESTIONS---
 ["Follow-up using record IDs from context", "Second follow-up", "Third follow-up"]
 """
+
+
+def _editor_context_documents_from_prompt(full_prompt: str) -> List[Document]:
+    """Turn injected LIVE_ASSISTANT_CONTEXT into retrievable context (not a hardcoded answer)."""
+    raw = str(full_prompt or "")
+    marker = "LIVE_ASSISTANT_CONTEXT"
+    if marker not in raw:
+        return []
+    block = raw.split(marker, 1)[1]
+    for end_marker in ("\n\nRAG_HINTS:", "\n\nPLANNED_ASSISTANT_ACTION:"):
+        if end_marker in block:
+            block = block.split(end_marker, 1)[0]
+    text = f"{marker}\n{block.strip()}"
+    if len(text.strip()) < 24:
+        return []
+    active_ref, active_title = _extract_active_sop_from_prompt(raw)
+    return [
+        Document(
+            page_content=text[:4000],
+            metadata={
+                "ref_number": active_ref or "EDITOR_CONTEXT",
+                "title": active_title or "Active editor context",
+                "entity_type": "editor_context",
+                "source_id": "live_assistant_context",
+                "_section": "sops",
+            },
+        )
+    ]
 
 
 def _build_unified_context(docs: List[Document], prefix_label: str) -> Tuple[str, List[dict]]:
@@ -684,8 +833,9 @@ def _parse_answer_citations_suggestions(raw: str) -> Tuple[str, List[dict], List
     # Clamp suggestions
     suggestions = [s for s in suggestions if isinstance(s, str)][:4]
 
-    answer = _strip_sources_lines_from_answer(answer)
-    answer = _strip_sources_footer_from_answer(answer)
+    answer = sanitize_user_facing_answer(
+        _strip_sources_footer_from_answer(_strip_sources_lines_from_answer(answer))
+    )
 
     return answer, citations, suggestions, reasoning, confidence
 
@@ -1096,6 +1246,7 @@ class SmartRAGChain:
         self.llm = get_llm()
         self.router = LLMRouter(llm=self.llm)
         self._active_ids_cache: dict[str, tuple[datetime, list[str]]] = {}
+        self._last_scoped_sop_id: str = ""
         self.prompt = ChatPromptTemplate.from_messages([
             SystemMessage(content=SMART_SYSTEM),
             MessagesPlaceholder(variable_name="chat_history_messages"),
@@ -1129,6 +1280,51 @@ class SmartRAGChain:
         self._active_ids_cache[section] = (now, ids)
         return ids
 
+    def _clear_scope_cache_if_switched(self, active_sop_id: str) -> None:
+        key = _canonical_entity_id_key(active_sop_id)
+        if key and key != self._last_scoped_sop_id:
+            self._active_ids_cache.clear()
+            self._last_scoped_sop_id = key
+
+    def _resolve_allowed_entity_ids(
+        self,
+        section: str,
+        active_scope: dict | None,
+        full_prompt: str = "",
+    ) -> list[str] | None:
+        """
+        None  → corpus-wide active entities (_get_active_entity_ids).
+        list  → restrict retrieval to these entity UUIDs (may be empty).
+        """
+        scope = active_scope if isinstance(active_scope, dict) else {}
+        scoped_id = str(scope.get("active_sop_id") or "").strip()
+        if not scoped_id and _prompt_requests_active_sop_scope(full_prompt):
+            scoped_id = _extract_active_sop_id_from_prompt(full_prompt)
+        if not scoped_id:
+            return None
+
+        sid = _canonical_entity_id_key(scoped_id)
+
+        def _norm_list(key: str) -> list[str]:
+            raw = scope.get(key) or []
+            if not isinstance(raw, list):
+                return []
+            return [_canonical_entity_id_key(str(x)) for x in raw if str(x).strip()]
+
+        if section == "sops":
+            ids = [sid] + [x for x in _norm_list("linked_sop_ids") if x and x != sid]
+        elif section == "deviations":
+            ids = _norm_list("linked_deviation_ids")
+        elif section == "capas":
+            ids = _norm_list("linked_capa_ids")
+        elif section == "audits":
+            ids = _norm_list("linked_audit_ids")
+        elif section == "decisions":
+            ids = _norm_list("linked_decision_ids")
+        else:
+            ids = []
+
+        return list(dict.fromkeys(x for x in ids if x))
 
     def _extract_metadata_filters(self, query: str) -> dict:
         """
@@ -1172,6 +1368,8 @@ class SmartRAGChain:
         metadata_filters: dict,
         active_doc_id: str,
         num_target_sections: int,
+        active_scope: dict | None = None,
+        full_prompt: str = "",
     ) -> tuple[str, List[Document], int]:
         """Hybrid retrieve + rerank for one router section (thread-safe per section retriever)."""
         retriever = self.federated.retrievers.get(section)
@@ -1179,7 +1377,11 @@ class SmartRAGChain:
             return section, [], 0
         try:
             section_filters = dict(metadata_filters or {})
-            section_filters["allowed_entity_ids"] = self._get_active_entity_ids(section)
+            scoped_ids = self._resolve_allowed_entity_ids(section, active_scope, full_prompt)
+            if scoped_ids is not None:
+                section_filters["allowed_entity_ids"] = scoped_ids
+            else:
+                section_filters["allowed_entity_ids"] = self._get_active_entity_ids(section)
             retriever.metadata_filters = section_filters
             if rag_unified_enabled():
                 retriever.category_filter = section
@@ -1225,10 +1427,23 @@ class SmartRAGChain:
             fallback_llm = get_fallback_llm()
             return (fallback_llm | parser).invoke(prompt).strip()
 
-    def invoke(self, query: str, category: str = None, chat_history: List[Dict] = None) -> dict:
+    def invoke(
+        self,
+        query: str,
+        category: str = None,
+        chat_history: List[Dict] = None,
+        active_scope: dict | None = None,
+    ) -> dict:
         t0 = time.time()
         query_for_routing = _strip_injected_context_blocks(query)
         full_ctx_query = (query or "").strip()
+        scoped_sop_id = ""
+        if isinstance(active_scope, dict):
+            scoped_sop_id = str(active_scope.get("active_sop_id") or "").strip()
+        if not scoped_sop_id and _prompt_requests_active_sop_scope(full_ctx_query):
+            scoped_sop_id = _extract_active_sop_id_from_prompt(full_ctx_query)
+        if scoped_sop_id:
+            self._clear_scope_cache_if_switched(scoped_sop_id)
         llm_cfg = get_local_llm_config()
         logger.info(
             "[rag-invoke] provider=%s model=%s retrieval_query_preview=%s",
@@ -1236,49 +1451,21 @@ class SmartRAGChain:
             llm_cfg.model,
             _console_safe(_truncate_text(query_for_routing or query, 240)),
         )
-        if _looks_like_sop_generation_query(query_for_routing):
-            sop_text = self._generate_structured_sop(query)
-            return {
-                "answer": sop_text,
-                "reasoning": "",
-                "confidence": "HIGH — direct SOP authoring mode from user-provided notes.",
-                "citations": [],
-                "retrieval_debug": [],
-                "suggestions": [
-                    "Review role assignments for each procedure step",
-                    "Add organization-specific compliance references",
-                    "Request a shorter version for training use",
-                ],
-                "retrieval_stats": {
-                    "searched": [],
-                    "per_section": {},
-                    "total_docs": 0,
-                    "latency_ms": round((time.time() - t0) * 1000, 1),
-                    "authoring_mode": "sop_generation",
-                },
-                "routed_to": "sop-generation",
-                "cached": False,
-                "metadata_snapshot": [],
-                "audit_log_snapshot": [],
-                "action_metadata": {
-                    "query": _truncate_text(query, MAX_QUERY_CHARS),
-                    "routing": ["sop-generation"],
-                    "latency_ms": round((time.time() - t0) * 1000, 1),
-                    "timestamp": time.time(),
-                    "model": get_local_llm_config().model,
-                },
-            }
-
         cat_norm = (category or "").strip().lower()
         route_data = self.router.route(query_for_routing)
         sop_inventory_mode: Optional[Literal["count", "list"]] = None
-        if not RAG_DISABLE_SOP_INVENTORY and ((not cat_norm) or cat_norm == "sops"):
+        editor_scoped = bool(scoped_sop_id) or _prompt_requests_active_sop_scope(full_ctx_query)
+        if not RAG_DISABLE_SOP_INVENTORY and ((not cat_norm) or cat_norm == "sops") and not editor_scoped:
             sop_inventory_mode = _classify_sop_inventory_query(query_for_routing)
 
         # ── Step 0: Extract Metadata Filters & Active Doc ID ──
         metadata_filters = self._extract_metadata_filters(query_for_routing)
         active_doc_id = self._find_active_doc_id(chat_history) if chat_history else ""
-        if active_doc_id and not sop_inventory_mode:
+        if editor_scoped and scoped_sop_id:
+            active_ref_hint, _ = _extract_active_sop_from_prompt(full_ctx_query)
+            if active_ref_hint and active_ref_hint.upper().startswith("SOP"):
+                metadata_filters["ref_number"] = active_ref_hint.upper()
+        elif active_doc_id and not sop_inventory_mode:
             _safe_print(f"  [context] identified active doc from history: {active_doc_id}")
             is_sop_query = any(
                 k in (query_for_routing or "").lower() for k in ["sop", "procedure", "standard"]
@@ -1333,11 +1520,14 @@ class SmartRAGChain:
         )
         _safe_print(f"[rag-routing] sections={target_sections} filters={metadata_filters}")
 
-        if sop_inventory_mode:
+        if sop_inventory_mode and not RAG_DISABLE_SOP_INVENTORY:
             sop_retriever = self.federated.retrievers.get("sops")
             if sop_retriever:
                 section_filters = dict(metadata_filters or {})
-                section_filters["allowed_entity_ids"] = self._get_active_entity_ids("sops")
+                scoped_ids = self._resolve_allowed_entity_ids("sops", active_scope, full_ctx_query)
+                section_filters["allowed_entity_ids"] = (
+                    scoped_ids if scoped_ids is not None else self._get_active_entity_ids("sops")
+                )
                 sop_retriever.metadata_filters = section_filters
                 if rag_unified_enabled():
                     sop_retriever.category_filter = "sops"
@@ -1391,7 +1581,7 @@ class SmartRAGChain:
         elif n_sec == 1:
             sec = target_sections[0]
             _, ranked, cnt = self._retrieve_ranked_for_section(
-                sec, query_for_routing, mf_copy, active_doc_id, n_sec
+                sec, query_for_routing, mf_copy, active_doc_id, n_sec, active_scope, full_ctx_query
             )
             section_ranked[sec] = ranked
             per_section_counts[sec] = cnt
@@ -1405,6 +1595,8 @@ class SmartRAGChain:
                         mf_copy,
                         active_doc_id,
                         n_sec,
+                        active_scope,
+                        full_ctx_query,
                     ): section
                     for section in target_sections
                 }
@@ -1458,23 +1650,12 @@ class SmartRAGChain:
             retrieval_phase_ms,
         )
 
+        editor_ctx_docs = _editor_context_documents_from_prompt(full_ctx_query)
+        if editor_ctx_docs:
+            all_docs = editor_ctx_docs + list(all_docs or [])
+            per_section_counts["editor_context"] = len(editor_ctx_docs)
+
         if not all_docs:
-            if sop_inventory_mode:
-                strict_resp = _strict_sop_inventory_response(
-                    [],
-                    query_for_routing,
-                    self.federated.retrievers.get("sops"),
-                    mode=sop_inventory_mode,
-                    full_prompt=full_ctx_query,
-                )
-                strict_resp["retrieval_stats"] = {
-                    "searched": target_sections,
-                    "per_section": per_section_counts,
-                    "total_docs": 0,
-                    "latency_ms": round((time.time() - t0) * 1000, 1),
-                    "strict_mode": True,
-                }
-                return strict_resp
             logger.info(
                 "[rag-refusal] reason=zero_chunks sections=%s filters=%s provider=%s model=%s",
                 target_sections,
@@ -1482,15 +1663,8 @@ class SmartRAGChain:
                 llm_cfg.provider,
                 llm_cfg.model,
             )
-            refusal_msg = "Sorry, I do not have enough information about this."
-            if (
-                _db_active_sop_count() == 0
-                and "sops" in target_sections
-                and _user_query_expects_sop_context(query_for_routing)
-            ):
-                refusal_msg = NO_SOP_CONTEXT_FALLBACK
             return {
-                "answer": refusal_msg,
+                "answer": RAG_NO_CONTEXT_REFUSAL,
                 "citations": [],
                 "suggestions": [
                     "Ask about a specific SOP number",
@@ -1514,7 +1688,7 @@ class SmartRAGChain:
                 "failure_stage": "no_retrieval",
             }
 
-        if sop_inventory_mode:
+        if sop_inventory_mode and not RAG_DISABLE_SOP_INVENTORY:
             strict_resp = _strict_sop_inventory_response(
                 all_docs,
                 query_for_routing,
@@ -1624,11 +1798,7 @@ class SmartRAGChain:
                 body = ex or title
                 if body:
                     pieces.append(f"{ref}: {body}" if ref else body)
-            answer_fb = (
-                "\n\n".join(pieces)
-                if pieces
-                else "Retrieved relevant records from the index, but the local language model did not return a summary."
-            )
+            answer_fb = RAG_NO_CONTEXT_REFUSAL
             latency_ms = round((time.time() - t0) * 1000.0, 1)
             return {
                 "answer": answer_fb,

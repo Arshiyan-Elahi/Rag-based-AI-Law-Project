@@ -415,6 +415,7 @@ export async function performAIAction(payload) {
         sop_title: payload?.sop_title || null,
         section_name: payload?.section_name || payload?.section_title || null,
         section_type: payload?.section_type || null,
+        edit_scope: payload?.edit_scope || null,
         client_structured_json: payload?.client_structured_json || null,
         sop_entity_id: payload?.sop_entity_id || null,
         triggered_by: payload?.triggered_by || null,

@@ -34,7 +34,7 @@ def _flatten_content_json(content_json: dict) -> str:
 
 class APIDataFetcher:
     def __init__(self):
-        self.base_url = os.getenv("API_BASE_URL", "").rstrip("/")
+        self.base_url = os.getenv("API_BASE_URL", "http://127.0.0.1:8001").rstrip("/")
         self.endpoint_sops = os.getenv("ENDPOINT_SOPS", "/api/sops")
         self.headers = {"Accept": "application/json"}
         api_key = os.getenv("API_KEY")

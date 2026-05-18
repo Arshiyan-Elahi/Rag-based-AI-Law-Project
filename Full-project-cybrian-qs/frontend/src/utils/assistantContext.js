@@ -49,12 +49,21 @@ export function getKLAssistantContext(pathname = '/') {
   const editorState = readLocalJson(KL_EDITOR_CONTEXT_KEY, {})
   const workspaceState = readLocalJson(KL_WORKSPACE_CONTEXT_KEY, {})
   const activeDocumentId = localStorage.getItem('current_document_id') || ''
+  const activeSopId = activeDocumentId || editorState?.sop?.id || ''
+  const activeTabId = workspaceState?.active_tab_id || ''
+  const workspaceEditorTabActive =
+    typeof activeTabId === 'string' && activeTabId.startsWith('editor-')
+  const onEditorSurface =
+    pathname.startsWith('/editor') ||
+    ((pathname === '/sops' || pathname.startsWith('/sops/')) && workspaceEditorTabActive)
 
   return {
     route: pathname,
-    current_document_id: activeDocumentId || editorState?.sop?.id || '',
+    current_document_id: activeSopId,
+    active_sop_id: onEditorSurface ? activeSopId : '',
+    editor_surface_active: Boolean(activeSopId && onEditorSurface),
     current_sop: {
-      id: editorState?.sop?.id || activeDocumentId || '',
+      id: activeSopId,
       sop_number: editorState?.sop?.sop_number || editorState?.sop?.documentId || '',
       title: editorState?.sop?.title || '',
       version: editorState?.sop?.version || '',

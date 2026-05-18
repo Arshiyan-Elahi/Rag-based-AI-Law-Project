@@ -426,3 +426,32 @@
   from { transform: rotate(0deg); }
   to { transform: rotate(360deg); }
 }
+
+/* Inline diff decorations (Actions tab rewrite/improve) */
+.ProseMirror .ai-inline-diff-removed {
+  background: rgba(254, 226, 226, 0.85);
+  color: #991b1b;
+  text-decoration: line-through;
+  text-decoration-color: #b91c1c;
+}
+
+.ai-inline-diff-added-block {
+  display: block;
+  margin: 6px 0 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: rgba(220, 252, 231, 0.95);
+  color: #14532d;
+  border-left: 3px solid #22c55e;
+  white-space: pre-wrap;
+  font-size: inherit;
+  line-height: 1.55;
+}
+
+.ai-inline-diff-added-block.tiptap p {
+  margin: 0 0 6px;
+}
+
+.ai-inline-diff-added-block.tiptap p:last-child {
+  margin-bottom: 0;
+}

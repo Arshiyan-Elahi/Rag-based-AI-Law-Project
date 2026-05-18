@@ -123,6 +123,22 @@ def build_nlp_structure_parameters_inner_body(
     sop_title = (getattr(request, "sop_title", None) if request else None) or scalars.get("sop_title") or sop_ctx.get("title") or ""
     ver_lbl = scalars.get("version_label") or (sop_ctx.get("version_id") and f"id:{sop_ctx.get('version_id')}") or ""
 
+    if request is not None and action in ("improve", "rewrite", "summarize", "analyze"):
+        try:
+            from chatbot.actions.prompts import resolve_edit_scope
+
+            scope = resolve_edit_scope(request)
+            ln = _scalar_line("Edit Scope", scope)
+            if ln:
+                lines.append(ln)
+            if scope == "section_only":
+                target = getattr(request, "section_title", None) or "Selected text"
+                ln = _scalar_line("Target Section (rewrite/improve only this block)", target)
+                if ln:
+                    lines.append(ln)
+        except Exception:
+            pass
+
     for part in (
         _scalar_line("SOP Number", sop_num),
         _scalar_line("SOP Title", sop_title),

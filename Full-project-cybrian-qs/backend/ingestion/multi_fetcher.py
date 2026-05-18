@@ -4,7 +4,8 @@ Fetches data from all 5 entity-specific API endpoints in parallel,
 cleans and normalises each record into a LangChain Document,
 ready to be chunked and upserted into separate Qdrant collections.
 
-DOES NOT modify any existing files.
+Uses WEBHOOK_ENDPOINT_* from .env when set (resolved via webhook_config),
+otherwise API_BASE_URL + ENDPOINT_* paths.
 """
 
 import os
@@ -17,25 +18,39 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BASE_URL = os.getenv("API_BASE_URL", "").rstrip("/")
+try:
+    from app.services.webhook_config import get_all_webhook_endpoints, normalize_internal_url
+except ImportError:
+    get_all_webhook_endpoints = None  # type: ignore
+    normalize_internal_url = lambda u: u  # type: ignore
+
+BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8001").rstrip("/")
 ENDPOINT_SOPS = os.getenv("ENDPOINT_SOPS", "/api/sops")
 ENDPOINT_DEVIATIONS = os.getenv("ENDPOINT_DEVIATIONS", "/api/deviations")
 ENDPOINT_CAPAS = os.getenv("ENDPOINT_CAPAS", "/api/capas")
 ENDPOINT_DECISIONS = os.getenv("ENDPOINT_DECISIONS", "/api/decisions")
 ENDPOINT_AUDITS = os.getenv("ENDPOINT_AUDITS", "/api/audits")
 
-# Optional webhook endpoint vars for ingestion/webhook alignment.
-WEBHOOK_ENDPOINT_SOPS = os.getenv("WEBHOOK_ENDPOINT_SOPS", "")
-WEBHOOK_ENDPOINT_DEVIATIONS = os.getenv("WEBHOOK_ENDPOINT_DEVIATIONS", "")
-WEBHOOK_ENDPOINT_CAPAS = os.getenv("WEBHOOK_ENDPOINT_CAPAS", "")
-WEBHOOK_ENDPOINT_DECISIONS = os.getenv("WEBHOOK_ENDPOINT_DECISIONS", "")
-WEBHOOK_ENDPOINT_AUDITS = os.getenv("WEBHOOK_ENDPOINT_AUDITS", "")
-HEADERS = {
-    "Accept": "application/json",
-}
+HEADERS = {"Accept": "application/json"}
 api_key = os.getenv("API_KEY", "")
 if api_key and api_key != "dummy_developer_key":
     HEADERS["Authorization"] = f"Bearer {api_key}"
+
+
+def _resolved_fetch_urls() -> dict[str, str]:
+    """Prefer WEBHOOK_ENDPOINT_* full URLs; fall back to API_BASE_URL + ENDPOINT_*."""
+    if get_all_webhook_endpoints:
+        cfgs = get_all_webhook_endpoints()
+        if cfgs:
+            return {c.entity_key: c.url for c in cfgs}
+
+    return {
+        "sops": normalize_internal_url(f"{BASE_URL}{ENDPOINT_SOPS}"),
+        "deviations": normalize_internal_url(f"{BASE_URL}{ENDPOINT_DEVIATIONS}"),
+        "capas": normalize_internal_url(f"{BASE_URL}{ENDPOINT_CAPAS}"),
+        "decisions": normalize_internal_url(f"{BASE_URL}{ENDPOINT_DECISIONS}"),
+        "audits": normalize_internal_url(f"{BASE_URL}{ENDPOINT_AUDITS}"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +88,6 @@ def _flatten_content_json(content_json: dict) -> str:
                 parts.append(inner + "\n")
             return
 
-        # Recurse into any other container node
         for child in children:
             walk(child)
 
@@ -91,10 +105,8 @@ def _clean_sop(item: dict) -> Document | None:
     meta_json    = version.get("metadata_json") or {}
     sop_meta     = meta_json.get("sopMetadata") or {}
 
-    # Flatten the TipTap JSON into plain text
     text = _flatten_content_json(content_json)
 
-    # If content_json only has a generic placeholder, build text from title
     if not text or "Technical documentation for" in text:
         text = (
             f"{item.get('sop_number', '')} - {item.get('title', '')}\n"
@@ -111,7 +123,6 @@ def _clean_sop(item: dict) -> Document | None:
             "department": item.get("department", ""),
             "status":     version.get("external_status", ""),
             "risk_level": sop_meta.get("riskLevel", ""),
-            # Audit Vault Snapshots
             "full_metadata": item,
             "audit_trail": meta_json.get("auditTrail", []),
         },
@@ -137,7 +148,6 @@ def _clean_deviation(item: dict) -> Document | None:
             "title":        item.get("title", ""),
             "status":       item.get("external_status", ""),
             "impact_level": item.get("impact_level", ""),
-            # Audit Vault Snapshots
             "full_metadata": item,
             "audit_trail": item.get("audit_trail") or item.get("auditTrail") or [],
         },
@@ -160,7 +170,6 @@ def _clean_capa(item: dict) -> Document | None:
             "ref_number": item.get("capa_number", ""),
             "title":      item.get("title", ""),
             "status":     item.get("external_status", ""),
-            # Audit Vault Snapshots
             "full_metadata": item,
             "audit_trail": item.get("audit_trail") or item.get("auditTrail") or [],
         },
@@ -183,7 +192,6 @@ def _clean_decision(item: dict) -> Document | None:
             "ref_number": item.get("decision_number", ""),
             "title":      item.get("title", ""),
             "status":     "",
-            # Audit Vault Snapshots
             "full_metadata": item,
             "audit_trail": item.get("audit_trail") or item.get("auditTrail") or [],
         },
@@ -206,7 +214,6 @@ def _clean_audit(item: dict) -> Document | None:
             "ref_number": item.get("finding_number", ""),
             "title":      item.get("finding_number", "Audit Finding"),
             "status":     item.get("acceptance_status", ""),
-            # Audit Vault Snapshots
             "full_metadata": item,
             "audit_trail": item.get("audit_trail") or item.get("auditTrail") or [],
         },
@@ -217,8 +224,7 @@ def _clean_audit(item: dict) -> Document | None:
 # Async HTTP helpers
 # ---------------------------------------------------------------------------
 
-async def _fetch_json(client: httpx.AsyncClient, path: str) -> list:
-    url = f"{BASE_URL}{path}"
+async def _fetch_json_url(client: httpx.AsyncClient, url: str) -> list:
     resp = await client.get(url, headers=HEADERS)
     resp.raise_for_status()
     data = resp.json()
@@ -231,17 +237,22 @@ async def _fetch_json(client: httpx.AsyncClient, path: str) -> list:
 
 async def fetch_all_entities() -> dict[str, List[Document]]:
     """
-    Fetches all 5 entity types from their API endpoints in parallel.
+    Fetches all 5 entity types from webhook-configured URLs in parallel.
     Returns a dict:  { "sops": [...], "deviations": [...], ... }
-    Each value is a list of LangChain Documents ready for chunking.
     """
+    urls = _resolved_fetch_urls()
+    cleaners = {
+        "sops": _clean_sop,
+        "deviations": _clean_deviation,
+        "capas": _clean_capa,
+        "decisions": _clean_decision,
+        "audits": _clean_audit,
+    }
+
     async with httpx.AsyncClient(timeout=120.0) as client:
-        sops_raw, devs_raw, capas_raw, decisions_raw, audits_raw = await asyncio.gather(
-            _fetch_json(client, ENDPOINT_SOPS),
-            _fetch_json(client, ENDPOINT_DEVIATIONS),
-            _fetch_json(client, ENDPOINT_CAPAS),
-            _fetch_json(client, ENDPOINT_DECISIONS),
-            _fetch_json(client, ENDPOINT_AUDITS),
+        keys = list(urls.keys())
+        raw_batches = await asyncio.gather(
+            *[_fetch_json_url(client, urls[k]) for k in keys]
         )
 
     def _safe_clean(cleaner, item, entity_type):
@@ -251,16 +262,13 @@ async def fetch_all_entities() -> dict[str, List[Document]]:
             print(f"  [ERROR] Failed to clean {entity_type} item {item.get('id')}: {e}")
             return None
 
-    result = {
-        "sops":       [d for item in sops_raw      if (d := _safe_clean(_clean_sop, item, "sop"))       is not None],
-        "deviations": [d for item in devs_raw       if (d := _safe_clean(_clean_deviation, item, "deviation")) is not None],
-        "capas":      [d for item in capas_raw      if (d := _safe_clean(_clean_capa, item, "capa"))      is not None],
-        "decisions":  [d for item in decisions_raw  if (d := _safe_clean(_clean_decision, item, "decision"))  is not None],
-        "audits":     [d for item in audits_raw     if (d := _safe_clean(_clean_audit, item, "audit"))     is not None],
-    }
-
-    for key, docs in result.items():
-        print(f"  [{key}] fetched & cleaned {len(docs)} documents")
+    result = {}
+    for key, raw in zip(keys, raw_batches):
+        cleaner = cleaners[key]
+        result[key] = [
+            d for item in raw if (d := _safe_clean(cleaner, item, key)) is not None
+        ]
+        print(f"  [{key}] fetched from {urls[key]} — {len(result[key])} documents")
 
     return result
 

@@ -4,7 +4,6 @@ from typing import List
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_, asc
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from concurrent.futures import ThreadPoolExecutor
 from qdrant_client.http import models as qmodels
 import hashlib
 from .database import get_db, SessionLocal
@@ -60,6 +59,9 @@ import threading
 import logging
 from datetime import datetime
 from .services.sop_metadata_extractor import strip_invalid_control_chars
+from .services.semantic_jobs import schedule_semantic_reindex
+from .services.webhook_service import entities_for_link
+from .utils.tiptap_text import extract_plain_text_from_tiptap
 
 # ==========================================
 # CONSTANTS
@@ -67,8 +69,6 @@ from .services.sop_metadata_extractor import strip_invalid_control_chars
 
 # Fixed tenant for dev/seed environment
 FIXED_TENANT_ID = uuid.UUID("11111111-1111-1111-1111-111111111111")
-SEMANTIC_WORKER_THREADS = max(1, int(os.getenv("SEMANTIC_WORKER_THREADS", "2")))
-_semantic_job_executor = ThreadPoolExecutor(max_workers=SEMANTIC_WORKER_THREADS, thread_name_prefix="semantic-job")
 logger = logging.getLogger(__name__)
 
 
@@ -314,63 +314,24 @@ def _resolve_current_version(db: Session, sop: SOP) -> SOPVersion | None:
     return initial_version
 
 
-def _schedule_semantic_job(background_tasks: BackgroundTasks, entity_type: str, entity_id: uuid.UUID, version_id: uuid.UUID | None = None, job_type: str = "entity_reindex"):
+def _schedule_semantic_job(
+    background_tasks: BackgroundTasks,
+    entity_type: str,
+    entity_id: uuid.UUID,
+    version_id: uuid.UUID | None = None,
+    job_type: str = "entity_reindex",
+):
     try:
         if entity_type not in ENTITY_TYPES:
             return
-        if entity_type == "sop" and version_id:
-            db = SessionLocal()
-            try:
-                version = db.query(SOPVersion).filter(SOPVersion.id == version_id, SOPVersion.sop_id == entity_id).first()
-                if version and isinstance(version.metadata_json, dict):
-                    plain_text = _extract_plain_text_from_tiptap(version.content_json)
-                    if plain_text:
-                        content_hash = hashlib.sha256(plain_text.encode("utf-8", errors="ignore")).hexdigest()
-                        import_hash = version.metadata_json.get("_import_context_hash")
-                        if import_hash == content_hash:
-                            print(
-                                f"[semantic-job] Skipped unchanged already-indexed SOP {entity_id} v={version_id}",
-                                flush=True,
-                            )
-                            return
-            finally:
-                db.close()
-        
         print(f"[semantic-job] Scheduling {job_type} for {entity_type} {entity_id}", flush=True)
-        job_id = SemanticPipelineService.enqueue_reindex(
-            entity_type=entity_type,
-            entity_id=entity_id,
-            version_id=version_id,
-            job_type=job_type,
-        )
-        if not job_id:
-            return
-        # Fire-and-forget with bounded worker pool to avoid spawning unbounded
-        # per-request threads and exhausting DB connection pool.
-        def _run_one_async() -> None:
-            try:
-                SemanticPipelineService.process_job(job_id)
-            except Exception as exc:
-                print(f"[semantic-job] {job_id} failed: {exc}", flush=True)
-        _semantic_job_executor.submit(_run_one_async)
+        schedule_semantic_reindex(entity_type, entity_id, version_id, job_type=job_type)
     except Exception as exc:
         print(f"[semantic-job] ERROR: Failed to schedule job for {entity_type} {entity_id}: {exc}", flush=True)
 
+
 def _extract_plain_text_from_tiptap(doc_json: dict | None) -> str:
-    if not isinstance(doc_json, dict):
-        return ""
-    out: list[str] = []
-
-    def walk(node: dict):
-        if not isinstance(node, dict):
-            return
-        if node.get("type") == "text" and node.get("text"):
-            out.append(str(node.get("text")))
-        for child in node.get("content", []) or []:
-            walk(child)
-
-    walk(doc_json)
-    return " ".join(out).strip()
+    return extract_plain_text_from_tiptap(doc_json)
 
 
 def _parse_uuid_or_400(value: str, field_name: str = "id") -> uuid.UUID:
@@ -2474,7 +2435,11 @@ def search_knowledge(q: str, db: Session = Depends(get_db)):
 # ==========================================
 
 @router.post("/api/links")
-def create_link(payload: LinkRequest, db: Session = Depends(get_db)):
+def create_link(
+    payload: LinkRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     """Create a manual link between two entities."""
     l_type = payload.link_type.lower()
     source_id = payload.source_id
@@ -2497,6 +2462,8 @@ def create_link(payload: LinkRequest, db: Session = Depends(get_db)):
         
     db.add(link_obj)
     db.commit()
+    for entity_type, entity_id in entities_for_link(l_type, source_id, target_id):
+        _schedule_semantic_job(background_tasks, entity_type, entity_id, job_type="link_reindex")
     return {"status": "success", "link_id": str(link_obj.id)}
 
 @router.delete("/api/links/{link_type}/{link_id}")

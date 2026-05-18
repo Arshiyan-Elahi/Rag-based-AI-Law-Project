@@ -29,7 +29,9 @@ from .ai_routes import ai_router, CHATBOT_USE_LOCAL_DB, _get_smart_rag_chain
 from .auth_routes import router as auth_router
 from .chat_history_routes import router as chat_history_router
 from .profile_routes import router as profile_router
+from .webhook_routes import webhook_router
 from .services.semantic_pipeline import SemanticPipelineService
+from .services.webhook_config import validate_webhook_configuration
 
 logger = logging.getLogger("cybrain.startup")
 if not logger.handlers:
@@ -146,6 +148,14 @@ def _bootstrap_rag_runtime() -> None:
     finally:
         db.close()
 
+    wh = validate_webhook_configuration()
+    logger.info(
+        "[startup-webhook] complete=%s endpoints=%d api_base=%s",
+        wh.get("complete"),
+        len(wh.get("endpoints") or []),
+        wh.get("api_base_url"),
+    )
+
 
 def _spawn_background_bootstrap() -> threading.Thread:
     def _runner() -> None:
@@ -199,6 +209,7 @@ app.include_router(ai_router)
 app.include_router(chat_history_router)
 app.include_router(auth_router)
 app.include_router(profile_router)
+app.include_router(webhook_router)
 
 
 @app.middleware("http")

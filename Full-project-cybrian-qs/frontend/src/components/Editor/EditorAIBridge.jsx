@@ -4,12 +4,29 @@ import AIComparisonModal from './AIComparisonModal'
 import { performAIAction } from '../../api/editorApi'
 import { formatAiSuggestionForUi } from '../../utils/aiOutputFormatter'
 import {
+  dispatchEditorSnapshotResponse,
+  subscribeEditorInlineSuggestionApply,
+  subscribeEditorInlineSuggestionClear,
+  subscribeEditorInlineSuggestionShow,
+  subscribeEditorSnapshotRequest,
+  EDITOR_GAP_APPEND_EVENT,
+  EDITOR_SCROLL_TO_RANGE_EVENT,
+} from '../../utils/editorActionsBridge'
+import {
+  clearInlineAiSuggestion,
+  setInlineAiSuggestion,
+} from '../../utils/editorInlineSuggestionPlugin'
+import { resolveTargetInEditor } from '../../utils/editorTargetResolver'
+import {
   AI_ACTION_TRIGGERED_BY,
   EDITOR_AI_ACTIONS,
   EDITOR_AI_ACTION_STATUS,
   dispatchEditorAiActionResult,
   subscribeEditorAiActionRequest,
 } from '../../utils/editorAiBridge'
+
+const INLINE_SHOWN_EVENT = 'editor-actions-inline-shown'
+const INLINE_APPLIED_EVENT = 'editor-actions-inline-applied'
 
 const ACTION_TEXT_WARNING_CHARS = 7000
 
@@ -93,6 +110,8 @@ const EditorAIBridge = ({
   const sopMetadataRef = useRef(sopMetadata)
   const documentIdRef = useRef(documentId)
   const isEditableRef = useRef(isEditable)
+  /** Pending inline suggestion from the sidebar Actions tab. */
+  const inlinePendingRef = useRef(null)
 
   useEffect(() => { editorRef.current = editor }, [editor])
   useEffect(() => { sopMetadataRef.current = sopMetadata }, [sopMetadata])
@@ -265,6 +284,7 @@ const EditorAIBridge = ({
         sop_title: sopTitle,
         section_name: sectionName,
         section_type: sectionType,
+        edit_scope: isFullDoc ? 'full_document' : 'section_only',
         sop_entity_id: documentIdRef.current || null,
         triggered_by: AI_ACTION_TRIGGERED_BY.KL_ASSISTANT,
       })
@@ -323,6 +343,263 @@ const EditorAIBridge = ({
       preview,
     })
   }, [emitResult])
+
+  const resolveDocRange = useCallback((detail) => {
+    const liveEditor = editorRef.current
+    if (!liveEditor || liveEditor.isDestroyed) return null
+    const size = liveEditor.state.doc.content.size
+    const from = Number.isFinite(detail.from) ? detail.from : 0
+    const to = Number.isFinite(detail.to) ? detail.to : size
+    return {
+      from: Math.max(0, Math.min(from, size)),
+      to: Math.max(from, Math.min(to, size)),
+    }
+  }, [])
+
+  const emitInlineShown = useCallback((requestId, range) => {
+    const liveEditor = editorRef.current
+    let toolbarCoords = null
+    if (liveEditor?.view && range) {
+      try {
+        const coords = liveEditor.view.coordsAtPos(range.to)
+        toolbarCoords = { top: coords.top + window.scrollY, left: coords.left + window.scrollX }
+      } catch {
+        toolbarCoords = null
+      }
+    }
+    window.dispatchEvent(
+      new CustomEvent(INLINE_SHOWN_EVENT, {
+        detail: {
+          requestId,
+          toolbarCoords,
+          from: range?.from,
+          to: range?.to,
+        },
+      }),
+    )
+  }, [])
+
+  const emitInlineApplied = useCallback((requestId, ok, message = '') => {
+    window.dispatchEvent(
+      new CustomEvent(INLINE_APPLIED_EVENT, {
+        detail: { requestId, ok, message },
+      }),
+    )
+  }, [])
+
+  useEffect(() => {
+    const unsubSnapshot = subscribeEditorSnapshotRequest(({ requestId, prompt }) => {
+      const liveEditor = editorRef.current
+      if (!liveEditor || liveEditor.isDestroyed || !isEditableRef.current) {
+        dispatchEditorSnapshotResponse({
+          requestId,
+          ok: false,
+          message: 'Editor is not available or is read-only.',
+        })
+        return
+      }
+      const { state } = liveEditor
+      const { selection } = state
+      const hasSelection = Boolean(selection && !selection.empty)
+      const selectionPayload = hasSelection
+        ? {
+            from: selection.from,
+            to: selection.to,
+            text: state.doc.textBetween(selection.from, selection.to, '\n'),
+            empty: false,
+          }
+        : { empty: true }
+
+      try {
+        const target = resolveTargetInEditor(liveEditor, {
+          prompt: String(prompt || ''),
+          selection: selectionPayload,
+        })
+        if (!target?.text || target.from == null || target.to == null) {
+          dispatchEditorSnapshotResponse({
+            requestId,
+            ok: false,
+            error: 'Could not find that heading or paragraph in the open SOP. Check the text or select it in the editor.',
+          })
+          return
+        }
+        dispatchEditorSnapshotResponse({
+          requestId,
+          ok: true,
+          target,
+          fullText: state.doc.textBetween(0, state.doc.content.size, '\n'),
+          docSize: state.doc.content.size,
+          selection: selectionPayload,
+          sopTitle: (sopMetadataRef.current?.title || 'Untitled SOP').toString(),
+          sopNumber: (sopMetadataRef.current?.documentId || '').toString(),
+        })
+      } catch (err) {
+        dispatchEditorSnapshotResponse({
+          requestId,
+          ok: false,
+          error: err?.message || 'Could not resolve target in editor.',
+        })
+      }
+    })
+
+    const unsubShow = subscribeEditorInlineSuggestionShow((detail) => {
+      const liveEditor = editorRef.current
+      const requestId = detail?.requestId
+      if (!requestId || !liveEditor || liveEditor.isDestroyed || !isEditableRef.current) {
+        emitInlineShown(requestId, null)
+        return
+      }
+
+      if (inlinePendingRef.current?.requestId && inlinePendingRef.current.requestId !== requestId) {
+        clearInlineAiSuggestion(liveEditor)
+      }
+
+      let range = resolveDocRange(detail)
+      const docSize = liveEditor.state.doc.content.size
+      if (detail.isFullDoc && docSize > 0) {
+        range = { from: 0, to: Math.max(docSize, 1) }
+      }
+      if (!range || range.to <= range.from) {
+        emitInlineShown(requestId, null)
+        return
+      }
+
+      const suggestedPlain = String(detail.suggestedPlain || '').trim()
+      if (!suggestedPlain) {
+        emitInlineShown(requestId, null)
+        return
+      }
+
+      inlinePendingRef.current = {
+        requestId,
+        ...range,
+        suggestedPlain,
+        suggestedHtml: detail.suggestedHtml || null,
+        acceptedContent: detail.acceptedContent || null,
+        selectedFraction: Number(detail.selectedFraction) || 0,
+        structuredData: detail.structuredData || null,
+        action: detail.action,
+        isFullDoc: Boolean(detail.isFullDoc),
+        originalText: detail.originalText || liveEditor.state.doc.textBetween(range.from, range.to, '\n'),
+      }
+
+      notifyPreviewSession(true)
+      setInlineAiSuggestion(liveEditor, {
+        from: range.from,
+        to: range.to,
+        suggestedPlain,
+        suggestedHtml: detail.suggestedHtml || null,
+      })
+      try {
+        liveEditor.commands.focus()
+        liveEditor.commands.setTextSelection({ from: range.from, to: range.to })
+        liveEditor.commands.scrollIntoView()
+      } catch {
+        // non-fatal
+      }
+      emitInlineShown(requestId, range)
+    })
+
+    const unsubClear = subscribeEditorInlineSuggestionClear(({ requestId }) => {
+      const liveEditor = editorRef.current
+      const pending = inlinePendingRef.current
+      if (requestId && pending?.requestId && pending.requestId !== requestId) return
+      if (liveEditor && !liveEditor.isDestroyed) {
+        clearInlineAiSuggestion(liveEditor)
+      }
+      inlinePendingRef.current = null
+      notifyPreviewSession(false)
+    })
+
+    const unsubApply = subscribeEditorInlineSuggestionApply(({ requestId }) => {
+      const liveEditor = editorRef.current
+      const pending = inlinePendingRef.current
+      if (!pending || pending.requestId !== requestId) {
+        emitInlineApplied(requestId, false, 'No pending suggestion to apply.')
+        return
+      }
+      if (!liveEditor || liveEditor.isDestroyed) {
+        emitInlineApplied(requestId, false, 'Editor is not available.')
+        return
+      }
+
+      try {
+        const {
+          from,
+          to,
+          suggestedPlain,
+          suggestedHtml,
+          acceptedContent,
+          isFullDoc,
+          action,
+        } = pending
+        const insertPayload =
+          acceptedContent
+          || (isFullDoc ? suggestedHtml : suggestedPlain)
+          || suggestedHtml
+          || suggestedPlain
+
+        if (isFullDoc) {
+          liveEditor.commands.setContent(insertPayload || '<p></p>', false)
+        } else if (typeof insertPayload === 'string' && /<\/?[a-z]/i.test(insertPayload)) {
+          liveEditor.chain().focus().insertContentAt({ from, to }, insertPayload).run()
+        } else {
+          liveEditor.chain().focus().insertContentAt({ from, to }, insertPayload || '').run()
+        }
+        clearInlineAiSuggestion(liveEditor)
+        inlinePendingRef.current = null
+        notifyPreviewSession(false)
+        emitInlineApplied(requestId, true)
+        if (typeof onAfterApply === 'function') {
+          onAfterApply({
+            action,
+            applied_scope: isFullDoc ? 'full_document' : 'selection',
+            source: 'actions_tab',
+          })
+        }
+      } catch (err) {
+        console.error('[editor-actions-bridge] apply failed', err)
+        emitInlineApplied(requestId, false, err?.message || 'Could not apply suggestion.')
+      }
+    })
+
+    const onScrollToRange = (event) => {
+      const liveEditor = editorRef.current
+      const { from, to } = event.detail || {}
+      if (!liveEditor || liveEditor.isDestroyed || from == null || to == null) return
+      try {
+        liveEditor.chain().focus().setTextSelection({ from, to }).scrollIntoView().run()
+      } catch (err) {
+        console.warn('[editor-actions-bridge] scrollIntoView failed', err)
+      }
+    }
+    window.addEventListener(EDITOR_SCROLL_TO_RANGE_EVENT, onScrollToRange)
+
+    const onGapAppend = (event) => {
+      const liveEditor = editorRef.current
+      const html = event.detail?.html
+      if (!liveEditor || liveEditor.isDestroyed || !html) return
+      try {
+        const docEnd = liveEditor.state.doc.content.size
+        const appendix = /<h3/i.test(String(html))
+          ? html
+          : `<h3>AI Gap Check Findings</h3>${html}`
+        liveEditor.chain().focus().insertContentAt(docEnd, appendix, { updateSelection: false }).run()
+      } catch (err) {
+        console.warn('[editor-actions-bridge] gap append failed', err)
+      }
+    }
+    window.addEventListener(EDITOR_GAP_APPEND_EVENT, onGapAppend)
+
+    return () => {
+      unsubSnapshot()
+      unsubShow()
+      unsubClear()
+      unsubApply()
+      window.removeEventListener(EDITOR_SCROLL_TO_RANGE_EVENT, onScrollToRange)
+      window.removeEventListener(EDITOR_GAP_APPEND_EVENT, onGapAppend)
+    }
+  }, [editor, emitInlineApplied, emitInlineShown, notifyPreviewSession, onAfterApply, resolveDocRange])
 
   useEffect(() => {
     const unsubscribe = subscribeEditorAiActionRequest((request) => {
@@ -385,7 +662,7 @@ const EditorAIBridge = ({
             structuredData,
           })
         }
-        liveEditor.commands.setContent(payloadHtml || suggestedHtml || '<p></p>', true)
+        liveEditor.commands.setContent(payloadHtml || suggestedHtml || '<p></p>', false)
         console.info('[kl-editor-action-inserted]', { action, scope: 'full_document', requestId: request?.requestId })
       } else {
         const from = target?.from ?? 0

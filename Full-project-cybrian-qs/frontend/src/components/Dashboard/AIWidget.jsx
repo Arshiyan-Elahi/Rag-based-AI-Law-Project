@@ -5,6 +5,7 @@ import {
   nowTime,
   runUnifiedAssistantQuery,
   getAssistantRouteMeta,
+  toVisibleUserMessage,
   toHtml,
   formatChatTimeFromIso,
   readKlAssistantMode,
@@ -22,13 +23,22 @@ import {
   describeEditorAiResult,
   detectEditorIntent,
   dispatchEditorAiActionRequest,
-  editorActionFromChipId,
   getActiveEditorDocumentId,
-  isEditorRoute,
+  hasActiveSopEditor,
   makeEditorAiRequestId,
+  SOP_EDITOR_CONTEXT_EVENT,
   subscribeEditorAiActionResult,
 } from '../../utils/editorAiBridge'
+import ActionsTab from './ActionsTab'
+import { dispatchActionsTabRun } from '../../utils/editorActionsBridge'
+import { runEditorGapCheck } from '../../utils/editorGapCheck'
+import { buildGapCheckSidebarReport } from '../../utils/actionsTabGapReport'
 import './DashboardComponents.css'
+
+const WIDGET_TABS = [
+  { id: 'chat', label: 'Chat' },
+  { id: 'actions', label: 'Actions' },
+]
 
 const LS_SESSION_BY_PATH = 'cybrain_kl_chat_session_by_path'
 
@@ -68,25 +78,24 @@ function defaultGreeting() {
   ]
 }
 
+function mapSourcesToWidgetTags(sources) {
+  if (!Array.isArray(sources)) return []
+  return sources.slice(0, 5).map((s, idx) => s?.label || s?.id || `Quelle ${idx + 1}`)
+}
+
 function dbMessagesToWidget(rows) {
   if (!Array.isArray(rows) || rows.length === 0) return defaultGreeting()
   return rows.map((m) => ({
     id: m.id,
     role: m.role === 'user' ? 'user' : 'ai',
-    text: String(m.content || ''),
-    tags: [],
+    text:
+      m.role === 'user'
+        ? toVisibleUserMessage(m.content)
+        : String(m.content || ''),
+    tags: m.role === 'user' ? [] : mapSourcesToWidgetTags(m.sources),
     time: formatChatTimeFromIso(m.created_at),
   }))
 }
-
-const QUICK_ACTION_CHIPS = [
-  { id: 'rewrite', label: 'Rewrite', text: 'Rewrite the active SOP into an industry-level SOP using the configured LLM model.' },
-  { id: 'improve', label: 'Improve', text: 'Improve readability of this SOP.' },
-  { id: 'gap', label: 'Gap Check', text: 'Run gap check on this SOP.' },
-  { id: 'summarize', label: 'Summarize', text: 'Summarize this SOP for executives.' },
-  { id: 'analyze', label: 'Analyze', text: 'Analyze compliance of this SOP.' },
-  { id: 'compare', label: 'Compare', text: 'Compare SOP versions for this document.' },
-]
 
 export default function AIWidget() {
   const location = useLocation()
@@ -104,10 +113,35 @@ export default function AIWidget() {
   /** requestId -> { messageId, action } for in-flight editor bridge requests. */
   const pendingBridgeRef = useRef(new Map())
   const suggestions = routeMeta.suggestions
+  const [sopEditorActive, setSopEditorActive] = useState(() => hasActiveSopEditor(location.pathname))
+  const [widgetTab, setWidgetTab] = useState('chat')
+
+  useEffect(() => {
+    const syncEditorContext = () => {
+      setSopEditorActive(hasActiveSopEditor(location.pathname))
+    }
+    syncEditorContext()
+    window.addEventListener(SOP_EDITOR_CONTEXT_EVENT, syncEditorContext)
+    window.addEventListener('storage', syncEditorContext)
+    return () => {
+      window.removeEventListener(SOP_EDITOR_CONTEXT_EVENT, syncEditorContext)
+      window.removeEventListener('storage', syncEditorContext)
+    }
+  }, [location.pathname])
 
   useEffect(() => {
     setAssistantMode(readKlAssistantMode())
+    if (!hasActiveSopEditor(location.pathname)) {
+      setWidgetTab('chat')
+    }
   }, [location.pathname])
+
+  useEffect(() => {
+    if (sopEditorActive && widgetTab === 'actions') {
+      setAssistantMode('action')
+      writeKlAssistantMode('action')
+    }
+  }, [sopEditorActive, widgetTab])
 
   useEffect(() => {
     if (assistantMode === 'query') setPendingDeleteAction(null)
@@ -155,29 +189,31 @@ export default function AIWidget() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, sending])
 
-  useEffect(() => {
-    let cancelled = false
+  const loadChatHistory = useCallback(async () => {
     const path = location.pathname
-    async function load() {
-      const sid = readSessionIdForPath(path)
-      if (!sid) {
-        if (!cancelled) setMessages(defaultGreeting())
-        return
-      }
-      try {
-        const rows = await getChatSessionMessages(sid)
-        if (cancelled) return
-        setMessages(dbMessagesToWidget(rows))
-      } catch (e) {
-        console.error('[chat-history-load] AIWidget messages', e)
-        if (!cancelled) setMessages(defaultGreeting())
-      }
+    const sid = readSessionIdForPath(path)
+    if (!sid) {
+      setMessages(defaultGreeting())
+      return
     }
-    load()
-    return () => {
-      cancelled = true
+    try {
+      const rows = await getChatSessionMessages(sid)
+      setMessages(dbMessagesToWidget(rows))
+    } catch (e) {
+      console.error('[chat-history-load] AIWidget messages', e)
+      setMessages(defaultGreeting())
     }
   }, [location.pathname])
+
+  useEffect(() => {
+    loadChatHistory()
+  }, [loadChatHistory])
+
+  useEffect(() => {
+    if (widgetTab === 'chat') {
+      loadChatHistory()
+    }
+  }, [widgetTab, loadChatHistory])
 
   useEffect(() => {
     const pending = pendingBridgeRef.current
@@ -202,6 +238,17 @@ export default function AIWidget() {
     }
   }, [])
 
+  const handleWidgetTabChange = useCallback((tabId) => {
+    setWidgetTab(tabId)
+    if (tabId === 'chat') {
+      setAssistantMode('query')
+      writeKlAssistantMode('query')
+    } else if (tabId === 'actions') {
+      setAssistantMode('action')
+      writeKlAssistantMode('action')
+    }
+  }, [])
+
   /**
    * Try to handle the message as an editor-side action (rewrite / improve /
    * gap_check / read of the active SOP) instead of a chat-only RAG query.
@@ -209,10 +256,98 @@ export default function AIWidget() {
    */
   const tryBridgeEditorAction = useCallback((text, userMessage, opts = {}) => {
     const { explicitAction = null } = opts
+    if (widgetTab === 'chat') {
+      const intent = explicitAction || detectEditorIntent(text)
+      if (intent === EDITOR_AI_ACTIONS.GAP_CHECK && hasActiveSopEditor(location.pathname)) {
+        setInput('')
+        setSending(true)
+        ;(async () => {
+          try {
+            const { result, target } = await runEditorGapCheck({ instruction: text })
+            const report = buildGapCheckSidebarReport(result)
+            const parts = report.sections.map((s) => {
+              if (s.gapItems?.length) {
+                return `${s.title}\n${s.gapItems.map((g) => `- ${g.issue}${g.recommendation ? `\n  → ${g.recommendation}` : ''}`).join('\n')}`
+              }
+              return s.body ? `${s.title}\n${s.body}` : s.title
+            })
+            const plain = parts.filter(Boolean).join('\n\n') || report.analysisPlain
+            setMessages((prev) => [
+              ...prev,
+              userMessage,
+              {
+                id: `gap-chat-${Date.now()}`,
+                role: 'ai',
+                text: `Gap check — ${target.sectionName}${target.isFullDoc ? ' (full SOP)' : ''}\n\n${plain}`,
+                tags: ['Gap Check'],
+                time: nowTime(),
+              },
+            ])
+          } catch (err) {
+            setMessages((prev) => [
+              ...prev,
+              userMessage,
+              {
+                id: `gap-err-${Date.now()}`,
+                role: 'ai',
+                text: err?.message || 'Gap check failed.',
+                isError: true,
+                time: nowTime(),
+              },
+            ])
+          } finally {
+            setSending(false)
+          }
+        })()
+        return true
+      }
+      if (intent === EDITOR_AI_ACTIONS.REWRITE || intent === EDITOR_AI_ACTIONS.IMPROVE) {
+        dispatchActionsTabRun({ action: intent, prompt: text || '' })
+        handleWidgetTabChange('actions')
+        setMessages((prev) => [
+          ...prev,
+          userMessage,
+          {
+            id: `actions-redirect-${Date.now()}`,
+            role: 'ai',
+            text: 'Rewrite/Improve runs in the **Actions** tab with inline preview in the editor.',
+            tags: [],
+            time: nowTime(),
+          },
+        ])
+        setInput('')
+        return true
+      }
+      return false
+    }
     if (assistantMode !== 'action') return false
-    if (!isEditorRoute(location.pathname)) return false
+    if (!hasActiveSopEditor(location.pathname)) return false
     const intent = explicitAction || detectEditorIntent(text)
     if (!intent) return false
+
+    if (intent === EDITOR_AI_ACTIONS.GAP_CHECK) {
+      dispatchActionsTabRun({ action: EDITOR_AI_ACTIONS.GAP_CHECK, prompt: text || '' })
+      handleWidgetTabChange('actions')
+      setMessages((prev) => [...prev, userMessage])
+      setInput('')
+      return true
+    }
+
+    if (intent === EDITOR_AI_ACTIONS.REWRITE || intent === EDITOR_AI_ACTIONS.IMPROVE) {
+      dispatchActionsTabRun({ action: intent, prompt: text || '' })
+      handleWidgetTabChange('actions')
+      const userMsg = { id: Date.now(), role: 'user', text: text || '' }
+      const statusMsg = {
+        id: `actions-redirect-${Date.now()}`,
+        role: 'ai',
+        text: 'Rewrite/Improve läuft im Tab **Actions** mit Inline-Vorschau im Editor. Bitte dort Accept oder Reject wählen.',
+        tags: [],
+        time: nowTime(),
+      }
+      setMessages((prev) => [...prev, userMsg, statusMsg])
+      setInput('')
+      return true
+    }
 
     const activeDocumentId = getActiveEditorDocumentId()
     if (!activeDocumentId) {
@@ -274,24 +409,7 @@ export default function AIWidget() {
     }, 360000)
 
     return true
-  }, [assistantMode, location.pathname])
-
-  const handleQuickActionChip = useCallback((chip) => {
-    console.info('[kl-action-chip-click]', { chipId: chip.id, label: chip.label, mode: assistantMode })
-    if (assistantMode !== 'action' || !isEditorRoute(location.pathname)) {
-      setInput(chip.text)
-      return
-    }
-    const explicit = editorActionFromChipId(chip.id)
-    const userMsg = { id: Date.now(), role: 'user', text: chip.text }
-    if (explicit && tryBridgeEditorAction(chip.text, userMsg, { explicitAction: explicit })) {
-      return
-    }
-    if (tryBridgeEditorAction(chip.text, userMsg)) {
-      return
-    }
-    setInput(chip.text)
-  }, [assistantMode, location.pathname, tryBridgeEditorAction])
+  }, [assistantMode, location.pathname, widgetTab, handleWidgetTabChange, setSending, setMessages])
 
   const sendMessage = useCallback(async (text, opts = {}) => {
     const trimmed = text.trim()
@@ -323,6 +441,7 @@ export default function AIWidget() {
         { role: 'user', content: trimmed },
       ]
       const sid = readSessionIdForPath(location.pathname)
+      const ragMode = widgetTab === 'chat' ? 'query' : assistantMode
       const result = await runUnifiedAssistantQuery({
         question: trimmed,
         pathname: location.pathname,
@@ -330,7 +449,7 @@ export default function AIWidget() {
         assistantActionConfirmation: opts.assistantActionConfirmation || null,
         surface: 'kl_assistant',
         sessionId: sid,
-        assistantMode,
+        assistantMode: ragMode,
       })
       const action = result?.assistant_action
       if (assistantMode === 'action' && action?.requires_confirmation && action?.type === 'delete_sop') {
@@ -368,7 +487,7 @@ export default function AIWidget() {
           id: Date.now() + 1,
           role: 'ai',
           text: result.answer || result.text || result.response || '—',
-          tags: result.sources?.map((s) => s.label) ?? [],
+          tags: mapSourcesToWidgetTags(result.sources || result.citations),
           time: nowTime(),
         }
         setMessages((prev) => [...prev, aiMsg])
@@ -386,7 +505,7 @@ export default function AIWidget() {
     } finally {
       setSending(false)
     }
-  }, [sending, location.pathname, navigate, emitSOPRefresh, showToast, clearAssistantActiveContext, assistantMode, tryBridgeEditorAction])
+  }, [sending, location.pathname, navigate, emitSOPRefresh, showToast, clearAssistantActiveContext, assistantMode, widgetTab, tryBridgeEditorAction])
 
   const handleSend = () => sendMessage(input)
 
@@ -470,77 +589,33 @@ export default function AIWidget() {
         <div className="ai-widget-divider" />
       </div>
 
+      {sopEditorActive ? (
+        <div className="ai-widget-tabs" role="tablist" aria-label="Assistant panels">
+          {WIDGET_TABS.map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              role="tab"
+              aria-selected={widgetTab === tab.id}
+              className={`ai-widget-tab${widgetTab === tab.id ? ' ai-widget-tab--active' : ''}`}
+              onClick={() => handleWidgetTabChange(tab.id)}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
+      ) : null}
+
+      {sopEditorActive && widgetTab === 'actions' ? (
+        <ActionsTab onSwitchToActions={() => handleWidgetTabChange('actions')} />
+      ) : (
+        <>
       {/* Context section (n_e1120) */}
       <div className="ai-context-section">
         {/* Context label row (n_36782, n_8a4b0, n_1632b) */}
         <div className="ai-context-row">
           <Zap size={14} className="ai-context-icon" />
           <span className="ai-context-label">{contextLabel}</span>
-        </div>
-
-        <div className="ai-assistant-mode-row">
-          <label htmlFor="kl-assistant-mode" className="ai-assistant-mode-label">
-            Modus
-          </label>
-          <select
-            id="kl-assistant-mode"
-            className={`ai-assistant-mode-select ${assistantMode === 'query' ? 'ai-assistant-mode-select--query' : 'ai-assistant-mode-select--action'}`}
-            value={assistantMode}
-            onChange={(e) => {
-              const v = e.target.value
-              if (v === 'query' || v === 'action') {
-                writeKlAssistantMode(v)
-                setAssistantMode(v)
-              }
-            }}
-            aria-label="Assistenz-Modus"
-          >
-            <option value="query">Query</option>
-            <option value="action">Perform Action</option>
-          </select>
-          <span
-            className={`ai-assistant-mode-pill ${assistantMode === 'query' ? 'ai-assistant-mode-pill--query' : 'ai-assistant-mode-pill--action'}`}
-          >
-            {assistantMode === 'query' ? 'Nur Abfrage' : 'Aktionen'}
-          </span>
-        </div>
-
-        {assistantMode === 'action' ? (
-          <div className="ai-action-chips" role="group" aria-label="Schnellaktionen">
-            {QUICK_ACTION_CHIPS.map((c) => (
-              <button
-                key={c.id}
-                type="button"
-                className="ai-action-chip"
-                disabled={sending}
-                aria-label={c.label}
-                onClick={() => handleQuickActionChip(c)}
-              >
-                <span className="ai-action-chip__text">{c.label}</span>
-              </button>
-            ))}
-          </div>
-        ) : null}
-
-        {/* Input and send button (n_af201, n_dfc55, n_61f05) */}
-        <div className="ai-context-input-group">
-          <input
-            type="text"
-            className="ai-context-input"
-            placeholder="Frage zur SOP stellen…"
-            value={input}
-            onChange={e => setInput(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && handleSend()}
-            disabled={sending}
-          />
-          <button
-            className="ai-context-send-btn"
-            onClick={handleSend}
-            disabled={sending || !input.trim()}
-            aria-label="Senden"
-          >
-            Senden
-          </button>
         </div>
       </div>
 
@@ -638,6 +713,9 @@ export default function AIWidget() {
           </button>
         </div>
       </div>
+
+        </>
+      )}
 
       {pendingDeleteAction ? (
         <div className="sop-delete-modal-overlay" role="presentation">

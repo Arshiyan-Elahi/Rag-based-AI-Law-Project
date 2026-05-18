@@ -17,6 +17,7 @@ import {
   runUnifiedAssistantQuery,
   stripHtml,
   toHtml,
+  toVisibleUserMessage,
 } from '../utils/chatAssistant'
 import { deriveSopTitleFromText, htmlToPlainText, plainTextToTiptapDoc } from '../utils/chatSopSave'
 import { getAssistantContextStorageKeys, resetAssistantStateOnce } from '../utils/assistantContext'
@@ -48,7 +49,9 @@ function mapDbRowsToMessages(rows) {
     id: m.id,
     sender: m.role === 'user' ? 'user' : 'ai',
     time: formatChatTimeFromIso(m.created_at),
-    content: toHtml(String(m.content || '')),
+    content: toHtml(
+      m.role === 'user' ? toVisibleUserMessage(m.content) : String(m.content || ''),
+    ),
     tags: [],
     showActions: m.role === 'assistant',
   }))

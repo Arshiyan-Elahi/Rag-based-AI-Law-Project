@@ -10,6 +10,10 @@ import {
   selectionLooksLikeFormattedAiReport,
   selectionMatchesLastAiSuggestion,
 } from '../../utils/aiActionSelection'
+import {
+  captureEditorSelectionForAction,
+  inferSectionMetaForSelection,
+} from '../../utils/editScopeInference'
 
 const buildStructuredSelectionText = (editor, from, to) =>
   editor.state.doc.textBetween(from, to, '\n').trim()
@@ -56,6 +60,8 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true, onPrevi
   const [isModalOpen, setIsModalOpen] = useState(false)
   const [menuPosition, setMenuPosition] = useState(null)
   const selectionRef = useRef(null)
+  /** Range locked when an action starts (used for accept/reject). */
+  const actionRangeRef = useRef(null)
   /** Last successful /api/ai/action response for re-apply without re-parsing formatted UI text. */
   const lastAiReplyRef = useRef(null)
   const menuRef = useRef(null)
@@ -217,12 +223,10 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true, onPrevi
     if (!dom) return undefined
 
     dom.addEventListener('mousedown', startPointerSelection)
-    window.addEventListener('mouseup', delayedUpdate)
-    window.addEventListener('keyup', delayedUpdate)
     window.addEventListener('mouseup', endPointerSelection)
+    // Avoid global keyup/selectionchange — they fire on every keystroke and caused repaint loops.
     window.addEventListener('scroll', delayedUpdate, true)
     window.addEventListener('resize', delayedUpdate)
-    document.addEventListener('selectionchange', delayedUpdate)
     window.addEventListener('keydown', handleGlobalKeyDown)
     updatePosition()
 
@@ -235,12 +239,9 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true, onPrevi
       if (dom) {
         dom.removeEventListener('mousedown', startPointerSelection)
       }
-      window.removeEventListener('mouseup', delayedUpdate)
-      window.removeEventListener('keyup', delayedUpdate)
       window.removeEventListener('mouseup', endPointerSelection)
       window.removeEventListener('scroll', delayedUpdate, true)
       window.removeEventListener('resize', delayedUpdate)
-      document.removeEventListener('selectionchange', delayedUpdate)
       window.removeEventListener('keydown', handleGlobalKeyDown)
     }
   }, [editor, isEditable, isEditorReady])
@@ -248,10 +249,16 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true, onPrevi
   if (!editor || !isEditable || !isEditorReady) return null
 
   const handleAction = async (action) => {
-    const savedSelection = selectionRef.current
-    const selectedText = savedSelection?.selectedText || ''
+    const savedSelection = captureEditorSelectionForAction(editor) || selectionRef.current
+    const selectedText = savedSelection?.structuredText || savedSelection?.selectedText || ''
 
     if (!selectedText) return
+
+    selectionRef.current = savedSelection
+    actionRangeRef.current = {
+      from: savedSelection.from,
+      to: savedSelection.to,
+    }
 
     const structuredForCheck = savedSelection.structuredText || selectedText
     if (
@@ -273,36 +280,8 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true, onPrevi
       }
     }
 
-    let sectionName = 'Selected text'
-    let sectionType = 'Paragraph'
-    const isFullDocumentSelection = Number(savedSelection.selectedFraction || 0) >= 0.85
-
-    try {
-      const resolvedPos = editor.state.doc.resolve(savedSelection.from)
-      for (let depth = resolvedPos.depth; depth >= 0; depth -= 1) {
-        const node = resolvedPos.node(depth)
-        if (node.type.name === 'heading') {
-          sectionName = node.textContent
-          sectionType = 'Heading'
-          break
-        }
-        if (node.type.name === 'table') {
-          sectionType = 'Table'
-        } else if (node.type.name === 'bulletList' || node.type.name === 'orderedList' || node.type.name === 'listItem') {
-          sectionType = 'List'
-        } else if (node.type.name === 'paragraph') {
-          sectionType = 'Paragraph'
-        }
-      }
-    } catch {
-      // Best-effort section inference only.
-    }
-
-    if (isFullDocumentSelection) {
-      sectionName = 'Full Document'
-      sectionType = 'Full Document'
-    }
-
+    const editScope = savedSelection.editScope || 'section_only'
+    const { sectionName, sectionType } = inferSectionMetaForSelection(editor, savedSelection)
     const structuredPayload = savedSelection.structuredText || selectedText
     const lastReply = lastAiReplyRef.current
     let textForApi = structuredPayload
@@ -337,6 +316,7 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true, onPrevi
         sop_title: sopMetadata?.title || 'Untitled SOP',
         section_name: sectionName,
         section_type: sectionType,
+        edit_scope: editScope,
         client_structured_json: clientStructured,
         sop_entity_id: sopMetadata?.sop_entity_id || null,
         triggered_by: AI_ACTION_TRIGGERED_BY.EDITOR_BUBBLE,
@@ -382,10 +362,12 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true, onPrevi
   }
 
   const handleAccept = () => {
-    if (!aiResult || !selectionRef.current) return
+    if (!aiResult) return
+    const range = actionRangeRef.current || selectionRef.current
+    if (!range) return
 
-    const { from, to } = selectionRef.current
-    const acceptedContent = buildAcceptedContent(aiResult, selectionRef.current)
+    const { from, to } = range
+    const acceptedContent = buildAcceptedContent(aiResult, selectionRef.current || range)
     if (!acceptedContent) return
     editor.chain().focus().insertContentAt({ from, to }, acceptedContent).run()
 
@@ -394,6 +376,7 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true, onPrevi
     pauseBubblePositioningRef.current = false
     notifyPreviewSession(false)
     selectionRef.current = null
+    actionRangeRef.current = null
     lastAiReplyRef.current = null
   }
 
@@ -456,6 +439,7 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true, onPrevi
           notifyPreviewSession(false)
           setIsModalOpen(false)
           setAIResult(null)
+          actionRangeRef.current = null
         }}
         action={aiResult?.action}
         originalText={aiResult?.original_text}

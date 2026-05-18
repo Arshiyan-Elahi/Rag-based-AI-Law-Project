@@ -1255,21 +1255,6 @@ async def query_ai(payload: dict):
     if live_ctx_chars > 60:
         question_for_rag = f"{question_for_rag}\n\n{live_block[:3200]}"
 
-    # RAG is the default source of truth. Local DB primary mode is opt-in only
-    # for diagnostics and should not be used in normal semantic chatbot flow.
-    allow_local_db_bypass = bool(payload.get("allow_local_db_primary")) and CHATBOT_USE_LOCAL_DB and CHATBOT_ALLOW_LOCAL_DB_PRIMARY
-    if allow_local_db_bypass:
-        # Run in a worker thread so SQLAlchemy work does not block the event loop
-        # (avoids piling up slow requests, nginx timeouts, and a stuck-feeling UI).
-        response = await asyncio.to_thread(
-            _build_local_db_chat_response, question_for_rag, chat_history, category
-        )
-        logger.info(
-            "[chatbot-response] source=local-db-primary latency_ms=%.1f",
-            (time.perf_counter() - t0) * 1000.0,
-        )
-        return response
-
     pipeline_timeout = get_chat_pipeline_timeout_seconds()
     logger.info(
         "[chatbot-timeout] pipeline_seconds=%s local_llm_seconds=%s",
@@ -1423,7 +1408,9 @@ async def query_ai(payload: dict):
     dbg_preview = str(dbg_rows[0])[:480] if dbg_rows else ""
 
     if not had_evidence and (not answer_raw or boilerplate_unreachable):
-        response["answer"] = "Sorry, I do not have enough information about this."
+        from chatbot.rag.rag_chain import RAG_NO_CONTEXT_REFUSAL
+
+        response["answer"] = RAG_NO_CONTEXT_REFUSAL
         response["citations"] = []
         response["sources"] = []
         response["retrieval_debug"] = []
@@ -1448,15 +1435,10 @@ async def query_ai(payload: dict):
         )
 
     try:
-        from chatbot.rag.rag_chain import (
-            _strip_sources_footer_from_answer,
-            _strip_sources_lines_from_answer,
-        )
+        from chatbot.rag.rag_chain import sanitize_user_facing_answer
 
         if not bool((response.get("retrieval_stats") or {}).get("strict_mode")):
-            response["answer"] = _strip_sources_footer_from_answer(
-                _strip_sources_lines_from_answer(response.get("answer") or "")
-            )
+            response["answer"] = sanitize_user_facing_answer(response.get("answer") or "")
     except Exception:
         pass
 
