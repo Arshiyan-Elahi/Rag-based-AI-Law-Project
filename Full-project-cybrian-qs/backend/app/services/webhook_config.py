@@ -67,7 +67,9 @@ def normalize_internal_url(url: str) -> str:
         parsed = urlparse(raw)
         base_parsed = urlparse(base)
         host = (parsed.hostname or "").lower()
-        if host in ("backend", "localhost", "127.0.0.1") and parsed.port in (8000, None):
+        if host in ("backend", "localhost", "127.0.0.1") and (
+            parsed.port in (8000, 8001, None) or (host == "backend" and parsed.port != base_parsed.port)
+        ):
             path = parsed.path or ""
             query = f"?{parsed.query}" if parsed.query else ""
             port = base_parsed.port

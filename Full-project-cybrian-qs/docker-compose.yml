@@ -41,8 +41,10 @@ services:
       dockerfile: backend/Dockerfile
     container_name: cybrain_backend
     restart: unless-stopped
+    ports:
+      - "${BACKEND_HOST_PORT:-8001}:8001"
     expose:
-      - "8000"
+      - "8001"
     depends_on:
       db:
         condition: service_healthy
@@ -61,10 +63,22 @@ services:
       DATABASE_URL_DOCKER: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-admin123}@db:5432/${POSTGRES_DB:-editor_db}
       QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      # In-container API + webhook URLs (override host-only 127.0.0.1 values from backend/.env)
+      API_BASE_URL: http://backend:8001
+      WEBHOOK_ENDPOINT_SOPS: http://backend:8001/api/public/sops/full?status=all&page=1&page_size=50
+      WEBHOOK_ENDPOINT_DEVIATIONS: http://backend:8001/api/deviations
+      WEBHOOK_ENDPOINT_CAPAS: http://backend:8001/api/capas
+      WEBHOOK_ENDPOINT_DECISIONS: http://backend:8001/api/decisions
+      WEBHOOK_ENDPOINT_AUDITS: http://backend:8001/api/audits
+      HF_HOME: /app/.hf-cache
+      HUGGINGFACE_HUB_CACHE: /app/.hf-cache/hub
+      EMBEDDING_HF_CACHE_DIR: /app/.hf-cache
+      TESSERACT_CMD: /usr/bin/tesseract
+      POPPLER_PATH: ""
     command: >
-      sh -c "uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1"
+      sh -c "uvicorn app.main:app --host 0.0.0.0 --port 8001 --workers 1"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/api/health >/dev/null || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8001/api/health >/dev/null || exit 1"]
       interval: 15s
       timeout: 10s
       retries: 8
@@ -106,6 +120,15 @@ services:
       DATABASE_URL_DOCKER: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-admin123}@db:5432/${POSTGRES_DB:-editor_db}
       QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      API_BASE_URL: http://backend:8001
+      WEBHOOK_ENDPOINT_SOPS: http://backend:8001/api/public/sops/full?status=all&page=1&page_size=50
+      WEBHOOK_ENDPOINT_DEVIATIONS: http://backend:8001/api/deviations
+      WEBHOOK_ENDPOINT_CAPAS: http://backend:8001/api/capas
+      WEBHOOK_ENDPOINT_DECISIONS: http://backend:8001/api/decisions
+      WEBHOOK_ENDPOINT_AUDITS: http://backend:8001/api/audits
+      HF_HOME: /app/.hf-cache
+      HUGGINGFACE_HUB_CACHE: /app/.hf-cache/hub
+      EMBEDDING_HF_CACHE_DIR: /app/.hf-cache
     command: ["python", "run_embedding_worker.py"]
     depends_on:
       db:
