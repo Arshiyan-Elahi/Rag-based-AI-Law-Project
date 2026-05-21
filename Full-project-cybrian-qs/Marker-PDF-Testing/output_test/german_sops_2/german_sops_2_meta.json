@@ -1,0 +1,228 @@
+{
+  "table_of_contents": [
+    {
+      "title": "EG-Leitfaden der Guten Herstellungspraxis",
+      "heading_level": null,
+      "page_id": 0,
+      "polygon": [
+        [
+          132.0,
+          180.984375
+        ],
+        [
+          463.5,
+          180.984375
+        ],
+        [
+          463.5,
+          196.453125
+        ],
+        [
+          132.0,
+          196.453125
+        ]
+      ]
+    },
+    {
+      "title": "Kapitel 4 Dokumentation",
+      "heading_level": null,
+      "page_id": 0,
+      "polygon": [
+        [
+          202.5,
+          236.671875
+        ],
+        [
+          392.25,
+          236.671875
+        ],
+        [
+          392.25,
+          252.140625
+        ],
+        [
+          202.5,
+          252.140625
+        ]
+      ]
+    },
+    {
+      "title": "Inhaltsverzeichnis",
+      "heading_level": null,
+      "page_id": 0,
+      "polygon": [
+        [
+          68.25,
+          330.0
+        ],
+        [
+          176.25,
+          329.09765625
+        ],
+        [
+          176.25,
+          340.5
+        ],
+        [
+          68.25,
+          340.69921875
+        ]
+      ]
+    },
+    {
+      "title": "Grunds\u00e4tze",
+      "heading_level": null,
+      "page_id": 0,
+      "polygon": [
+        [
+          69.75,
+          564.75
+        ],
+        [
+          138.0,
+          564.75
+        ],
+        [
+          138.0,
+          573.75
+        ],
+        [
+          69.75,
+          573.75
+        ]
+      ]
+    },
+    {
+      "title": "Erforderliche GMP Dokumentation (nach Typus)",
+      "heading_level": null,
+      "page_id": 1,
+      "polygon": [
+        [
+          69.0,
+          346.5
+        ],
+        [
+          347.25,
+          344.953125
+        ],
+        [
+          347.25,
+          357.75
+        ],
+        [
+          69.0,
+          358.875
+        ]
+      ]
+    },
+    {
+      "title": "Site Master File:",
+      "heading_level": null,
+      "page_id": 1,
+      "polygon": [
+        [
+          69.626953125,
+          381.75
+        ],
+        [
+          163.5,
+          380.53125
+        ],
+        [
+          163.5,
+          391.5
+        ],
+        [
+          69.626953125,
+          391.5
+        ]
+      ]
+    },
+    {
+      "title": "Vorschriften (Anweisungen oder Anforderungen):",
+      "heading_level": null,
+      "page_id": 1,
+      "polygon": [
+        [
+          70.5,
+          443.25
+        ],
+        [
+          355.5,
+          442.40625
+        ],
+        [
+          355.5,
+          454.5
+        ],
+        [
+          70.224609375,
+          454.78125
+        ]
+      ]
+    }
+  ],
+  "page_stats": [
+    {
+      "page_id": 0,
+      "text_extraction_method": "surya",
+      "block_counts": [
+        [
+          "Line",
+          32
+        ],
+        [
+          "Span",
+          7
+        ],
+        [
+          "SectionHeader",
+          4
+        ],
+        [
+          "Text",
+          3
+        ]
+      ],
+      "block_metadata": {
+        "llm_request_count": 0,
+        "llm_error_count": 0,
+        "llm_tokens_used": 0,
+        "previous_text": "",
+        "previous_type": "",
+        "previous_order": 0
+      }
+    },
+    {
+      "page_id": 1,
+      "text_extraction_method": "surya",
+      "block_counts": [
+        [
+          "Line",
+          39
+        ],
+        [
+          "Span",
+          14
+        ],
+        [
+          "Text",
+          8
+        ],
+        [
+          "SectionHeader",
+          3
+        ]
+      ],
+      "block_metadata": {
+        "llm_request_count": 0,
+        "llm_error_count": 0,
+        "llm_tokens_used": 0,
+        "previous_text": "",
+        "previous_type": "",
+        "previous_order": 0
+      }
+    }
+  ],
+  "debug_data_path": "debug_data\\german_sops_2"
+}

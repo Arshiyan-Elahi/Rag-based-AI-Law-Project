@@ -397,7 +397,9 @@ def _style_profile_prompt_block(profile: dict[str, Any]) -> str:
         f"- modal_ratio={profile.get('modal_ratio', 0.0)}\n"
         f"- bullet_density={profile.get('bullet_density', 0.0)}\n"
         f"- passive_markers={profile.get('passive_markers', 0)}\n"
-        f"- style_guidance={top_rules}"
+        f"- style_guidance={top_rules}\n"
+        "- Match output verbosity to these signals; avoid generic explanatory prose that exceeds "
+        "the document's typical procedural density unless USER_EDIT_INTENT asks for more detail."
     )
 
 
@@ -1379,6 +1381,14 @@ def _build_action_request(payload: AIActionRequest) -> ActionRequest:
     section_type = payload.section_type or "Selected Text"
     if edit_scope == "full_document":
         section_type = "Full Document"
+    instr = ""
+    try:
+        instr = str(getattr(payload, "assistant_instruction", None) or "").strip()
+    except Exception:
+        instr = ""
+    if len(instr) > 8000:
+        instr = instr[:7997].rstrip() + "..."
+
     return ActionRequest(
         document_id=payload.sop_title or "editor-document",
         section_id=(payload.section_name or "selected-text").lower().replace(" ", "-"),
@@ -1388,6 +1398,7 @@ def _build_action_request(payload: AIActionRequest) -> ActionRequest:
         section_text=payload.text,
         sop_entity_id=entity or None,
         edit_scope=edit_scope,
+        assistant_instruction=instr or None,
     )
 
 
@@ -2690,7 +2701,13 @@ def _execute_sop_action(
                 next_text = f"{current_text}\n\n{llm_text}".strip()
             else:
                 next_text = llm_text or current_text
-            current.content_json = _build_minimal_tiptap_doc(next_text[:18000])
+            from .utils.tiptap_builder import merge_text_preserving_tables
+
+            current.content_json = merge_text_preserving_tables(
+                current.content_json,
+                next_text[:18000],
+                mode=mode,
+            )
             db.commit()
             return {
                 "type": "update_sop",
@@ -2815,6 +2832,40 @@ async def perform_ai_action(payload: AIActionRequest):
             )
 
     raise HTTPException(status_code=400, detail=f"Action '{payload.action}' is not supported.")
+
+
+@ai_router.post("/api/ai/classify-intent")
+async def classify_intent(payload: dict):
+    """
+    Semantic intent routing for the unified KL/KI Assistant chat panel.
+    Returns flow (chat | editor_action | clarify), action, target scope, and constraints.
+    """
+    from chatbot.assistant.intent_classifier import classify_assistant_intent
+
+    message = (payload.get("message") or payload.get("question") or "").strip()
+    if not message:
+        raise HTTPException(status_code=422, detail="message is required")
+
+    ctx = payload.get("assistant_context") if isinstance(payload.get("assistant_context"), dict) else {}
+    current_sop = ctx.get("current_sop") if isinstance(ctx.get("current_sop"), dict) else {}
+
+    has_active_sop = bool(payload.get("has_active_sop"))
+    if not has_active_sop:
+        has_active_sop = bool(
+            str(ctx.get("active_sop_id") or ctx.get("current_document_id") or "").strip()
+            or str(current_sop.get("id") or "").strip()
+        )
+
+    result = await asyncio.to_thread(
+        classify_assistant_intent,
+        message,
+        has_active_sop=has_active_sop,
+        has_editor_selection=bool(payload.get("has_editor_selection")),
+        route=str(payload.get("route") or ctx.get("route") or "").strip(),
+        active_sop_title=str(current_sop.get("title") or "").strip(),
+        active_sop_number=str(current_sop.get("sop_number") or current_sop.get("documentId") or "").strip(),
+    )
+    return result.model_dump()
 
 
 @ai_router.get("/api/ai/llm-health")

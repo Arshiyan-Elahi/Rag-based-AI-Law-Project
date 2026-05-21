@@ -157,10 +157,22 @@ def _bootstrap_rag_runtime() -> None:
     )
 
 
+def _bootstrap_local_marker() -> None:
+    """Optional warm-up of local Marker PDF models (runs in background thread)."""
+    try:
+        from .services.local_marker_extractor import warmup_local_marker
+
+        info = warmup_local_marker()
+        logger.info("[startup-marker] %s", info)
+    except Exception as exc:
+        logger.warning("[startup-marker] skipped err=%s", exc)
+
+
 def _spawn_background_bootstrap() -> threading.Thread:
     def _runner() -> None:
         boot_t0 = time.perf_counter()
         logger.info("[startup] background_bootstrap starting")
+        _bootstrap_local_marker()
         _bootstrap_qdrant_probe()
         _bootstrap_rag_runtime()
         total_ms = int((time.perf_counter() - boot_t0) * 1000)

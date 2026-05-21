@@ -13,9 +13,8 @@ export default defineConfig({
       '/api': {
         target: apiTarget,
         changeOrigin: true,
-        // Slightly longer dev timeouts cover slow first-time RAG warmup,
-        // while still surfacing genuinely hung backends to the developer.
-        timeout: 120000,
+        // Long timeouts cover slow OCR / large SOP imports in dev (browser fetch + proxy).
+        timeout: 600000,
       },
     },
   },

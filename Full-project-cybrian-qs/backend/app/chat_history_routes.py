@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from .auth_routes import get_current_user, get_current_user_optional
 from .database import get_db
-from .models import ChatMessage, ChatSession, User
+from .models import ChatMessage, ChatSession, SOP, User
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +19,7 @@ router = APIRouter(prefix="/api/chat", tags=["Chat History"])
 class CreateSessionRequest(BaseModel):
     title: str | None = None
     collection_name: str = "docs_sops"
+    sop_id: str | None = None
 
 
 class AddMessageRequest(BaseModel):
@@ -30,6 +31,79 @@ class AddMessageRequest(BaseModel):
     audit_log_snapshot: dict | list | None = None
     action_metadata: dict | None = None
     category_filter: str | None = None
+
+
+def _parse_sop_uuid(raw: str | None) -> UUID | None:
+    if not raw or not str(raw).strip():
+        return None
+    try:
+        return UUID(str(raw).strip())
+    except ValueError:
+        return None
+
+
+def _sessions_for_user(db: Session, current_user: User | None):
+    q = db.query(ChatSession).filter(ChatSession.is_active == True)  # noqa: E712
+    if current_user is not None:
+        return q.filter(ChatSession.user_id == current_user.id)
+    return q.filter(ChatSession.user_id.is_(None))
+
+
+@router.get("/sessions/by-sop/{sop_id}")
+def resolve_session_by_sop(
+    sop_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    """
+    Return the active chat session for an SOP, creating one when none exists.
+    Sessions are scoped per SOP and user (or anonymous bucket when unauthenticated).
+    """
+    sop = db.query(SOP.id).filter(SOP.id == sop_id).first()
+    if not sop:
+        raise HTTPException(status_code=404, detail="SOP not found")
+
+    session = (
+        _sessions_for_user(db, current_user)
+        .filter(ChatSession.sop_id == sop_id)
+        .order_by(ChatSession.updated_at.desc(), ChatSession.created_at.desc())
+        .first()
+    )
+    created = False
+    if session is None:
+        session = ChatSession(
+            user_id=current_user.id if current_user else None,
+            sop_id=sop_id,
+            title="SOP Chat",
+            collection_name="docs_sops",
+            is_active=True,
+        )
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+        created = True
+        logger.info(
+            "[chat-history-session-create] by_sop sop_id=%s session_id=%s user_id=%s",
+            sop_id,
+            session.id,
+            current_user.id if current_user else "anon",
+        )
+    else:
+        logger.info(
+            "[chat-history-load] by_sop sop_id=%s session_id=%s reused=True",
+            sop_id,
+            session.id,
+        )
+
+    return {
+        "id": str(session.id),
+        "title": session.title,
+        "collection_name": session.collection_name,
+        "sop_id": str(session.sop_id) if session.sop_id else None,
+        "created": created,
+        "created_at": session.created_at,
+        "updated_at": session.updated_at,
+    }
 
 
 @router.get("/sessions")
@@ -52,6 +126,7 @@ def list_sessions(
             "id": str(s.id),
             "title": s.title,
             "collection_name": s.collection_name,
+            "sop_id": str(s.sop_id) if s.sop_id else None,
             "created_at": s.created_at,
             "updated_at": s.updated_at,
             "is_active": s.is_active,
@@ -66,8 +141,15 @@ def create_session(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    sop_uuid = _parse_sop_uuid(payload.sop_id)
+    if payload.sop_id and sop_uuid is None:
+        raise HTTPException(status_code=422, detail="Invalid sop_id")
+    if sop_uuid and not db.query(SOP.id).filter(SOP.id == sop_uuid).first():
+        raise HTTPException(status_code=404, detail="SOP not found")
+
     session = ChatSession(
         user_id=current_user.id,
+        sop_id=sop_uuid,
         title=payload.title,
         collection_name=payload.collection_name or "docs_sops",
         is_active=True,
@@ -79,6 +161,7 @@ def create_session(
         "id": str(session.id),
         "title": session.title,
         "collection_name": session.collection_name,
+        "sop_id": str(session.sop_id) if session.sop_id else None,
         "created_at": session.created_at,
     }
 

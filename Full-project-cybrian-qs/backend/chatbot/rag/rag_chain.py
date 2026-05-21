@@ -438,6 +438,8 @@ SYSTEM_PROMPT = """\
 You are SOPSearch AI - a compliance assistant for SOPs and regulatory processes.
 Answer from context only. Be concise. If not found say: "Information not available in the knowledge base."
 Do NOT fabricate document numbers or dates.
+Write every answer in the same language as the user's question. If they explicitly request a language
+(e.g. "reply in English", "answer in German"), follow that instruction instead.
 """
 USER_PROMPT = "## Context\n{context}\n\n## Question\n{question}\n\nAnswer:"
 
@@ -559,11 +561,19 @@ When discussing deviations, always surface the impact_level in your answer.
 Priority order: Critical > Major > Moderate > Minor
 Flag Critical and Major deviations explicitly with a ⚠️ marker.
 
-RULE 7 — BILINGUAL HANDLING
-This system contains both German and English documents.
-If the user asks in English about a German SOP title, translate the intent
-correctly and search both languages.
-Return the answer in the same language the user asked in.
+RULE 7 — RESPONSE LANGUAGE (MANDATORY)
+The knowledge base contains German and English documents. Retrieval may surface either language.
+Your [ANSWER], any refusal sentence, and ---SUGGESTIONS--- must use the language of the user's latest
+message in USER QUESTION — not the language of retrieved snippets or document titles.
+1. User asks in English → respond in English.
+2. User asks in German → respond in German.
+3. Explicit language instruction ("reply in English", "answer in German", etc.) overrides detection.
+4. Mixed-language input → use the language of the latest clear user instruction.
+5. Do not force all answers into German or English when the user used another language.
+6. Translate or summarize retrieved content into the user's language as needed; keep record IDs
+   (e.g. [SOP-IT-001], [DEV-IT-401]) unchanged.
+For search: if the user asks in English about a German SOP title (or vice versa), interpret intent
+correctly and search both languages; still answer in the user's language.
 
 RULE 8 — STATUS AWARENESS
 Always report the current status of records:
@@ -583,8 +593,10 @@ RETRIEVED CONTEXT below. Do not use outside knowledge, training data, or guesses
 When RETRIEVED CONTEXT includes records that bear on the question, answer from
 that context with citations. Refuse when snippets are empty, off-topic, or when
 the user asks general knowledge unrelated to QMS documents (e.g. "what is an LLM?").
-If you must refuse, reply with exactly one sentence:
+If you must refuse, reply with exactly one sentence in the user's language (see RULE 7), e.g. English:
 "I can only answer questions related to uploaded documents, SOPs, or retrieved system context."
+or German:
+"Ich kann nur Fragen zu hochgeladenen Dokumenten, SOPs oder abgerufenem Systemkontext beantworten."
 Never hallucinate fields, dates, or root causes that are null or missing in the data.
 """
 
@@ -616,6 +628,9 @@ Answer each point briefly before [ANSWER]:
   • Any cross-collection links to surface?
 
 STEP 2 — [ANSWER]
+  • RESPONSE LANGUAGE (RULE 7): Write [ANSWER] in the same language as USER QUESTION above.
+    Do not answer in German because context is German, or in English because context is English.
+    Honor explicit language instructions from the user.
   • Answer directly and completely.
   • Cite every fact with bracket notation, e.g.
     [SOP-IT-001], [DEV-IT-401], [CAPA-22], [AUDIT-7], [DEC-15]
@@ -656,7 +671,8 @@ FORMAT RULES
 
 After [CONFIDENCE], you MUST append the following machine-readable blocks
 exactly (the application parses them). List each cited source once in
----CITATIONS---; then three to four follow-up questions in JSON.
+---CITATIONS---; then three to four follow-up questions in JSON, in the same
+language as USER QUESTION (RULE 7).
 
 ---CITATIONS---
 [[REF_ID|Document Title|Type|One sentence excerpt]]
@@ -869,7 +885,8 @@ RAW INPUT
 
 OUTPUT REQUIREMENTS
 1) Output ONLY the SOP body in clean plain text (no markdown headings, no code fences).
-2) Use professional, concise, domain-appropriate language.
+2) Use the same language as the user's RAW INPUT. If they explicitly request a language, use that language.
+   Use professional, concise, domain-appropriate wording.
 3) Build a logical, complete hierarchy with numbered sections and subsections.
 4) Numbering style must be consistent (e.g., 1.0, 1.1, 1.2 ... 2.0 ...).
 5) Include these core sections when relevant:

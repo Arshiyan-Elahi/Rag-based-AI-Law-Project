@@ -1149,9 +1149,8 @@ def _render_gap_check_analysis_html(analysis: str) -> str:
             while i < len(block_lines) and block_lines[i] != "":
                 para_lines.append(block_lines[i])
                 i += 1
-            html_parts.append(
-                f"<p>{escape('\n'.join(para_lines)).replace(chr(10), '<br />')}</p>"
-            )
+            para_html = escape("\n".join(para_lines)).replace(chr(10), "<br />")
+            html_parts.append(f"<p>{para_html}</p>")
 
         return "".join(html_parts) if html_parts else render_paragraphs(block_lines)
 
@@ -1182,6 +1181,32 @@ async def perform_ai_action(payload: AIActionRequest):
     from app.ai_routes import perform_ai_action as _app_perform_ai_action
 
     return await _app_perform_ai_action(payload)
+
+
+@ai_router.post("/api/ai/classify-intent")
+async def classify_intent(payload: dict):
+    from chatbot.assistant.intent_classifier import classify_assistant_intent
+
+    message = (payload.get("message") or payload.get("question") or "").strip()
+    if not message:
+        raise HTTPException(status_code=422, detail="message is required")
+
+    ctx = payload.get("assistant_context") if isinstance(payload.get("assistant_context"), dict) else {}
+    current_sop = ctx.get("current_sop") if isinstance(ctx.get("current_sop"), dict) else {}
+    has_active_sop = bool(payload.get("has_active_sop")) or bool(
+        str(ctx.get("active_sop_id") or ctx.get("current_document_id") or current_sop.get("id") or "").strip()
+    )
+
+    result = await asyncio.to_thread(
+        classify_assistant_intent,
+        message,
+        has_active_sop=has_active_sop,
+        has_editor_selection=bool(payload.get("has_editor_selection")),
+        route=str(payload.get("route") or ctx.get("route") or "").strip(),
+        active_sop_title=str(current_sop.get("title") or "").strip(),
+        active_sop_number=str(current_sop.get("sop_number") or current_sop.get("documentId") or "").strip(),
+    )
+    return result.model_dump()
 
 
 @ai_router.get("/api/ai/llm-health")

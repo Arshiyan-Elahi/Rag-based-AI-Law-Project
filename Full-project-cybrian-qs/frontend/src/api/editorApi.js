@@ -131,9 +131,21 @@ export async function createChatSession(payload = {}) {
     body: JSON.stringify({
       title: payload.title ?? null,
       collection_name: payload.collection_name || 'docs_sops',
+      sop_id: payload.sop_id ? String(payload.sop_id).trim() : null,
     }),
   })
   if (!res.ok) await throwApiError(res, 'Failed to create chat session')
+  return res.json()
+}
+
+/** Backend get-or-create: one active chat session per SOP (not browser storage). */
+export async function resolveChatSessionBySop(sopId) {
+  const sid = String(sopId || '').trim()
+  if (!sid) throw new Error('sop_id is required')
+  const res = await fetch(`${API_BASE}/api/chat/sessions/by-sop/${encodeURIComponent(sid)}`, {
+    headers: { ...buildOptionalAuthHeaders() },
+  })
+  if (!res.ok) await throwApiError(res, 'Failed to resolve SOP chat session')
   return res.json()
 }
 
@@ -152,12 +164,29 @@ export async function getChatSessionMessages(sessionId) {
 // Document (sops) operations
 // ─────────────────────────────────────────────────────
 
-export async function createDocument(payload) {
-  const res = await fetch(`${API_BASE}/api/editor/docs`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  })
+export async function createDocument(payload, options = {}) {
+  const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 600000
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+
+  let res
+  try {
+    res = await fetch(`${API_BASE}/api/editor/docs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...buildOptionalAuthHeaders() },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    })
+  } catch (err) {
+    clearTimeout(timer)
+    if (err?.name === 'AbortError') {
+      throw new Error(
+        'Saving the imported SOP timed out. The document may be very large; try again or import a smaller file.',
+      )
+    }
+    throw err
+  }
+  clearTimeout(timer)
   if (import.meta?.env?.DEV) {
     console.debug('[createDocument] request payload', payload)
   }
@@ -321,6 +350,43 @@ export async function getKnowledgeStats() {
 // TODO: Connect to real AI endpoint when available (e.g. POST /api/ai/query)
 // The AI endpoint should accept { question: string } and return
 // { answer: string, sources: Array<{ id: string, type: string, label: string }> }
+/**
+ * Semantic intent classification for the unified KL/KI Assistant chat panel.
+ */
+export async function classifyAssistantIntent(payload = {}) {
+  const body = {
+    message: payload.message || payload.question || '',
+    route: payload.route || '',
+    has_active_sop: Boolean(payload.has_active_sop),
+    has_editor_selection: Boolean(payload.has_editor_selection),
+  }
+  if (payload.assistant_context && typeof payload.assistant_context === 'object') {
+    body.assistant_context = payload.assistant_context
+  }
+
+  const controller = new AbortController()
+  const timeoutMs = 25000
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  let res
+  try {
+    res = await fetch(`${API_BASE}/api/ai/classify-intent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...buildOptionalAuthHeaders() },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    })
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      throw new Error('Intent classification timed out.')
+    }
+    throw err
+  } finally {
+    clearTimeout(timer)
+  }
+  if (!res.ok) await throwApiError(res, 'Intent classification failed')
+  return res.json()
+}
+
 export async function queryAI(question, options = {}) {
   const payload = { question }
   if (Array.isArray(options.chat_history) && options.chat_history.length > 0) {
@@ -419,6 +485,7 @@ export async function performAIAction(payload) {
         client_structured_json: payload?.client_structured_json || null,
         sop_entity_id: payload?.sop_entity_id || null,
         triggered_by: payload?.triggered_by || null,
+        assistant_instruction: payload?.assistant_instruction || null,
       }),
       signal: controller.signal,
     })
@@ -444,16 +511,81 @@ export async function semanticReindex(entityId) {
   return res.json()
 }
 
-export async function extractText(file) {
+/**
+ * @param {File} file
+ * @param {{ timeoutMs?: number }} [options] — large PDFs/OCR can exceed default browser/proxy patience
+ */
+/**
+ * Fast SOP upload — creates the document shell and processes extraction in the background.
+ * @param {File} file
+ * @param {{ timeoutMs?: number }} [options]
+ */
+export async function importSOPAsync(file, options = {}) {
   const formData = new FormData()
   formData.append('file', file)
 
-  const res = await fetch(`${API_BASE}/api/extract-text`, {
-    method: 'POST',
-    body: formData,
-  })
-  if (!res.ok) await throwApiError(res, 'OCR extraction failed')
-  const data = await res.json()
-  console.debug('[OCR] API response', data)
-  return data
+  const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 120000
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+
+  try {
+    const res = await fetch(`${API_BASE}/api/editor/sops/import-async`, {
+      method: 'POST',
+      body: formData,
+      headers: { ...buildOptionalAuthHeaders() },
+      signal: controller.signal,
+    })
+    if (!res.ok) await throwApiError(res, 'Failed to start SOP import')
+    const data = await res.json()
+    notifySidebarCountsRefresh()
+    return data
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      throw new Error('Upload timed out while starting background import. Please try again.')
+    }
+    throw err
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+export async function getImportJobStatus(jobId, options = {}) {
+  const params = new URLSearchParams()
+  if (options.versionId) params.set('version_id', String(options.versionId))
+  if (options.sopId) params.set('sop_id', String(options.sopId))
+  const qs = params.toString()
+  const url = `${API_BASE}/api/editor/import-jobs/${encodeURIComponent(jobId)}${qs ? `?${qs}` : ''}`
+  const res = await fetch(url)
+  if (!res.ok) await throwApiError(res, 'Failed to load import status')
+  return res.json()
+}
+
+export async function extractText(file, options = {}) {
+  const formData = new FormData()
+  formData.append('file', file)
+
+  const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 600000
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+
+  try {
+    const res = await fetch(`${API_BASE}/api/extract-text`, {
+      method: 'POST',
+      body: formData,
+      signal: controller.signal,
+    })
+    if (!res.ok) await throwApiError(res, 'OCR extraction failed')
+    const data = await res.json()
+    console.debug('[OCR] API response', data)
+    return data
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      throw new Error(
+        'Text extraction timed out. Very large files can take several minutes; try again or split the document.',
+      )
+    }
+    throw err
+  } finally {
+    clearTimeout(timer)
+  }
 }

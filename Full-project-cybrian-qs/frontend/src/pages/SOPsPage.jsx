@@ -2,14 +2,30 @@ import React, { useState, useEffect, useCallback, useMemo, lazy, Suspense } from
 import {
   Search, Plus, ChevronDown, ChevronUp, ArrowLeft,
   Sparkles, ExternalLink, Edit3, Filter, Download,
-  AlertCircle, FileText, X, FileEdit, List, Loader, Upload, Trash2
+  AlertCircle, CheckCircle, FileText, X, FileEdit, List, Loader, Upload, Trash2
 } from 'lucide-react'
-import { getSOPs, getDocument, queryAI, createDocument, deleteDocument, getChatSessionMessages } from '../api/editorApi'
+import {
+  getSOPs,
+  getDocument,
+  queryAI,
+  deleteDocument,
+  getChatSessionMessages,
+  importSOPAsync,
+} from '../api/editorApi'
 import {
   buildSOPDisplayLabel,
-  prepareNewSOPImport,
+  importStatusToModalMessage,
+  importStatusToModalPhase,
+  pollImportJobUntilDone,
+  prepareSOPMetadataJson,
   SOP_IMPORT_ACCEPT,
+  SOP_IMPORT_UNSUPPORTED_MESSAGE,
+  assertSOPImportFileAllowed,
+  validateSOPImportFileTypes,
+  normalizeSOPImportMetadata,
+  normalizeSOPTitleForDisplay,
 } from '../utils/sopImportService'
+import { resolveSOPDisplayStatus } from '../utils/sopConstants'
 import SOPTable from '../components/SOPs/SOPTable'
 import StatusBadge from '../components/Common/StatusBadge'
 import { getKLAssistantContext } from '../utils/assistantContext'
@@ -144,6 +160,70 @@ function KISummary({ open, onToggle, query, summaryText, sources, loading, error
   )
 }
 
+/** @typedef {'uploading' | 'success' | 'error'} SOPImportModalPhase */
+
+function formatSOPImportError(err) {
+  const msg = String(err?.message || '').trim()
+  if (
+    msg === SOP_IMPORT_UNSUPPORTED_MESSAGE
+    || /unsupported|binary file|not supported.*pdf|\.pdf.*\.docx.*\.txt/i.test(msg)
+  ) {
+    return SOP_IMPORT_UNSUPPORTED_MESSAGE
+  }
+  if (err?.status === 409) {
+    return msg || 'This SOP ID already exists. Please create a new version or choose another SOP ID.'
+  }
+  return msg || 'SOP upload failed. Please try again.'
+}
+
+function SOPImportFeedbackModal({ modal, onClose }) {
+  if (!modal?.open) return null
+
+  const { phase, message } = modal
+  const isBusy = phase === 'uploading'
+    || phase === 'extracting'
+    || phase === 'ocr_processing'
+    || phase === 'creating_sop'
+    || phase === 'rendering_ready'
+    || phase === 'semantic_processing'
+    || phase === 'indexing'
+  const isSuccess = phase === 'success'
+  const isError = phase === 'error'
+
+  return (
+    <div
+      className="sop-import-modal-overlay"
+      role="presentation"
+      onClick={isError ? onClose : undefined}
+    >
+      <div
+        className={`sop-import-modal sop-import-modal--${phase}`}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="sop-import-modal-title"
+        aria-busy={isBusy}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="sop-import-modal-icon" aria-hidden="true">
+          {isBusy ? <Loader size={36} className="spin" /> : null}
+          {isSuccess ? <CheckCircle size={36} /> : null}
+          {isError ? <AlertCircle size={36} /> : null}
+        </div>
+        <p id="sop-import-modal-title" className="sop-import-modal-message">
+          {message}
+        </p>
+        {isError ? (
+          <div className="sop-import-modal-actions">
+            <button type="button" className="sop-import-modal-btn" onClick={onClose}>
+              Close
+            </button>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  )
+}
+
 // ── Map raw /api/sops record into a display-ready shape ───────────────────
 function mapSOP(s) {
   const cv = s.current_version
@@ -153,7 +233,10 @@ function mapSOP(s) {
     title: s.title || 'Untitled',
     department: s.department || '',
     version_number: cv?.version_number || '1',
-    status: cv?.external_status || 'draft',
+    status: resolveSOPDisplayStatus({
+      externalStatus: cv?.external_status,
+      metadataJson: cv?.metadata_json,
+    }),
     // For the table view
     code: s.sop_number || String(s.id).slice(0, 8),
     version: cv?.version_number ? `V ${cv.version_number}` : 'V 1',
@@ -222,6 +305,35 @@ function buildInitialSOPMetadata(sop) {
 export default function SOPsPage() {
   const fileInputRef = React.useRef(null)
   const [importing, setImporting] = useState(false)
+  /** @type {[{ open: boolean, phase: SOPImportModalPhase, message: string } | null, Function]} */
+  const [importModal, setImportModal] = useState(null)
+  const importSuccessCloseTimerRef = React.useRef(null)
+
+  const closeImportModal = useCallback(() => {
+    if (importSuccessCloseTimerRef.current) {
+      window.clearTimeout(importSuccessCloseTimerRef.current)
+      importSuccessCloseTimerRef.current = null
+    }
+    setImportModal(null)
+  }, [])
+
+  const showImportModal = useCallback((phase, message) => {
+    setImportModal({ open: true, phase, message })
+  }, [])
+
+  useEffect(() => {
+    if (importModal?.phase !== 'success') return undefined
+    importSuccessCloseTimerRef.current = window.setTimeout(() => {
+      setImportModal(null)
+      importSuccessCloseTimerRef.current = null
+    }, 2200)
+    return () => {
+      if (importSuccessCloseTimerRef.current) {
+        window.clearTimeout(importSuccessCloseTimerRef.current)
+        importSuccessCloseTimerRef.current = null
+      }
+    }
+  }, [importModal?.phase])
 
   // ── Document tab system ──────────────────────────────────────────────────
   const [tabs, setTabs] = useState([
@@ -261,7 +373,14 @@ export default function SOPsPage() {
     setActiveTabId(tabId)
   }, [])
 
-  const openSOPEditorTab = useCallback((sopId, sopCode, initialMetadataJson = null, initialStatus = '', initialDocTitle = '') => {
+  const openSOPEditorTab = useCallback((
+    sopId,
+    sopCode,
+    initialMetadataJson = null,
+    initialStatus = '',
+    initialDocTitle = '',
+    initialDocJson = null,
+  ) => {
     const tabId = `editor-${sopId}`
     const openRequestKey = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
     console.debug('[SOP Open] openSOPEditorTab payload', {
@@ -288,6 +407,7 @@ export default function SOPsPage() {
                 initialMetadataJson: initialMetadataJson || tab.initialMetadataJson || null,
                 initialStatus: initialStatus || tab.initialStatus || '',
                 initialDocTitle: initialDocTitle || tab.initialDocTitle || '',
+                initialDocJson: initialDocJson || tab.initialDocJson || null,
                 openRequestKey,
               }
             : tab
@@ -301,6 +421,7 @@ export default function SOPsPage() {
         initialMetadataJson,
         initialStatus,
         initialDocTitle,
+        initialDocJson,
         openRequestKey,
         closeable: true,
       }]
@@ -569,47 +690,166 @@ export default function SOPsPage() {
   }, [loadSOPs, sopToDelete])
 
   const handleFileChange = async (e) => {
-    const file = e.target.files?.[0]
-    if (!file) return
+    const list = e.target.files
+    if (!list?.length) return
+
+    const files = Array.from(list)
+    const typeError = validateSOPImportFileTypes(files)
+    if (typeError) {
+      showImportModal('error', typeError)
+      if (fileInputRef.current) fileInputRef.current.value = ''
+      return
+    }
+
+    const uploadingMessage = files.length === 1
+      ? 'SOP is uploading...'
+      : `Uploading ${files.length} SOPs...`
 
     setImporting(true)
+    showImportModal('uploading', uploadingMessage)
+
     try {
-      const imported = await prepareNewSOPImport(file)
-      const createPayload = {
-        title: imported.resolvedTitle,
-        doc_json: imported.docJson,
-        metadata_json: imported.metadataJson,
+      let successCount = 0
+      let lastNewDoc = null
+      let lastImported = null
+      const errors = []
+
+      for (const file of files) {
+        try {
+          assertSOPImportFileAllowed(file)
+          const started = await importSOPAsync(file)
+          const jobId = started?.job_id
+          const shellDoc = started?.document
+          const pollVersionId = started?.import_status?.version_id || shellDoc?.version_id
+          const pollSopId = started?.import_status?.sop_id || shellDoc?.sop_id
+          if (!jobId || !shellDoc?.id) {
+            throw new Error('Background import did not return a document id.')
+          }
+
+          const shellMeta = shellDoc.metadata_json && typeof shellDoc.metadata_json === 'object'
+            ? shellDoc.metadata_json
+            : {}
+          const fallbackTitle = file.name.replace(/\.[^/.]+$/, '') || 'Imported SOP'
+          const shellSm = shellMeta.sopMetadata || {}
+          const resolvedTitle = normalizeSOPTitleForDisplay(
+            shellSm.title || shellDoc.title || '',
+            shellSm.documentId || '',
+          ) || fallbackTitle
+          const metadataJson = prepareSOPMetadataJson(
+            normalizeSOPImportMetadata(shellSm),
+            { author: 'System (Import)', reviewer: '' },
+          )
+          const initialStatus = (
+            metadataJson.sopStatus
+            || metadataJson.status
+            || ''
+          ).trim()
+
+          const tabLabel = buildSOPDisplayLabel(normalizeSOPImportMetadata(shellSm))
+            || shellSm.documentId
+            || resolvedTitle
+
+          openSOPEditorTab(
+            String(shellDoc.id),
+            tabLabel,
+            metadataJson,
+            initialStatus,
+            resolvedTitle,
+            shellDoc.doc_json || { type: 'doc', content: [] },
+          )
+
+          const reportStatus = (statusRow) => {
+            const phase = importStatusToModalPhase(statusRow?.status)
+            const message = importStatusToModalMessage(
+              statusRow?.status,
+              statusRow?.message,
+            )
+            showImportModal(phase, message)
+          }
+
+          reportStatus(started?.import_status || { status: 'uploading' })
+
+          const refreshImportedEditorTab = async () => {
+            const newDoc = await getDocument(String(shellDoc.id))
+            const importedMeta = newDoc?.metadata_json && typeof newDoc.metadata_json === 'object'
+              ? newDoc.metadata_json
+              : metadataJson
+            const imported = {
+              resolvedTitle: normalizeSOPTitleForDisplay(
+                importedMeta?.sopMetadata?.title || newDoc.title || '',
+                importedMeta?.sopMetadata?.documentId || '',
+              ) || resolvedTitle,
+              metadataJson: importedMeta,
+              metadata: normalizeSOPImportMetadata(importedMeta?.sopMetadata || {}),
+              docJson: newDoc?.doc_json || { type: 'doc', content: [] },
+            }
+            const refreshKey = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+            setTabs((prev) => prev.map((tab) => (
+              tab.id === `editor-${shellDoc.id}`
+                ? {
+                    ...tab,
+                    label: buildSOPDisplayLabel(imported.metadata) || tab.label,
+                    initialDocJson: imported.docJson,
+                    initialMetadataJson: imported.metadataJson,
+                    initialDocTitle: imported.resolvedTitle,
+                    openRequestKey: refreshKey,
+                  }
+                : tab
+            )))
+            return { newDoc, imported }
+          }
+
+          await pollImportJobUntilDone(jobId, {
+            versionId: pollVersionId,
+            sopId: pollSopId,
+            onStatus: reportStatus,
+            onContentReady: async () => {
+              try {
+                await refreshImportedEditorTab()
+              } catch (refreshErr) {
+                console.warn('Early import content refresh failed:', refreshErr)
+              }
+            },
+          })
+
+          const { newDoc, imported } = await refreshImportedEditorTab()
+
+          successCount += 1
+          lastNewDoc = newDoc
+          lastImported = imported
+        } catch (err) {
+          console.error('SOP import failed:', err, {
+            status: err?.status,
+            responseBody: err?.responseBody || null,
+            file: file?.name,
+          })
+          errors.push(`${file.name}: ${formatSOPImportError(err)}`)
+        }
       }
 
-      if (import.meta?.env?.DEV) {
-        console.debug('[SOP Import] createDocument payload', createPayload)
-      }
-
-      const newDoc = await createDocument(createPayload)
-
-      const tabLabel = buildSOPDisplayLabel(imported.metadata)
-        || newDoc.sop_number
-        || imported.resolvedTitle
-
-      openSOPEditorTab(newDoc.id, tabLabel)
-      
-      // Reset file input
-      if (fileInputRef.current) fileInputRef.current.value = ''
-      
-      // Optional: reload list
-      loadSOPs()
-    } catch (err) {
-      console.error('PDF Import failed:', err, {
-        status: err?.status,
-        responseBody: err?.responseBody || null,
-      })
-      if (err?.status === 409) {
-        alert(
-          err.message ||
-            'This SOP ID already exists. Please create a new version or choose another SOP ID.',
+      if (successCount > 0 && errors.length === 0) {
+        const successMessage = successCount === 1
+          ? 'SOP uploaded successfully.'
+          : `${successCount} SOPs uploaded successfully.`
+        showImportModal('success', successMessage)
+      } else if (successCount > 0 && errors.length > 0) {
+        showImportModal(
+          'error',
+          `Uploaded ${successCount} of ${files.length}. ${errors.join(' ')}`,
         )
-      } else {
-        alert(`Import fehlgeschlagen: ${err.message}`)
+      } else if (errors.length > 0) {
+        showImportModal(
+          'error',
+          errors.length === 1 ? errors[0].replace(/^[^:]+:\s*/, '') : errors.join(' '),
+        )
+      }
+
+      if (fileInputRef.current) fileInputRef.current.value = ''
+
+      try {
+        await loadSOPs()
+      } catch (loadErr) {
+        console.error('Failed to refresh SOP list after import:', loadErr)
       }
     } finally {
       setImporting(false)
@@ -618,6 +858,7 @@ export default function SOPsPage() {
 
   return (
     <div className="sops-tabbed-page">
+      <SOPImportFeedbackModal modal={importModal} onClose={closeImportModal} />
 
       {/* ── Document tab bar ──────────────────────────────────────────── */}
       <div className="doc-tab-bar" role="tablist" aria-label="SOP Tabs">
@@ -799,19 +1040,21 @@ export default function SOPsPage() {
                 <button className="sops-action-btn sops-action-primary" onClick={handleCreate}>
                   <Plus size={14} /> Neue SOP
                 </button>
-                <button 
-                  className={`sops-action-btn sops-action-primary ${importing ? 'loading' : ''}`} 
+                <button
+                  className="sops-action-btn sops-action-primary"
                   onClick={handleImportClick}
                   disabled={importing}
+                  aria-busy={importing}
                 >
-                  {importing ? <Loader size={14} className="spin" /> : <Upload size={14} />}
-                  <span>{importing ? 'Importiere...' : 'Import SOP'}</span>
+                  <Upload size={14} />
+                  <span>Import SOP</span>
                 </button>
                 <input
                   type="file"
                   ref={fileInputRef}
                   style={{ display: 'none' }}
                   accept={SOP_IMPORT_ACCEPT}
+                  multiple
                   onChange={handleFileChange}
                 />
               </div>
@@ -898,6 +1141,7 @@ export default function SOPsPage() {
             <EditorPage
               isEmbedded
               initialDocId={tab.docId !== undefined ? tab.docId : null}
+              initialDocJson={tab.initialDocJson || null}
               initialMetadataJson={tab.initialMetadataJson || null}
               initialStatus={tab.initialStatus || ''}
               initialDocTitle={tab.initialDocTitle || ''}

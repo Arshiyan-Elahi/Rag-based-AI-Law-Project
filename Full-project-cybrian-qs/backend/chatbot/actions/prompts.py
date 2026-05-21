@@ -39,15 +39,60 @@ _THREE_C_IMPROVE_STANDARD = """3C SOP IMPROVEMENT STANDARD:
 - Clarity: Correct grammar, sentence flow, vague terms, unclear abbreviations, and unclear responsibility without changing meaning.
 - Consistency: Keep the original structure, numbering, field labels, formatting, terminology, paragraph boundaries, and compact register style.
 - Compliance: Preserve audit-relevant facts and improve GMP/QA wording without adding new requirements, controls, dates, systems, owners, approvals, or regulatory claims.
+- Voice: Prefer tight procedural phrasing over explanatory prose; do not inflate terse lines into narrative.
 - Final self-check: Confirm the output preserves the same meaning, scope, records, IDs, and required fields as TEXT."""
 
 _THREE_C_REWRITE_STANDARD = """3C SOP REWRITE STANDARD:
 - Clarity: Rewrite vague, passive, or informal wording into clear, role-based, action-oriented SOP language.
 - Consistency: Keep the same section order, numbering, terminology, register format, IDs, record structure, and document tone unless EDIT_SCOPE is FULL_DOCUMENT and TEXT is missing required SOP backbone sections.
 - Compliance: Strengthen GMP/QA control language only when supported by TEXT, metadata, or a visible risk in the provided content. Do not invent approvals, limits, systems, owners, dates, forms, thresholds, or regulatory references.
+- Voice: Default to concise auditable instructions; avoid generic AI essay tone, redundant qualifiers, and meta-commentary about the document.
 - Final self-check: Verify the rewritten SOP is clear, consistent, compliant, and that no original ID, record, section, or required field was removed."""
 
 _META_USAGE = """METADATA: Use NLP_STRUCTURE_AND_PARAMETERS and database metadata for style, terminology, and structure alignment only. If metadata conflicts with TEXT, preserve TEXT meaning."""
+
+_USER_EDIT_INTENT_SEMANTICS = """USER_EDIT_INTENT_SEMANTICS (applies when USER_EDIT_INTENT block is present):
+- Treat USER_EDIT_INTENT as the author's operational brief — infer task shape, desired density, tone, and output shape from meaning (including domain jargon and negations), not from isolated cue words.
+- Resolve brevity vs completeness by keeping every obligation, control, record, identifier, threshold, and sequence step that exists in TEXT; remove only redundancy, filler, and non-audit narrative wrapping.
+- When the brief leans toward a shorter deliverable, increase procedural density: shorter clauses, decisive modals/imperatives, fewer transitions, no preamble or recap, no commentary about "this SOP" or "the above".
+- If USER_EDIT_INTENT conflicts with a stylistic default in this prompt, follow USER_EDIT_INTENT while still obeying PRESERVE rules and EDIT_SCOPE."""
+
+_PROCEDURAL_SOP_VOICE = """PROCEDURAL SOP VOICE (baseline unless USER_EDIT_INTENT clearly asks for training-style or explanatory depth):
+- Write as auditable work instructions: who acts, on what, when, with which record — not as a tutorial, essay, or marketing text.
+- Prefer direct imperatives and named roles over framing ("In order to ensure quality…", "It is important to note…").
+- Avoid stacked synonyms, repeated hedges, and boilerplate intensifiers that do not change the requirement.
+- Do not describe your own edits; output only the revised SOP content inside the JSON string."""
+
+_PROCEDURAL_ANALYSIS_VOICE = """FINDINGS VOICE (this task is analysis, not an SOP rewrite):
+- Use tight audit-oriented phrasing; avoid narrative filler, rhetorical padding, and generic reviewer monologue.
+- Cite themes visible in TEXT; do not paste or wholesale rewrite the SOP body.
+- Put all analysis content in the single JSON string value; no markdown or prose outside JSON."""
+
+
+def _user_edit_intent_block(request: ActionRequest) -> str:
+    raw = getattr(request, "assistant_instruction", None)
+    if raw is None:
+        return ""
+    text = str(raw).strip()
+    if not text:
+        return ""
+    if len(text) > 3500:
+        text = text[:3497].rstrip() + "..."
+    return (
+        "\nUSER_EDIT_INTENT (author request — interpret semantically; "
+        "not part of the SOP body to paste verbatim):\n"
+        f"\"\"\"{text}\"\"\"\n"
+    )
+
+
+def _intent_optimization_layers(request: ActionRequest, *, output_kind: str = "sop_edit") -> str:
+    """User brief + response shaping; keeps token cost low when no brief is present."""
+    block = _user_edit_intent_block(request)
+    voice = _PROCEDURAL_ANALYSIS_VOICE if output_kind == "analysis" else _PROCEDURAL_SOP_VOICE
+    if block.strip():
+        return f"{block}\n{_USER_EDIT_INTENT_SEMANTICS}\n{voice}".strip()
+    return voice.strip()
+
 
 _RECORD_ID_RE = re.compile(r"\b(?:DEV|CAPA|AUD|DEC)-[A-Z0-9]+-\d+\b", re.IGNORECASE)
 TRACEABILITY_SECTION_HEADER_RE = re.compile(
@@ -261,6 +306,7 @@ def build_improve_prompt(request: ActionRequest, context: str, nlp_block: str = 
 {_LANGUAGE_RULE}
 {_doc_block(request, context)}
 {_scope_directive(request, "improve")}
+{_intent_optimization_layers(request)}
 {_nlp_section(nlp_block)}
 {_META_USAGE}
 {_PRESERVE_CORE}
@@ -272,6 +318,7 @@ IMPROVE RULES:
 - Never introduce bullets, numbering, labels, or headings not present in the original.
 - Never add steps, approvals, systems, requirements, or compliance claims.
 - Keep compact register statements compact — do not inflate into narrative prose.
+- When USER_EDIT_INTENT or the TASK wording favors less verbiage, shorten at the clause level while keeping each obligation and record field explicit.
 - When EDIT_SCOPE is SECTION_ONLY: output must replace only the targeted block; never return a full SOP skeleton.
 - Before returning: compare output against TEXT and restore any missing section, record, field, or ID present in TEXT.
 
@@ -282,17 +329,19 @@ Return only:
 
 
 def build_summarize_prompt(request: ActionRequest, context: str, nlp_block: str = "") -> str:
-    return f"""You are a senior GMP/QA communications lead. TASK: produce a concise executive summary of the SOP text (no full rewrite).
+    return f"""You are a senior GMP/QA communications lead. TASK: produce a concise summary of the SOP text (not a full rewrite) suitable for stakeholders who must grasp controls quickly.
 {_SPEED_FIRST}
 {_JSON_ESCAPING_RULE}
 {_LANGUAGE_RULE}
 {_doc_block(request, context)}
+{_intent_optimization_layers(request)}
 {_nlp_section(nlp_block)}
 {_META_USAGE}
 {_PRESERVE_CORE}
 
 SUMMARY RULES:
-- 6–12 short bullets or 2 tight paragraphs maximum.
+- Default: 6–12 short bullets or 2 tight paragraphs maximum. If USER_EDIT_INTENT specifies a different cap (lines, words, bullets), follow it while still obeying PRESERVE rules.
+- Use operational phrasing (actions, owners, records, triggers) — not generic AI narrative or essay transitions.
 - Cover: purpose, scope, critical controls, key roles, records, and review cadence when present in the text.
 - Do not invent facts, dates, systems, or approvals that are not present in TEXT.
 - Keep identifiers and codes exactly as written.
@@ -309,6 +358,7 @@ def build_analyze_prompt(request: ActionRequest, context: str, nlp_block: str = 
 {_JSON_ESCAPING_RULE}
 {_LANGUAGE_RULE}
 {_doc_block(request, context)}
+{_intent_optimization_layers(request, output_kind="analysis")}
 {_nlp_section(nlp_block)}
 {_META_USAGE}
 {_PRESERVE_CORE}
@@ -340,6 +390,7 @@ FULL SOP BACKBONE (add when missing from TEXT, in input language):
 {_LANGUAGE_RULE}
 {_doc_block(request, context)}
 {_scope_directive(request, "rewrite")}
+{_intent_optimization_layers(request)}
 {_nlp_section(nlp_block)}
 {_META_USAGE}
 {_PRESERVE_CORE}
@@ -350,6 +401,7 @@ REWRITE RULES:
 - Single section/heading (e.g. CAPAs, DEVIATIONS, Procedure): rewrite only lines in TEXT; never swap CAPAs for DEVIATIONS or vice versa.
 - Use bracketed placeholders only for missing controls clearly implied by TEXT inside that section.
 - Apply rewrite_improve_parameters from NLP_STRUCTURE_AND_PARAMETERS only for tone, formality, numbering, and domain vocabulary; never use them to change facts.
+- When a stronger compression preference is evident from USER_EDIT_INTENT, DOCUMENT fields, or the TASK wording, prioritize shorter sentences and fewer function words while keeping each control and record explicit.
 
 LANGUAGE & STYLE:
 - Active voice, named accountable roles, precise verbs, consistent controlled vocabulary.
@@ -421,6 +473,7 @@ def build_gap_check_prompt(request: ActionRequest, context: str, nlp_block: str 
 {_LANGUAGE_RULE}
 SOP: "{request.sop_title}" | Section: "{request.section_title}" ({request.section_type})
 edit_scope: {resolve_edit_scope(request)}
+{_user_edit_intent_block(request)}
 
 {_gap_scope_directive(request)}
 

@@ -1,6 +1,6 @@
 import io
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, UploadFile, File
-from typing import List
+from typing import List ,Any
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_, asc
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -40,6 +40,8 @@ from .schemas import (
     SemanticReindexRequest,
     LinkSuggestionResponse,
     SemanticStatusResponse,
+    SOPImportJobStatusResponse,
+    AsyncSOPImportResponse,
 )
 from .services.semantic_pipeline import (
     SemanticPipelineService,
@@ -632,8 +634,12 @@ def _upsert_import_context_entities(
                 created["links"] += 1
 
     db.commit()
-    version_meta["_import_context_hash"] = context_hash
-    version.metadata_json = version_meta
+    # Refresh metadata before writing hash so _import_job and other internal keys are not wiped.
+    db.refresh(version)
+    fresh_meta = version.metadata_json if isinstance(version.metadata_json, dict) else {}
+    fresh_meta = dict(fresh_meta)
+    fresh_meta["_import_context_hash"] = context_hash
+    version.metadata_json = fresh_meta
     db.commit()
     t_end = datetime.utcnow()
     print(
@@ -662,9 +668,13 @@ def _normalize_sop_metadata(sop_number: str, title: str, department: str = None,
     title = strip_invalid_control_chars(title or "")
     department = strip_invalid_control_chars(department or "")
     
+    from .services.sop_metadata_extractor import resolve_status_from_metadata
+
+    resolved_sop_status = resolve_status_from_metadata(raw_meta)
+
     # 1. Base Structure
     normalized = {
-        "sopStatus": raw_meta.get("sopStatus", "draft"),
+        "sopStatus": resolved_sop_status or "draft",
         "variables": raw_meta.get("variables", {}),
         "approvedBy": raw_meta.get("approvedBy", ""),
         "auditTrail": raw_meta.get("auditTrail") if isinstance(raw_meta.get("auditTrail"), list) else [],
@@ -685,10 +695,13 @@ def _normalize_sop_metadata(sop_number: str, title: str, department: str = None,
             "references": raw_meta.get("sopMetadata", {}).get("references", []),
             "reviewDate": raw_meta.get("sopMetadata", {}).get("reviewDate", ""),
             "effectiveDate": raw_meta.get("sopMetadata", {}).get("effectiveDate", ""),
-            "regulatoryReferences": raw_meta.get("sopMetadata", {}).get("regulatoryReferences", [])
+            "regulatoryReferences": raw_meta.get("sopMetadata", {}).get("regulatoryReferences", []),
         }
     }
-    
+    if resolved_sop_status:
+        normalized["sopMetadata"]["sopStatus"] = resolved_sop_status
+        normalized["sopMetadata"]["status"] = resolved_sop_status
+
     # Merge nested sopMetadata: client may send documentId/title; incoming values win when non-empty
     input_sop_meta = raw_meta.get("sopMetadata", {})
     if isinstance(input_sop_meta, dict):
@@ -733,13 +746,16 @@ def _metadata_debug_sources(structured: dict) -> dict:
 
 
 def _build_extract_response(text: str, blocks: list, structured: dict) -> dict:
+    from .services.document_structure import blocks_to_structured_document
     from .services.sop_metadata_extractor import to_frontend_sop_metadata
 
     sop_ui = to_frontend_sop_metadata(structured)
     public_meta = {k: v for k, v in structured.items() if not str(k).startswith("_")}
+    structured_document = blocks_to_structured_document(blocks, public_meta)
     response = {
         "text": (text or "").strip(),
         "blocks": blocks,
+        "structured_document": structured_document,
         "sop_metadata": public_meta,
         "sop_metadata_ui": sop_ui,
         "metadata_sources": _metadata_debug_sources(public_meta),
@@ -761,32 +777,38 @@ def _build_extract_response(text: str, blocks: list, structured: dict) -> dict:
 
 
 def _normalize_external_status(value: str) -> str:
-    v = str(value or "").strip()
-    if not v:
-        return ""
-    compact = re.sub(r"[\s-]+", "_", v.lower())
-    alias_map = {
-        "in_review": "under_review",
-        "underreview": "under_review",
-        "freigegeben": "effective",
-        "entwurf": "draft",
-        "prufung": "under_review",
-        "pruefung": "under_review",
-    }
-    normalized = alias_map.get(compact, compact)
-    return normalized if normalized in {"draft", "under_review", "effective", "obsolete", "approved", "accepted", "rejected", "changes_requested"} else ""
+    from .services.sop_metadata_extractor import normalize_document_status
+
+    normalized = normalize_document_status(value)
+    if normalized:
+        return normalized
+    compact = re.sub(r"[\s-]+", "_", str(value or "").strip().lower())
+    if compact in {"accepted", "rejected", "changes_requested"}:
+        return compact
+    return ""
 
 
 def _resolve_external_status_from_payload(raw_meta: dict | None, fallback: str = "draft") -> str:
+    from .services.sop_metadata_extractor import resolve_status_from_metadata
+
     if not isinstance(raw_meta, dict):
         return fallback
-    candidate = (
-        raw_meta.get("sopStatus")
-        or raw_meta.get("status")
-        or (raw_meta.get("sopMetadata", {}) or {}).get("sopStatus")
-        or (raw_meta.get("sopMetadata", {}) or {}).get("status")
+    return resolve_status_from_metadata(raw_meta) or fallback
+
+
+def _resolve_version_status(version) -> str:
+    """
+    Version status for API/UI: prefer extracted document status in metadata when the
+    DB column is still the import shell default (draft).
+    """
+    meta_status = _resolve_external_status_from_payload(
+        version.metadata_json if isinstance(version.metadata_json, dict) else None,
+        fallback="",
     )
-    return _normalize_external_status(candidate) or fallback
+    col_status = _normalize_external_status(version.external_status or "")
+    if meta_status and (not col_status or (col_status == "draft" and meta_status != "draft")):
+        return meta_status
+    return col_status or meta_status or "draft"
 
 
 def _build_editor_doc_response(sop: SOP, version: SOPVersion) -> dict:
@@ -809,7 +831,7 @@ def _build_editor_doc_response(sop: SOP, version: SOPVersion) -> dict:
         "metadata_json": normalized_meta,
         "current_version_id": str(sop.current_version_id) if sop.current_version_id else None,
         "version_number": version.version_number,
-        "status": version.external_status or "draft",
+        "status": _resolve_version_status(version),
         "created_at": sop.created_at,
         "updated_at": sop.updated_at,
     }
@@ -832,7 +854,7 @@ def _build_editor_version_response(version: SOPVersion) -> dict:
         "id": str(version.id),
         "doc_id": str(version.sop_id),
         "version_number": version.version_number,
-        "status": version.external_status or "draft",
+        "status": _resolve_version_status(version),
         "doc_json": version.content_json,
         "metadata_json": normalized_meta,
         "effective_date": version.effective_date,
@@ -895,54 +917,100 @@ router = APIRouter()
 
 @router.get("/api/health")
 def health():
-    return {"status": "ok"}
+    from .services.local_marker_extractor import check_local_marker_setup
+    from .services.pdf_extractor import check_ocr_setup
+
+    ocr = check_ocr_setup()
+    marker = check_local_marker_setup()
+    return {
+        "status": "ok",
+        "ocr": ocr,
+        "ocr_ready": bool(ocr.get("tesseract_binary") and ocr.get("poppler_binaries")),
+        "local_marker": marker,
+        "local_marker_ready": bool(marker.get("enabled") and marker.get("available")),
+    }
+
+
+SOP_IMPORT_UNSUPPORTED_DETAIL = (
+    "This file format is not supported. Please upload PDF, DOCX, or TXT."
+)
+
+
+def _is_allowed_sop_upload_filename(filename: str | None) -> bool:
+    name = (filename or "").lower().strip()
+    return name.endswith((".pdf", ".docx", ".txt"))
 
 
 @router.post("/api/extract-text")
 async def extract_text_from_upload(file: UploadFile = File(...)):
     """
-    Extract plain text from a small text file or PDF (editor import / OCR path).
+    Extract plain text from PDF, DOCX, or TXT (editor import path).
+
+    PDF: disk cache only (Marker runs in background via import-async). DOCX: python-docx. TXT: UTF-8.
     Includes structured SOP metadata inferred from content (rules + optional LLM fallback).
     """
-    from .services.pdf_extractor import extract_docx_bytes, extract_pdf_bytes_robust
+    from .services.document_structure import enrich_metadata_text, structure_blocks_from_text
+    from .services.local_marker_extractor import try_extract_pdf_from_cache
+    from .services.pdf_extractor import extract_docx_bytes
     from .services.sop_metadata_extractor import extract_sop_metadata_from_text
 
     name = (file.filename or "").lower()
+    if not _is_allowed_sop_upload_filename(name):
+        raise HTTPException(status_code=400, detail=SOP_IMPORT_UNSUPPORTED_DETAIL)
+
+    # Metadata heuristics only need the beginning of the document; cap keeps very large imports responsive.
+    _meta_cap = int(os.getenv("SOP_IMPORT_METADATA_TEXT_CAP", "120000"))
+
+    def _clip_for_metadata(src: str) -> str:
+        t = (src or "").strip()
+        return t if len(t) <= _meta_cap else t[:_meta_cap]
+
     try:
         if name.endswith(".pdf"):
             raw_pdf = await file.read()
-            blocks, text = extract_pdf_bytes_robust(raw_pdf)
+            cached = try_extract_pdf_from_cache(raw_pdf)
+            if not cached:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "PDF extraction runs in the background and is not available on this request. "
+                        "Use POST /api/editor/sops/import-async to import PDFs, or re-open after a "
+                        "previous import has cached the same file."
+                    ),
+                )
+            blocks, text, _marker = cached
             text = strip_invalid_control_chars(text)
-            structured = extract_sop_metadata_from_text(text, blocks)
+            meta_text = enrich_metadata_text(text, blocks)
+            structured = extract_sop_metadata_from_text(
+                _clip_for_metadata(meta_text),
+                blocks,
+                use_llm_fallback=len(text) < 250000,
+            )
             return _build_extract_response(text, blocks, structured)
         elif name.endswith(".docx"):
             raw_docx = await file.read()
             blocks, text = extract_docx_bytes(raw_docx)
             text = strip_invalid_control_chars(text)
-            structured = extract_sop_metadata_from_text(text, blocks)
+            meta_text = enrich_metadata_text(text, blocks)
+            structured = extract_sop_metadata_from_text(
+                _clip_for_metadata(meta_text),
+                blocks,
+                use_llm_fallback=len(text) < 250000,
+            )
             return _build_extract_response(text, blocks, structured)
-        elif name.endswith((".txt", ".md", ".csv", ".json")):
+        elif name.endswith(".txt"):
             raw = await file.read()
             text = strip_invalid_control_chars(raw.decode("utf-8", errors="replace"))
-            paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
-            blocks = [{"type": "paragraph", "text": p} for p in paras]
-            structured = extract_sop_metadata_from_text(text, blocks)
+            blocks = structure_blocks_from_text(text)
+            meta_text = enrich_metadata_text(text, blocks)
+            structured = extract_sop_metadata_from_text(
+                _clip_for_metadata(meta_text),
+                blocks,
+                use_llm_fallback=len(text) < 250000,
+            )
             return _build_extract_response(text, blocks, structured)
         else:
-            # Best-effort UTF-8 for unknown extensions
-            raw = await file.read()
-            try:
-                text = raw.decode("utf-8")
-                text = strip_invalid_control_chars(text)
-            except Exception:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Unsupported or binary file; use .pdf, .docx, or .txt",
-                ) from None
-            paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
-            blocks = [{"type": "paragraph", "text": p} for p in paras]
-            structured = extract_sop_metadata_from_text(text, blocks)
-            return _build_extract_response(text, blocks, structured)
+            raise HTTPException(status_code=400, detail=SOP_IMPORT_UNSUPPORTED_DETAIL)
     except HTTPException:
         raise
     except Exception as e:
@@ -1085,10 +1153,234 @@ def create_document(
     db.refresh(initial_version)
     logger.info("[sop-editor] upload saved sop_id=%s version_id=%s", sop.id, initial_version.id)
 
-    _upsert_import_context_entities(db, sop, initial_version, background_tasks)
-    _schedule_semantic_job(background_tasks, "sop", sop.id, initial_version.id)
+    from .services.sop_import_worker import import_job_pending
+
+    if not import_job_pending(initial_version.metadata_json):
+        _upsert_import_context_entities(db, sop, initial_version, background_tasks)
+        _schedule_semantic_job(background_tasks, "sop", sop.id, initial_version.id)
 
     return _build_editor_doc_response(sop, initial_version)
+
+
+@router.post("/api/editor/sops/import-async", response_model=AsyncSOPImportResponse)
+async def import_sop_async(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    _=Depends(check_mock_mode),
+):
+    """
+    Fast SOP upload: create record immediately, extract/OCR/index in background.
+    Poll GET /api/editor/import-jobs/{job_id} for status until completed.
+    """
+    from pathlib import Path
+
+    from .services.sop_import_worker import (
+        IMPORT_STATUS_UPLOADING,
+        build_import_job_payload,
+        build_import_job_status_dict,
+        enqueue_sop_import_job,
+        get_import_job_status,
+        merge_import_job_metadata,
+        processing_placeholder_doc,
+    )
+
+    name = (file.filename or "").lower()
+    if not _is_allowed_sop_upload_filename(name):
+        raise HTTPException(status_code=400, detail=SOP_IMPORT_UNSUPPORTED_DETAIL)
+
+    max_bytes = int(os.getenv("SOP_IMPORT_MAX_BYTES", str(80 * 1024 * 1024)))
+    raw = await file.read()
+    if len(raw) > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large ({len(raw)} bytes). Maximum is {max_bytes} bytes.",
+        )
+
+    job_id = str(uuid.uuid4())
+    new_sop_id = uuid.uuid4()
+    new_ver_id = uuid.uuid4()
+    # Temporary unique placeholder until extraction assigns the real SOP number from the file.
+    sop_number = f"IMPORT-{job_id.replace('-', '')[:12].upper()}"
+    fallback_title = (Path(name).stem or "Imported SOP")[:255]
+    upload_filename = file.filename or "upload"
+
+    try:
+        job_payload = build_import_job_payload(
+            job_id=job_id,
+            status=IMPORT_STATUS_UPLOADING,
+            message="Upload received. Processing in background…",
+            filename=upload_filename,
+        )
+        normalized_meta = _normalize_sop_metadata(
+            sop_number="",
+            title=fallback_title,
+            department="Quality",
+            raw_meta=merge_import_job_metadata(
+                {
+                    "sopStatus": "draft",
+                    "sopMetadata": {
+                        "title": fallback_title,
+                        "author": "System (Import)",
+                        "reviewer": "",
+                    },
+                },
+                job_payload,
+            ),
+        )
+
+        sop = SOP(
+            id=new_sop_id,
+            tenant_id=FIXED_TENANT_ID,
+            title=fallback_title,
+            sop_number=sop_number,
+            department="Quality",
+            is_active=True,
+            current_version_id=new_ver_id,
+        )
+        initial_version = SOPVersion(
+            id=new_ver_id,
+            sop_id=new_sop_id,
+            version_number=normalized_meta.get("sopMetadata", {}).get("sopVersion") or "1",
+            content_json=processing_placeholder_doc(),
+            metadata_json=normalized_meta,
+            effective_date=_metadata_date(normalized_meta.get("sopMetadata", {}).get("effectiveDate")),
+            review_date=_metadata_date(normalized_meta.get("sopMetadata", {}).get("reviewDate")),
+            external_status="draft",
+        )
+        if name.endswith(".pdf"):
+            from .services.document_extraction import apply_extraction_fields
+            from .services.local_marker_extractor import EXTRACTION_ENGINE
+            from .services.sop_import_worker import IMPORT_STATUS_QUEUED
+
+            apply_extraction_fields(
+                initial_version,
+                job_id=job_id,
+                status=IMPORT_STATUS_QUEUED,
+                engine=EXTRACTION_ENGINE,
+            )
+        db.add(sop)
+        db.add(initial_version)
+        try:
+            db.commit()
+        except SQLAlchemyError as exc:
+            db.rollback()
+            logger.exception("[sop-import] async shell commit failed sop_number=%s", sop_number)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to create import shell: {str(exc)[:500]}",
+            ) from None
+
+        db.refresh(sop)
+        db.refresh(initial_version)
+
+        from .services.sop_import_job_registry import register_import_job
+
+        register_import_job(
+            job_id=job_id,
+            sop_id=sop.id,
+            version_id=initial_version.id,
+            status=IMPORT_STATUS_UPLOADING,
+            message="Upload received. Processing in background…",
+            filename=upload_filename,
+        )
+
+        if not isinstance(initial_version.metadata_json, dict) or not initial_version.metadata_json.get("_import_job"):
+            logger.error(
+                "[sop-import] _import_job missing after commit sop_id=%s version_id=%s meta_keys=%s",
+                sop.id,
+                initial_version.id,
+                list((initial_version.metadata_json or {}).keys()),
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Import job metadata was not persisted. Check database JSONB support.",
+            )
+
+        try:
+            enqueue_sop_import_job(
+                job_id=job_id,
+                sop_id=sop.id,
+                version_id=initial_version.id,
+                file_bytes=raw,
+                filename=upload_filename,
+            )
+        except Exception as exc:
+            logger.exception("[sop-import] failed to enqueue background worker job_id=%s", job_id)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Import worker could not be started: {type(exc).__name__}: {str(exc)[:300]}",
+            ) from None
+
+        status_row = build_import_job_status_dict(
+            job_id=job_id,
+            sop=sop,
+            version=initial_version,
+        ) or get_import_job_status(
+            db,
+            job_id,
+            version_id=initial_version.id,
+            sop_id=sop.id,
+        )
+        if not status_row:
+            logger.error(
+                "[sop-import] status payload missing after init job_id=%s sop_id=%s version_id=%s",
+                job_id,
+                sop.id,
+                initial_version.id,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Import job could not be initialized (status payload missing).",
+            )
+
+        logger.info(
+            "[sop-import] async shell created sop_id=%s version_id=%s job_id=%s filename=%s bytes=%s",
+            sop.id,
+            initial_version.id,
+            job_id,
+            upload_filename,
+            len(raw),
+        )
+        return AsyncSOPImportResponse(
+            job_id=job_id,
+            import_status=SOPImportJobStatusResponse(**status_row),
+            document=_build_editor_doc_response(sop, initial_version),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("[sop-import] async init failed filename=%s", upload_filename)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Import initialization failed: {type(exc).__name__}: {str(exc)[:400]}",
+        ) from None
+
+
+@router.get("/api/editor/import-jobs/{job_id}", response_model=SOPImportJobStatusResponse)
+def get_sop_import_job_status(
+    job_id: str,
+    version_id: str | None = None,
+    sop_id: str | None = None,
+    db: Session = Depends(get_db),
+):
+    from .services.sop_import_worker import get_import_job_status
+
+    vid = sid = None
+    if version_id:
+        try:
+            vid = uuid.UUID(str(version_id))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid version_id")
+    if sop_id:
+        try:
+            sid = uuid.UUID(str(sop_id))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid sop_id")
+
+    row = get_import_job_status(db, job_id, version_id=vid, sop_id=sid)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Import job not found: {job_id}")
+    return SOPImportJobStatusResponse(**row)
 
 
 @router.get("/api/editor/docs/{doc_id}", response_model=EditorDocResponse)
@@ -1175,6 +1467,9 @@ def update_document(
         current_version.metadata_json = normalized_meta
         current_version.effective_date = _metadata_date(normalized_meta.get("sopMetadata", {}).get("effectiveDate"))
         current_version.review_date = _metadata_date(normalized_meta.get("sopMetadata", {}).get("reviewDate"))
+        resolved_status = _resolve_external_status_from_payload(normalized_meta, fallback="")
+        if resolved_status:
+            current_version.external_status = resolved_status
 
     db.commit()
     db.refresh(sop)
@@ -1323,13 +1618,13 @@ def list_versions(doc_id: str, db: Session = Depends(get_db)):
     doc_id     <- sop_id
     status     <- external_status
     """
-    sop = db.query(SOP).filter(SOP.id == doc_id, SOP.is_active == True).first()  # noqa: E712
+    sop = _resolve_sop_lookup(db, doc_id, include_inactive=False)
     if not sop:
         raise HTTPException(status_code=404, detail="Document not found")
 
     versions = (
         db.query(SOPVersion)
-        .filter(SOPVersion.sop_id == doc_id)
+        .filter(SOPVersion.sop_id == sop.id)
         .order_by(SOPVersion.created_at.asc())
         .all()
     )
@@ -1347,7 +1642,7 @@ def create_version(
     """
     Create a new version row. Uses TRUE sequential integer calculation.
     """
-    sop = db.query(SOP).filter(SOP.id == doc_id, SOP.is_active == True).first()  # noqa: E712
+    sop = _resolve_sop_lookup(db, doc_id, include_inactive=False)
     if not sop:
         raise HTTPException(status_code=404, detail="Document not found")
 
@@ -1361,7 +1656,7 @@ def create_version(
         )
 
     # Calculate real next integer version
-    all_versions = db.query(SOPVersion).filter(SOPVersion.sop_id == doc_id).all()
+    all_versions = db.query(SOPVersion).filter(SOPVersion.sop_id == sop.id).all()
     max_v = 0
     for v in all_versions:
         try:
@@ -1413,13 +1708,13 @@ def get_version(doc_id: str, version_id: str, db: Session = Depends(get_db)):
     Fetch a specific version by doc_id (= sop_id) and version_id.
     Returns old editor field names.
     """
-    sop = db.query(SOP).filter(SOP.id == doc_id, SOP.is_active == True).first()  # noqa: E712
+    sop = _resolve_sop_lookup(db, doc_id, include_inactive=False)
     if not sop:
         raise HTTPException(status_code=404, detail="Document not found")
 
     version = (
         db.query(SOPVersion)
-        .filter(SOPVersion.sop_id == doc_id, SOPVersion.id == version_id)
+        .filter(SOPVersion.sop_id == sop.id, SOPVersion.id == version_id)
         .first()
     )
     if not version:
@@ -1439,7 +1734,7 @@ def duplicate_document(
     """
     Duplicate an existing SOP. Reset to version 1.
     """
-    source_sop = db.query(SOP).filter(SOP.id == doc_id, SOP.is_active == True).first()  # noqa: E712
+    source_sop = _resolve_sop_lookup(db, doc_id, include_inactive=False)
     if not source_sop:
         raise HTTPException(status_code=404, detail="Source document not found")
 
@@ -1507,13 +1802,13 @@ def update_version_status(
             detail=f"Invalid status '{payload.status}'. Must be one of: {', '.join(sorted(VALID_STATUSES))}"
         )
 
-    sop = db.query(SOP).filter(SOP.id == doc_id, SOP.is_active == True).first()  # noqa: E712
+    sop = _resolve_sop_lookup(db, doc_id, include_inactive=False)
     if not sop:
         raise HTTPException(status_code=404, detail="Document not found")
 
     version = (
         db.query(SOPVersion)
-        .filter(SOPVersion.sop_id == doc_id, SOPVersion.id == version_id)
+        .filter(SOPVersion.sop_id == sop.id, SOPVersion.id == version_id)
         .first()
     )
     if not version:

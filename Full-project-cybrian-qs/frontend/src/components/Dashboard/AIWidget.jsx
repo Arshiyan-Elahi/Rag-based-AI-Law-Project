@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react'
+import React, { useState, useEffect, useRef, useCallback, memo } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { Send, Zap } from 'lucide-react'
 import {
@@ -8,12 +8,11 @@ import {
   toVisibleUserMessage,
   toHtml,
   formatChatTimeFromIso,
-  readKlAssistantMode,
-  writeKlAssistantMode,
 } from '../../utils/chatAssistant'
 import {
   createDocument,
   getChatSessionMessages,
+  resolveChatSessionBySop,
 } from '../../api/editorApi'
 import { htmlToPlainText, deriveSopTitleFromText, plainTextToTiptapDoc } from '../../utils/chatSopSave'
 import { getAssistantContextStorageKeys, resetAssistantStateOnce } from '../../utils/assistantContext'
@@ -21,7 +20,6 @@ import {
   EDITOR_AI_ACTIONS,
   EDITOR_AI_ACTION_STATUS,
   describeEditorAiResult,
-  detectEditorIntent,
   dispatchEditorAiActionRequest,
   getActiveEditorDocumentId,
   hasActiveSopEditor,
@@ -29,49 +27,25 @@ import {
   SOP_EDITOR_CONTEXT_EVENT,
   subscribeEditorAiActionResult,
 } from '../../utils/editorAiBridge'
-import ActionsTab from './ActionsTab'
+import {
+  buildEnrichedActionPrompt,
+  classifyAssistantMessage,
+  planEditorActionExecution,
+} from '../../utils/assistantIntentRouter'
+import EditorChatActions from './EditorChatActions'
 import { dispatchActionsTabRun } from '../../utils/editorActionsBridge'
 import { runEditorGapCheck } from '../../utils/editorGapCheck'
 import { buildGapCheckSidebarReport } from '../../utils/actionsTabGapReport'
 import './DashboardComponents.css'
 
-const WIDGET_TABS = [
-  { id: 'chat', label: 'Chat' },
-  { id: 'actions', label: 'Actions' },
-]
-
-const LS_SESSION_BY_PATH = 'cybrain_kl_chat_session_by_path'
-
 resetAssistantStateOnce()
-
-function readSessionIdForPath(pathname) {
-  try {
-    const raw = localStorage.getItem(LS_SESSION_BY_PATH)
-    const j = raw ? JSON.parse(raw) : {}
-    const sid = j?.[pathname]
-    return sid && String(sid).trim() ? String(sid).trim() : null
-  } catch {
-    return null
-  }
-}
-
-function writeSessionIdForPath(pathname, sessionId) {
-  try {
-    const raw = localStorage.getItem(LS_SESSION_BY_PATH)
-    const j = raw ? JSON.parse(raw) : {}
-    j[pathname] = sessionId
-    localStorage.setItem(LS_SESSION_BY_PATH, JSON.stringify(j))
-  } catch {
-    // ignore
-  }
-}
 
 function defaultGreeting() {
   return [
     {
       id: `greeting-${Date.now()}`,
       role: 'ai',
-      text: 'Chatbot ist verbunden. Stelle eine Frage zu SOPs, Abweichungen, CAPAs, Audits oder Entscheidungen.',
+      text: 'Chatbot ist verbunden. Stelle eine Frage oder bitte um eine Aktion (z. B. Rewrite, Improve, Gap Check, Zusammenfassung) — alles in diesem Chat.',
       tags: [],
       time: nowTime(),
     },
@@ -97,13 +71,137 @@ function dbMessagesToWidget(rows) {
   }))
 }
 
-export default function AIWidget() {
+const CHAT_INPUT_PLACEHOLDER_EDITOR =
+  'Frage oder Aktion eingeben (z. B. Rewrite, Übersetzung ins Englische)…'
+const CHAT_INPUT_PLACEHOLDER_DEFAULT = 'Frage zur SOP stellen…'
+
+/** Message list isolated from composer keystrokes to avoid sidebar layout flicker. */
+const AIWidgetMessageList = memo(function AIWidgetMessageList({
+  messages,
+  sending,
+  assistantMode,
+  messagesScrollRef,
+  chatEndRef,
+  onCreateSop,
+}) {
+  return (
+    <div className="ai-messages-section" ref={messagesScrollRef}>
+      {messages.map((m, idx) => (
+        <div
+          key={m.id}
+          className={`ai-chat-message ${m.role}${m.isError ? ' error' : ''}${idx === 0 && String(m.id).startsWith('greeting') ? ' ai-greeting-bubble' : ''}`}
+        >
+          {idx === 0 && String(m.id).startsWith('greeting') ? (
+            <p className="ai-greeting-text">{m.text}</p>
+          ) : (
+            <div className="ai-message-content" dangerouslySetInnerHTML={{ __html: toHtml(m.text) }} />
+          )}
+          {m.tags && m.tags.length > 0 && (
+            <div className="ai-message-tags">
+              {m.tags.map((tag) => (
+                <span key={tag} className="ai-message-tag">
+                  {tag}
+                </span>
+              ))}
+            </div>
+          )}
+          {m.role === 'ai' && !m.isError && assistantMode === 'action' && /purpose|zweck|scope|geltungsbereich|procedure|verfahren|responsibilities|verantwortlichkeiten/i.test(m.text) && (
+            <button
+              className="ai-kontext-btn"
+              type="button"
+              style={{ marginTop: '10px', padding: '6px 12px', fontSize: '11px', minHeight: 'auto', borderRadius: '4px' }}
+              onClick={() => onCreateSop(m.text)}
+            >
+              Als SOP speichern
+            </button>
+          )}
+        </div>
+      ))}
+
+      {sending ? (
+        <div
+          className="ai-typing-indicator"
+          role="status"
+          aria-live="polite"
+          aria-label="Antwort wird generiert"
+        >
+          <span />
+          <span />
+          <span />
+        </div>
+      ) : null}
+      <div ref={chatEndRef} />
+    </div>
+  )
+})
+
+/** Footer (suggestions + input) — only re-renders when compose-related props change. */
+const AIWidgetComposeFooter = memo(function AIWidgetComposeFooter({
+  input,
+  onInputChange,
+  onSend,
+  sending,
+  sopEditorActive,
+  suggestions,
+  onSuggestionClick,
+}) {
+  const placeholder = sopEditorActive ? CHAT_INPUT_PLACEHOLDER_EDITOR : CHAT_INPUT_PLACEHOLDER_DEFAULT
+
+  return (
+    <div className="ai-widget-chat-footer">
+      <div className="ai-widget-divider" />
+
+      <div className="ai-quick-section">
+        <h4 className="ai-quick-title">Schnelle Fragen</h4>
+        <div className="ai-quick-list">
+          {suggestions.map((text) => (
+            <button
+              key={text}
+              type="button"
+              className="ai-quick-item"
+              onClick={() => onSuggestionClick(text)}
+              disabled={sending}
+            >
+              {text}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="ai-widget-divider" />
+
+      <div className="ai-bottom-input-section">
+        <div className="ai-bottom-input-group">
+          <input
+            type="text"
+            placeholder={placeholder}
+            className="ai-bottom-input"
+            value={input}
+            onChange={onInputChange}
+            onKeyDown={(e) => e.key === 'Enter' && onSend()}
+            disabled={sending}
+          />
+          <button
+            type="button"
+            className="ai-bottom-send-btn"
+            onClick={onSend}
+            disabled={sending || !input.trim()}
+            aria-label="Senden"
+          >
+            <Send size={14} />
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+})
+
+function AIWidget() {
   const location = useLocation()
   const navigate = useNavigate()
   const routeMeta = getAssistantRouteMeta(location.pathname)
   const [messages, setMessages] = useState(() => defaultGreeting())
   const [input, setInput] = useState('')
-  const [assistantMode, setAssistantMode] = useState(() => readKlAssistantMode())
   const [sending, setSending] = useState(false)
   const [pendingDeleteAction, setPendingDeleteAction] = useState(null)
   const [actionToast, setActionToast] = useState('')
@@ -112,13 +210,22 @@ export default function AIWidget() {
   const messagesRef = useRef(messages)
   /** requestId -> { messageId, action } for in-flight editor bridge requests. */
   const pendingBridgeRef = useRef(new Map())
+  /** In-memory only: SOP-scoped vs global KL session ids (never localStorage). */
+  const sopChatSessionIdRef = useRef(null)
+  const globalChatSessionIdRef = useRef(null)
+  const chatLoadGenRef = useRef(0)
   const suggestions = routeMeta.suggestions
   const [sopEditorActive, setSopEditorActive] = useState(() => hasActiveSopEditor(location.pathname))
-  const [widgetTab, setWidgetTab] = useState('chat')
+  const [activeSopId, setActiveSopId] = useState(() => (
+    hasActiveSopEditor(location.pathname) ? getActiveEditorDocumentId() : ''
+  ))
+  const assistantMode = sopEditorActive ? 'action' : 'query'
 
   useEffect(() => {
     const syncEditorContext = () => {
-      setSopEditorActive(hasActiveSopEditor(location.pathname))
+      const onEditor = hasActiveSopEditor(location.pathname)
+      setSopEditorActive(onEditor)
+      setActiveSopId(onEditor ? getActiveEditorDocumentId() : '')
     }
     syncEditorContext()
     window.addEventListener(SOP_EDITOR_CONTEXT_EVENT, syncEditorContext)
@@ -128,20 +235,6 @@ export default function AIWidget() {
       window.removeEventListener('storage', syncEditorContext)
     }
   }, [location.pathname])
-
-  useEffect(() => {
-    setAssistantMode(readKlAssistantMode())
-    if (!hasActiveSopEditor(location.pathname)) {
-      setWidgetTab('chat')
-    }
-  }, [location.pathname])
-
-  useEffect(() => {
-    if (sopEditorActive && widgetTab === 'actions') {
-      setAssistantMode('action')
-      writeKlAssistantMode('action')
-    }
-  }, [sopEditorActive, widgetTab])
 
   useEffect(() => {
     if (assistantMode === 'query') setPendingDeleteAction(null)
@@ -180,18 +273,23 @@ export default function AIWidget() {
     messagesRef.current = messages
   }, [messages])
 
+  const lastMessageScrollKeyRef = useRef('')
+
   useEffect(() => {
+    const scrollKey = `${messages.length}:${sending ? 1 : 0}`
+    if (scrollKey === lastMessageScrollKeyRef.current) return
+    lastMessageScrollKeyRef.current = scrollKey
+
     const el = messagesScrollRef.current
-    if (el) {
-      el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
-      return
-    }
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    if (!el) return
+
+    requestAnimationFrame(() => {
+      el.scrollTop = el.scrollHeight
+    })
   }, [messages, sending])
 
-  const loadChatHistory = useCallback(async () => {
-    const path = location.pathname
-    const sid = readSessionIdForPath(path)
+  const loadMessagesForSession = useCallback(async (sessionId, { sopId } = {}) => {
+    const sid = String(sessionId || '').trim()
     if (!sid) {
       setMessages(defaultGreeting())
       return
@@ -200,20 +298,71 @@ export default function AIWidget() {
       const rows = await getChatSessionMessages(sid)
       setMessages(dbMessagesToWidget(rows))
     } catch (e) {
+      if (e?.status === 404) {
+        if (sopId) {
+          sopChatSessionIdRef.current = null
+          try {
+            const session = await resolveChatSessionBySop(sopId)
+            const nextSid = session?.id && String(session.id).trim()
+            if (nextSid) {
+              sopChatSessionIdRef.current = nextSid
+              const rows = await getChatSessionMessages(nextSid)
+              setMessages(dbMessagesToWidget(rows))
+              return
+            }
+          } catch (retryErr) {
+            console.warn('[chat-history-load] SOP session recovery failed', retryErr)
+          }
+        } else {
+          globalChatSessionIdRef.current = null
+        }
+        setMessages(defaultGreeting())
+        return
+      }
       console.error('[chat-history-load] AIWidget messages', e)
       setMessages(defaultGreeting())
     }
-  }, [location.pathname])
+  }, [])
 
-  useEffect(() => {
-    loadChatHistory()
-  }, [loadChatHistory])
+  const loadChatHistory = useCallback(async () => {
+    const gen = chatLoadGenRef.current + 1
+    chatLoadGenRef.current = gen
+    const sopId = activeSopId && String(activeSopId).trim()
 
-  useEffect(() => {
-    if (widgetTab === 'chat') {
-      loadChatHistory()
+    if (sopId) {
+      try {
+        const session = await resolveChatSessionBySop(sopId)
+        if (chatLoadGenRef.current !== gen) return
+        const sid = session?.id && String(session.id).trim()
+        sopChatSessionIdRef.current = sid || null
+        if (!sid) {
+          setMessages(defaultGreeting())
+          return
+        }
+        await loadMessagesForSession(sid, { sopId })
+      } catch (e) {
+        if (chatLoadGenRef.current !== gen) return
+        console.error('[chat-history-load] AIWidget SOP session', e)
+        sopChatSessionIdRef.current = null
+        setMessages(defaultGreeting())
+      }
+      return
     }
-  }, [widgetTab, loadChatHistory])
+
+    sopChatSessionIdRef.current = null
+    const globalSid = globalChatSessionIdRef.current
+    if (!globalSid) {
+      setMessages(defaultGreeting())
+      return
+    }
+    if (chatLoadGenRef.current !== gen) return
+    await loadMessagesForSession(globalSid, {})
+  }, [activeSopId, loadMessagesForSession])
+
+  useEffect(() => {
+    sopChatSessionIdRef.current = null
+    loadChatHistory()
+  }, [activeSopId, location.pathname, loadChatHistory])
 
   useEffect(() => {
     const pending = pendingBridgeRef.current
@@ -238,161 +387,140 @@ export default function AIWidget() {
     }
   }, [])
 
-  const handleWidgetTabChange = useCallback((tabId) => {
-    setWidgetTab(tabId)
-    if (tabId === 'chat') {
-      setAssistantMode('query')
-      writeKlAssistantMode('query')
-    } else if (tabId === 'actions') {
-      setAssistantMode('action')
-      writeKlAssistantMode('action')
+  const bridgeStatusText = (intent) => {
+    if (intent === EDITOR_AI_ACTIONS.REWRITE) {
+      return 'Rewrite wird im Editor vorbereitet. Prüfe die Inline-Vorschau und wähle Accept oder Reject unten.'
     }
-  }, [])
+    if (intent === EDITOR_AI_ACTIONS.IMPROVE) {
+      return 'Verbesserung wird im Editor vorbereitet. Prüfe die Inline-Vorschau und wähle Accept oder Reject unten.'
+    }
+    if (intent === EDITOR_AI_ACTIONS.GAP_CHECK) {
+      return 'Gap Check läuft…'
+    }
+    if (intent === EDITOR_AI_ACTIONS.READ) return 'Bestätige aktive SOP im Editor…'
+    if (intent === EDITOR_AI_ACTIONS.SUMMARIZE) {
+      return 'Zusammenfassung wird als Inline-Vorschau im Editor vorbereitet. Prüfe Accept oder Reject unten.'
+    }
+    if (intent === EDITOR_AI_ACTIONS.ANALYZE) return 'Analyse wird im Editor vorbereitet…'
+    if (intent === EDITOR_AI_ACTIONS.COMPARE) return 'Versionsvergleich wird geöffnet…'
+    return 'Editor-Aktion wird vorbereitet…'
+  }
 
   /**
-   * Try to handle the message as an editor-side action (rewrite / improve /
-   * gap_check / read of the active SOP) instead of a chat-only RAG query.
-   * Returns true when the message was routed to the editor bridge.
+   * Route editor-side work from chat using semantic intent classification.
+   * Returns true when the message was handled (user message already in the thread).
    */
-  const tryBridgeEditorAction = useCallback((text, userMessage, opts = {}) => {
+  const routeClassifiedEditorAction = useCallback(async (text, classification, opts = {}) => {
     const { explicitAction = null } = opts
-    if (widgetTab === 'chat') {
-      const intent = explicitAction || detectEditorIntent(text)
-      if (intent === EDITOR_AI_ACTIONS.GAP_CHECK && hasActiveSopEditor(location.pathname)) {
-        setInput('')
-        setSending(true)
-        ;(async () => {
-          try {
-            const { result, target } = await runEditorGapCheck({ instruction: text })
-            const report = buildGapCheckSidebarReport(result)
-            const parts = report.sections.map((s) => {
-              if (s.gapItems?.length) {
-                return `${s.title}\n${s.gapItems.map((g) => `- ${g.issue}${g.recommendation ? `\n  → ${g.recommendation}` : ''}`).join('\n')}`
-              }
-              return s.body ? `${s.title}\n${s.body}` : s.title
-            })
-            const plain = parts.filter(Boolean).join('\n\n') || report.analysisPlain
-            setMessages((prev) => [
-              ...prev,
-              userMessage,
-              {
-                id: `gap-chat-${Date.now()}`,
-                role: 'ai',
-                text: `Gap check — ${target.sectionName}${target.isFullDoc ? ' (full SOP)' : ''}\n\n${plain}`,
-                tags: ['Gap Check'],
-                time: nowTime(),
-              },
-            ])
-          } catch (err) {
-            setMessages((prev) => [
-              ...prev,
-              userMessage,
-              {
-                id: `gap-err-${Date.now()}`,
-                role: 'ai',
-                text: err?.message || 'Gap check failed.',
-                isError: true,
-                time: nowTime(),
-              },
-            ])
-          } finally {
-            setSending(false)
-          }
-        })()
-        return true
-      }
-      if (intent === EDITOR_AI_ACTIONS.REWRITE || intent === EDITOR_AI_ACTIONS.IMPROVE) {
-        dispatchActionsTabRun({ action: intent, prompt: text || '' })
-        handleWidgetTabChange('actions')
+    if (!hasActiveSopEditor(location.pathname)) return false
+
+    const plan = planEditorActionExecution(classification, { explicitAction })
+    const intent = plan.intent
+    if (!intent) return false
+
+    const actionPrompt = buildEnrichedActionPrompt(text, classification)
+    const { sectionHint, targetScope } = plan.snapshotOptions
+
+    if (intent === EDITOR_AI_ACTIONS.GAP_CHECK) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `gap-pending-${Date.now()}`,
+          role: 'ai',
+          text: bridgeStatusText(intent),
+          tags: ['Gap Check'],
+          time: nowTime(),
+        },
+      ])
+      try {
+        const { result, target } = await runEditorGapCheck({ instruction: actionPrompt })
+          const report = buildGapCheckSidebarReport(result)
+          const parts = report.sections.map((s) => {
+            if (s.gapItems?.length) {
+              return `${s.title}\n${s.gapItems.map((g) => `- ${g.issue}${g.recommendation ? `\n  → ${g.recommendation}` : ''}`).join('\n')}`
+            }
+            return s.body ? `${s.title}\n${s.body}` : s.title
+          })
+          const plain = parts.filter(Boolean).join('\n\n') || report.analysisPlain
         setMessages((prev) => [
-          ...prev,
-          userMessage,
+          ...prev.filter((m) => !String(m.id).startsWith('gap-pending-')),
           {
-            id: `actions-redirect-${Date.now()}`,
+            id: `gap-chat-${Date.now()}`,
             role: 'ai',
-            text: 'Rewrite/Improve runs in the **Actions** tab with inline preview in the editor.',
-            tags: [],
+            text: `Gap check — ${target.sectionName}${target.isFullDoc ? ' (full SOP)' : ''}\n\n${plain}`,
+            tags: ['Gap Check'],
             time: nowTime(),
           },
         ])
-        setInput('')
+        return true
+      } catch (err) {
+        setMessages((prev) => [
+          ...prev.filter((m) => !String(m.id).startsWith('gap-pending-')),
+          {
+            id: `gap-err-${Date.now()}`,
+            role: 'ai',
+            text: err?.message || 'Gap check failed.',
+            isError: true,
+            time: nowTime(),
+          },
+        ])
         return true
       }
-      return false
     }
-    if (assistantMode !== 'action') return false
-    if (!hasActiveSopEditor(location.pathname)) return false
-    const intent = explicitAction || detectEditorIntent(text)
-    if (!intent) return false
 
-    if (intent === EDITOR_AI_ACTIONS.GAP_CHECK) {
-      dispatchActionsTabRun({ action: EDITOR_AI_ACTIONS.GAP_CHECK, prompt: text || '' })
-      handleWidgetTabChange('actions')
-      setMessages((prev) => [...prev, userMessage])
-      setInput('')
+    if (plan.useInline) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `editor-action-${Date.now()}`,
+          role: 'ai',
+          text: bridgeStatusText(plan.inlineAction || intent),
+          tags: [],
+          time: nowTime(),
+        },
+      ])
+      dispatchActionsTabRun({
+        action: plan.inlineAction || intent,
+        prompt: actionPrompt,
+        sectionHint,
+        targetScope,
+      })
       return true
     }
 
-    if (intent === EDITOR_AI_ACTIONS.REWRITE || intent === EDITOR_AI_ACTIONS.IMPROVE) {
-      dispatchActionsTabRun({ action: intent, prompt: text || '' })
-      handleWidgetTabChange('actions')
-      const userMsg = { id: Date.now(), role: 'user', text: text || '' }
-      const statusMsg = {
-        id: `actions-redirect-${Date.now()}`,
-        role: 'ai',
-        text: 'Rewrite/Improve läuft im Tab **Actions** mit Inline-Vorschau im Editor. Bitte dort Accept oder Reject wählen.',
-        tags: [],
-        time: nowTime(),
-      }
-      setMessages((prev) => [...prev, userMsg, statusMsg])
-      setInput('')
-      return true
-    }
+    if (!plan.useBridge) return false
 
     const activeDocumentId = getActiveEditorDocumentId()
     if (!activeDocumentId) {
-      const noSopMsg = {
-        id: `no-sop-${Date.now()}`,
-        role: 'ai',
-        text: 'Please open an SOP in the editor first.',
-        tags: [],
-        time: nowTime(),
-      }
-      setMessages((prev) => [...prev, userMessage, noSopMsg])
-      setInput('')
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `no-sop-${Date.now()}`,
+          role: 'ai',
+          text: 'Please open an SOP in the editor first.',
+          tags: [],
+          time: nowTime(),
+        },
+      ])
       return true
     }
 
     const placeholderId = `bridge-${Date.now()}`
-    const placeholderText =
-      intent === EDITOR_AI_ACTIONS.READ
-        ? 'Bestätige aktive SOP im Editor…'
-        : intent === EDITOR_AI_ACTIONS.GAP_CHECK
-          ? 'Gap Check im Editor wird vorbereitet…'
-          : intent === EDITOR_AI_ACTIONS.IMPROVE
-            ? 'Verbesserungen werden im Editor vorbereitet…'
-            : intent === EDITOR_AI_ACTIONS.SUMMARIZE
-              ? 'Zusammenfassung wird im Editor vorbereitet…'
-              : intent === EDITOR_AI_ACTIONS.ANALYZE
-                ? 'Analyse wird im Editor vorbereitet…'
-                : intent === EDITOR_AI_ACTIONS.COMPARE
-                  ? 'Versionsvergleich wird geöffnet…'
-                  : 'Rewrite wird im Editor vorbereitet…'
     const placeholderMsg = {
       id: placeholderId,
       role: 'ai',
-      text: placeholderText,
+      text: bridgeStatusText(intent),
       tags: [],
       time: nowTime(),
       _pendingBridge: true,
     }
-    setMessages((prev) => [...prev, userMessage, placeholderMsg])
+    setMessages((prev) => [...prev, placeholderMsg])
 
     const requestId = makeEditorAiRequestId()
     pendingBridgeRef.current.set(requestId, { messageId: placeholderId, action: intent })
     dispatchEditorAiActionRequest({
       action: intent,
-      prompt: text || '',
+      prompt: actionPrompt,
       requestId,
       source: 'kl_assistant',
     })
@@ -409,30 +537,42 @@ export default function AIWidget() {
     }, 360000)
 
     return true
-  }, [assistantMode, location.pathname, widgetTab, handleWidgetTabChange, setSending, setMessages])
+  }, [location.pathname, setMessages])
 
   const sendMessage = useCallback(async (text, opts = {}) => {
     const trimmed = text.trim()
     if (!trimmed || sending) return
 
-    // Append user message immediately
     const userMsg = { id: Date.now(), role: 'user', text: trimmed }
-
-    // Editor-bridge fast path: when the user is in the SOP editor and the
-    // message clearly targets the active SOP (rewrite/improve/gap_check/read),
-    // run the structured /api/ai/action flow against the editor instead of a
-    // chat-only RAG response. Chat output is then a status line confirming
-    // the editor change so the assistant stays editor-connected.
-    if (!opts.assistantActionConfirmation && tryBridgeEditorAction(trimmed, userMsg)) {
-      setInput('')
-      return
-    }
-
-    setMessages(prev => [...prev, userMsg])
+    setMessages((prev) => [...prev, userMsg])
     setInput('')
     setSending(true)
 
     try {
+      if (!opts.assistantActionConfirmation) {
+        const classification = await classifyAssistantMessage({
+          message: trimmed,
+          pathname: location.pathname,
+        })
+
+        if (classification.flow === 'clarify' && classification.clarification_question) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: Date.now() + 1,
+              role: 'ai',
+              text: classification.clarification_question,
+              time: nowTime(),
+            },
+          ])
+          return
+        }
+
+        if (classification.flow === 'editor_action') {
+          const handled = await routeClassifiedEditorAction(trimmed, classification, opts)
+          if (handled) return
+        }
+      }
       const chatHistoryPayload = [
         ...messagesRef.current.map((msg) => ({
           role: msg.role === 'ai' ? 'assistant' : 'user',
@@ -440,16 +580,25 @@ export default function AIWidget() {
         })),
         { role: 'user', content: trimmed },
       ]
-      const sid = readSessionIdForPath(location.pathname)
-      const ragMode = widgetTab === 'chat' ? 'query' : assistantMode
+      const sopId = activeSopId && String(activeSopId).trim()
+      let sid = sopId ? sopChatSessionIdRef.current : globalChatSessionIdRef.current
+      if (sopId && !sid) {
+        try {
+          const session = await resolveChatSessionBySop(sopId)
+          sid = session?.id && String(session.id).trim()
+          if (sid) sopChatSessionIdRef.current = sid
+        } catch (resolveErr) {
+          console.warn('[chat-history] could not resolve SOP session before send', resolveErr)
+        }
+      }
       const result = await runUnifiedAssistantQuery({
         question: trimmed,
         pathname: location.pathname,
         chatHistory: chatHistoryPayload,
         assistantActionConfirmation: opts.assistantActionConfirmation || null,
         surface: 'kl_assistant',
-        sessionId: sid,
-        assistantMode: ragMode,
+        sessionId: sid || undefined,
+        assistantMode,
       })
       const action = result?.assistant_action
       if (assistantMode === 'action' && action?.requires_confirmation && action?.type === 'delete_sop') {
@@ -479,9 +628,28 @@ export default function AIWidget() {
         }
       }
       if (result?.session_id) {
-        writeSessionIdForPath(location.pathname, result.session_id)
-        const rows = await getChatSessionMessages(result.session_id)
-        setMessages(dbMessagesToWidget(rows))
+        const nextSid = String(result.session_id).trim()
+        if (sopId) {
+          sopChatSessionIdRef.current = nextSid
+        } else {
+          globalChatSessionIdRef.current = nextSid
+        }
+        try {
+          const rows = await getChatSessionMessages(nextSid)
+          setMessages(dbMessagesToWidget(rows))
+        } catch (loadErr) {
+          if (loadErr?.status === 404) {
+            if (sopId) {
+              sopChatSessionIdRef.current = null
+              await loadChatHistory()
+            } else {
+              globalChatSessionIdRef.current = null
+              setMessages(defaultGreeting())
+            }
+          } else {
+            throw loadErr
+          }
+        }
       } else {
         const aiMsg = {
           id: Date.now() + 1,
@@ -505,9 +673,13 @@ export default function AIWidget() {
     } finally {
       setSending(false)
     }
-  }, [sending, location.pathname, navigate, emitSOPRefresh, showToast, clearAssistantActiveContext, assistantMode, widgetTab, tryBridgeEditorAction])
+  }, [sending, location.pathname, navigate, emitSOPRefresh, showToast, clearAssistantActiveContext, assistantMode, routeClassifiedEditorAction, activeSopId, loadChatHistory])
 
   const handleSend = () => sendMessage(input)
+
+  const handleInputChange = useCallback((e) => {
+    setInput(e.target.value)
+  }, [])
 
   // Clicking a suggestion triggers the actual query immediately
   const handleSuggestionClick = (text) => sendMessage(text)
@@ -589,27 +761,6 @@ export default function AIWidget() {
         <div className="ai-widget-divider" />
       </div>
 
-      {sopEditorActive ? (
-        <div className="ai-widget-tabs" role="tablist" aria-label="Assistant panels">
-          {WIDGET_TABS.map((tab) => (
-            <button
-              key={tab.id}
-              type="button"
-              role="tab"
-              aria-selected={widgetTab === tab.id}
-              className={`ai-widget-tab${widgetTab === tab.id ? ' ai-widget-tab--active' : ''}`}
-              onClick={() => handleWidgetTabChange(tab.id)}
-            >
-              {tab.label}
-            </button>
-          ))}
-        </div>
-      ) : null}
-
-      {sopEditorActive && widgetTab === 'actions' ? (
-        <ActionsTab onSwitchToActions={() => handleWidgetTabChange('actions')} />
-      ) : (
-        <>
       {/* Context section (n_e1120) */}
       <div className="ai-context-section">
         {/* Context label row (n_36782, n_8a4b0, n_1632b) */}
@@ -621,101 +772,30 @@ export default function AIWidget() {
 
       <div className="ai-widget-divider" />
 
-      {/* Chat messages (DB-backed when authenticated) */}
-      <div className="ai-messages-section" ref={messagesScrollRef}>
-        {messages.map((m, idx) => (
-          <div
-            key={m.id}
-            className={`ai-chat-message ${m.role}${m.isError ? ' error' : ''}${idx === 0 && String(m.id).startsWith('greeting') ? ' ai-greeting-bubble' : ''}`}
-          >
-            {idx === 0 && String(m.id).startsWith('greeting') ? (
-              <p className="ai-greeting-text">{m.text}</p>
-            ) : (
-              <div className="ai-message-content" dangerouslySetInnerHTML={{ __html: toHtml(m.text) }} />
-            )}
-            {m.tags && m.tags.length > 0 && (
-              <div className="ai-message-tags">
-                {m.tags.map((tag) => (
-                  <span key={tag} className="ai-message-tag">
-                    {tag}
-                  </span>
-                ))}
-              </div>
-            )}
-            {m.role === 'ai' && !m.isError && assistantMode === 'action' && /purpose|zweck|scope|geltungsbereich|procedure|verfahren|responsibilities|verantwortlichkeiten/i.test(m.text) && (
-              <button
-                className="ai-kontext-btn"
-                type="button"
-                style={{ marginTop: '10px', padding: '6px 12px', fontSize: '11px', minHeight: 'auto', borderRadius: '4px' }}
-                onClick={() => handleCreateSOP(m.text)}
-              >
-                Als SOP speichern
-              </button>
-            )}
-          </div>
-        ))}
+      <AIWidgetMessageList
+        messages={messages}
+        sending={sending}
+        assistantMode={assistantMode}
+        messagesScrollRef={messagesScrollRef}
+        chatEndRef={chatEndRef}
+        onCreateSop={handleCreateSOP}
+      />
 
-        {sending && (
-          <div
-            className="ai-typing-indicator"
-            role="status"
-            aria-live="polite"
-            aria-label="Antwort wird generiert"
-          >
-            <span />
-            <span />
-            <span />
-          </div>
-        )}
-        <div ref={chatEndRef} />
-      </div>
-
-      <div className="ai-widget-divider" />
-
-      {/* Quick suggestions section (n_8bfec, n_497dc, n_a2601, n_11cef, n_9d5ed) */}
-      <div className="ai-quick-section">
-        <h4 className="ai-quick-title">Schnelle Fragen</h4>
-        <div className="ai-quick-list">
-          {suggestions.map(text => (
-            <button
-              key={text}
-              className="ai-quick-item"
-              onClick={() => handleSuggestionClick(text)}
-              disabled={sending}
-            >
-              {text}
-            </button>
-          ))}
+      <div className="ai-widget-bottom-stack">
+        <div className="ai-editor-actions-slot">
+          {sopEditorActive ? <EditorChatActions /> : null}
         </div>
+
+        <AIWidgetComposeFooter
+          input={input}
+          onInputChange={handleInputChange}
+          onSend={handleSend}
+          sending={sending}
+          sopEditorActive={sopEditorActive}
+          suggestions={suggestions}
+          onSuggestionClick={handleSuggestionClick}
+        />
       </div>
-
-      <div className="ai-widget-divider" />
-
-      {/* Bottom input area (n_5a7d9, n_0cb35, n_afcae) */}
-      <div className="ai-bottom-input-section">
-        <div className="ai-bottom-input-group">
-          <input
-            type="text"
-            placeholder="Frage zur SOP stellen…"
-            className="ai-bottom-input"
-            value={input}
-            onChange={e => setInput(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && handleSend()}
-            disabled={sending}
-          />
-          <button
-            className="ai-bottom-send-btn"
-            onClick={handleSend}
-            disabled={sending || !input.trim()}
-            aria-label="Senden"
-          >
-            <Send size={14} />
-          </button>
-        </div>
-      </div>
-
-        </>
-      )}
 
       {pendingDeleteAction ? (
         <div className="sop-delete-modal-overlay" role="presentation">
@@ -748,3 +828,5 @@ export default function AIWidget() {
     </div>
   )
 }
+
+export default memo(AIWidget)

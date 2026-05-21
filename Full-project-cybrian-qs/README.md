@@ -77,34 +77,46 @@ JWT_SECRET_KEY=your_secure_random_hash
 JWT_REFRESH_SECRET_KEY=your_secure_refresh_hash
 ```
 
-### 3. Backend Setup
-1. Setup the python dependencies:
+### 3. Backend Setup (reproducible with `uv.lock`)
+1. Install [uv](https://docs.astral.sh/uv/) and Python 3.12 (see `.python-version`).
+2. From the **project root**, install exact locked dependencies:
    ```bash
-   uv venv
-   uv pip sync requirements.txt requirements.db.txt
+   uv sync
    ```
-2. Run database migrations:
+   Optional extras:
    ```bash
-   uv run alembic upgrade head
+   uv sync --extra nlp      # root nlp_pipeline.py (spacy, langdetect, textstat)
+   uv sync --extra scripts  # backend/scripts test helpers (requests, reportlab)
    ```
-3. Start the FastAPI server (without reload for heavy embedding models):
+3. Copy env template and edit secrets:
    ```bash
-   uv run uvicorn app.main:app --host 127.0.0.1 --port 8001
-   # Server runs on http://127.0.0.1:8001 and only one process loads runtime state
+   copy backend\.env.example backend\.env
    ```
-4. Start the dedicated embedding worker (loads BGE-M3 once and reuses it for all jobs):
+4. Run database migrations:
+   ```bash
+   cd database
+   uv run --project .. alembic upgrade head
+   cd ..
+   ```
+5. Start the FastAPI server (run from `backend/`):
+   ```bash
+   cd backend
+   uv run --directory .. uvicorn app.main:app --host 127.0.0.1 --port 8001
+   ```
+6. Start the embedding worker (second terminal, from project root):
    ```bash
    uv run python backend/run_embedding_worker.py
    ```
 
+**Windows OCR (optional):** install [Tesseract](https://github.com/tesseract-ocr/tesseract) and [Poppler](https://github.com/oschwartz10612/poppler-windows/releases), then set `TESSERACT_CMD` and `POPPLER_PATH` in `backend/.env`.
+
 ### 4. Frontend Setup
-1. Move to the frontend directory:
+1. Use Node.js 18+ (22 LTS recommended). From `frontend/`:
    ```bash
    cd frontend
-   npm install
+   npm ci
    ```
-2. Start the Vite development server:
+2. Start the Vite dev server:
    ```bash
    npm run dev
-   # App runs on http://localhost:5173
    ```

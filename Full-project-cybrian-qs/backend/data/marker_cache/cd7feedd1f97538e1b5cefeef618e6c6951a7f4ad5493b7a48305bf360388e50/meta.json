@@ -1,0 +1,658 @@
+{
+"table_of_contents": [
+{
+"title": "STANDARD OPERATING PROCEDURE",
+"heading_level": null,
+"page_id": 0,
+"polygon": [
+[
+159.4499969482422,
+112.17510986328125
+],
+[
+452.634033203125,
+112.1484375
+],
+[
+452.634033203125,
+128.17510986328125
+],
+[
+158.37890625,
+128.17510986328125
+]
+]
+},
+{
+"title": "AI-Based Batch Release Monitoring",
+"heading_level": null,
+"page_id": 0,
+"polygon": [
+[
+201.41015625,
+142.9578857421875
+],
+[
+408.9269714355469,
+142.69921875
+],
+[
+408.9269714355469,
+155.9578857421875
+],
+[
+200.21484375,
+157.39453125
+]
+]
+},
+{
+"title": "1. Purpose",
+"heading_level": null,
+"page_id": 0,
+"polygon": [
+[
+46.6171875,
+282.3753967285156
+],
+[
+108.45800018310547,
+281.53125
+],
+[
+108.45800018310547,
+296.3753967285156
+],
+[
+45.421875,
+296.3753967285156
+]
+]
+},
+{
+"title": "2. Scope",
+"heading_level": null,
+"page_id": 0,
+"polygon": [
+[
+46.900001525878906,
+373.62542724609375
+],
+[
+95.41000366210938,
+372.796875
+],
+[
+95.41000366210938,
+387.62542724609375
+],
+[
+46.01953125,
+387.62542724609375
+]
+]
+},
+{
+"title": "3. Responsibility",
+"heading_level": null,
+"page_id": 0,
+"polygon": [
+[
+46.318359375,
+452.07421875
+],
+[
+142.15599060058594,
+450.52734375
+],
+[
+142.15599060058594,
+466.97540283203125
+],
+[
+46.318359375,
+466.97540283203125
+]
+]
+},
+{
+"title": "4. Definitions",
+"heading_level": null,
+"page_id": 0,
+"polygon": [
+[
+46.01953125,
+659.9254150390625
+],
+[
+124.22200012207031,
+658.96875
+],
+[
+124.22200012207031,
+673.925407409668
+],
+[
+46.01953125,
+673.925407409668
+]
+]
+},
+{
+"title": "5. Procedure Overview",
+"heading_level": null,
+"page_id": 1,
+"polygon": [
+[
+45.75,
+166.5
+],
+[
+180.75,
+165.515625
+],
+[
+180.75,
+177.0
+],
+[
+45.720703125,
+177.890625
+]
+]
+},
+{
+"title": "5.1 Batch Data Intake",
+"heading_level": null,
+"page_id": 1,
+"polygon": [
+[
+45.75,
+219.0
+],
+[
+146.25,
+218.49609375
+],
+[
+146.25,
+228.0
+],
+[
+45.720703125,
+228.55078125
+]
+]
+},
+{
+"title": "5.2 Data Completeness Check",
+"heading_level": null,
+"page_id": 1,
+"polygon": [
+[
+45.75,
+279.75
+],
+[
+183.0,
+279.59765625
+],
+[
+183.0,
+290.25
+],
+[
+45.421875,
+291.19921875
+]
+]
+},
+{
+"title": "5.3 Al Alert Generation",
+"heading_level": null,
+"page_id": 1,
+"polygon": [
+[
+45.75,
+330.0
+],
+[
+153.75,
+329.87109375
+],
+[
+153.75,
+339.0
+],
+[
+45.720703125,
+339.92578125
+]
+]
+},
+{
+"title": "5.4 Human Review of Al Output",
+"heading_level": null,
+"page_id": 1,
+"polygon": [
+[
+45.75,
+378.2109375
+],
+[
+192.75,
+376.6640625
+],
+[
+192.75,
+388.5
+],
+[
+45.720703125,
+389.0390625
+]
+]
+},
+{
+"title": "5.5 Release Readiness Decision",
+"heading_level": null,
+"page_id": 1,
+"polygon": [
+[
+45.75,
+428.25
+],
+[
+189.0,
+427.32421875
+],
+[
+189.0,
+437.25
+],
+[
+45.421875,
+437.37890625
+]
+]
+},
+{
+"title": "5.6 Exception Handling",
+"heading_level": null,
+"page_id": 1,
+"polygon": [
+[
+45.75,
+477.75
+],
+[
+153.0,
+477.2109375
+],
+[
+153.0,
+487.5
+],
+[
+45.75,
+488.0390625
+]
+]
+},
+{
+"title": "6. Acceptance Criteria",
+"heading_level": null,
+"page_id": 2,
+"polygon": [
+[
+46.900001525878906,
+100.546875
+],
+[
+173.93600463867188,
+99.0
+],
+[
+173.93600463867188,
+114.92547607421875
+],
+[
+46.01953125,
+114.92547607421875
+]
+]
+},
+{
+"title": "7. Data Integrity and Compliance Controls",
+"heading_level": null,
+"page_id": 2,
+"polygon": [
+[
+46.900001525878906,
+286.9453125
+],
+[
+289.281982421875,
+285.3984375
+],
+[
+289.281982421875,
+301.2754211425781
+],
+[
+45.720703125,
+301.2754211425781
+]
+]
+},
+{
+"title": "8. System Validation and Periodic Review",
+"heading_level": null,
+"page_id": 2,
+"polygon": [
+[
+46.900001525878906,
+473.34375
+],
+[
+286.761962890625,
+471.796875
+],
+[
+286.761962890625,
+489.3254089355469
+],
+[
+45.720703125,
+489.3254089355469
+]
+]
+},
+{
+"title": "9. Deviation and CAPA Handling",
+"heading_level": null,
+"page_id": 2,
+"polygon": [
+[
+46.318359375,
+541.40625
+],
+[
+231.8679656982422,
+539.859375
+],
+[
+231.8679656982422,
+556.7754058837891
+],
+[
+46.318359375,
+556.875
+]
+]
+},
+{
+"title": "10. Records",
+"heading_level": null,
+"page_id": 2,
+"polygon": [
+[
+46.900001525878906,
+610.2254028320312
+],
+[
+114.26800537109375,
+610.2254028320312
+],
+[
+114.26800537109375,
+624.2254028320312
+],
+[
+46.900001525878906,
+624.2254028320312
+]
+]
+},
+{
+"title": "11. Training",
+"heading_level": null,
+"page_id": 3,
+"polygon": [
+[
+46.900001525878906,
+45.62542724609375
+],
+[
+115.24800872802734,
+44.47265625
+],
+[
+115.24800872802734,
+59.62542724609375
+],
+[
+46.900001525878906,
+59.62542724609375
+]
+]
+},
+{
+"title": "12. References",
+"heading_level": null,
+"page_id": 3,
+"polygon": [
+[
+46.900001525878906,
+112.921875
+],
+[
+132.3000030517578,
+111.375
+],
+[
+132.3000030517578,
+127.075439453125
+],
+[
+46.318359375,
+127.075439453125
+]
+]
+},
+{
+"title": "13. Revision History",
+"heading_level": null,
+"page_id": 3,
+"polygon": [
+[
+46.900001525878906,
+180.52545166015625
+],
+[
+161.85398864746094,
+179.4375
+],
+[
+161.85398864746094,
+194.52545166015625
+],
+[
+46.900001525878906,
+194.52545166015625
+]
+]
+}
+],
+"page_stats": [
+{
+"page_id": 0,
+"text_extraction_method": "pdftext",
+"block_counts": [
+[
+"Span",
+151
+],
+[
+"TableCell",
+66
+],
+[
+"Line",
+47
+],
+[
+"SectionHeader",
+6
+],
+[
+"Table",
+4
+],
+[
+"Text",
+4
+],
+[
+"PageFooter",
+1
+]
+],
+"block_metadata": {
+"llm_request_count": 0,
+"llm_error_count": 0,
+"llm_tokens_used": 0,
+"previous_text": "",
+"previous_type": "",
+"previous_order": 0
+}
+},
+{
+"page_id": 1,
+"text_extraction_method": "surya",
+"block_counts": [
+[
+"TableCell",
+73
+],
+[
+"Line",
+37
+],
+[
+"Span",
+15
+],
+[
+"SectionHeader",
+7
+],
+[
+"Text",
+7
+],
+[
+"Table",
+3
+],
+[
+"PageFooter",
+1
+]
+],
+"block_metadata": {
+"llm_request_count": 0,
+"llm_error_count": 0,
+"llm_tokens_used": 0,
+"previous_text": "",
+"previous_type": "",
+"previous_order": 0
+}
+},
+{
+"page_id": 2,
+"text_extraction_method": "pdftext",
+"block_counts": [
+[
+"Span",
+191
+],
+[
+"TableCell",
+74
+],
+[
+"Line",
+51
+],
+[
+"SectionHeader",
+5
+],
+[
+"Text",
+5
+],
+[
+"Table",
+4
+],
+[
+"PageFooter",
+1
+]
+],
+"block_metadata": {
+"llm_request_count": 0,
+"llm_error_count": 0,
+"llm_tokens_used": 0,
+"previous_text": "",
+"previous_type": "",
+"previous_order": 0
+}
+},
+{
+"page_id": 3,
+"text_extraction_method": "pdftext",
+"block_counts": [
+[
+"Span",
+35
+],
+[
+"Line",
+12
+],
+[
+"TableCell",
+8
+],
+[
+"SectionHeader",
+3
+],
+[
+"Text",
+3
+],
+[
+"Table",
+1
+],
+[
+"PageFooter",
+1
+]
+],
+"block_metadata": {
+"llm_request_count": 0,
+"llm_error_count": 0,
+"llm_tokens_used": 0,
+"previous_text": "",
+"previous_type": "",
+"previous_order": 0
+}
+}
+],
+"debug_data_path": "debug_data\\tmpe9mm9ucw"
+}

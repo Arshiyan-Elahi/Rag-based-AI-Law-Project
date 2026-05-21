@@ -11,6 +11,8 @@ import {
   subscribeEditorSnapshotRequest,
   EDITOR_GAP_APPEND_EVENT,
   EDITOR_SCROLL_TO_RANGE_EVENT,
+  EDITOR_SELECTION_QUERY_EVENT,
+  EDITOR_SELECTION_RESPONSE_EVENT,
 } from '../../utils/editorActionsBridge'
 import {
   clearInlineAiSuggestion,
@@ -214,23 +216,49 @@ const EditorAIBridge = ({
     const { state } = liveEditor
     const { selection } = state
     const hasSelection = Boolean(selection && !selection.empty)
+    const selectionPayload = hasSelection
+      ? { from: selection.from, to: selection.to, empty: false }
+      : { empty: true }
+
     let from = 0
     let to = state.doc.content.size
     let selectedText = state.doc.textBetween(from, to, '\n').trim()
     let isFullDoc = true
+    let sectionName = 'Full SOP'
+    let sectionType = 'Full Document'
 
-    if (hasSelection) {
+    const actionPrompt = String(request?.prompt || '').trim()
+    if (actionPrompt) {
+      try {
+        const resolved = resolveTargetInEditor(liveEditor, {
+          prompt: actionPrompt,
+          selection: selectionPayload,
+        })
+        if (resolved?.text && resolved.from != null && resolved.to != null) {
+          from = resolved.from
+          to = resolved.to
+          selectedText = resolved.text
+          isFullDoc = Boolean(resolved.isFullDoc)
+          sectionName = resolved.sectionName || sectionName
+          sectionType = resolved.sectionType || sectionType
+        }
+      } catch (err) {
+        emitResult({
+          ...request,
+          status: EDITOR_AI_ACTION_STATUS.ERROR,
+          message: err?.message || 'Could not resolve target in the open SOP.',
+        })
+        return
+      }
+    } else if (hasSelection) {
       from = selection.from
       to = selection.to
       const fragment = state.doc.textBetween(from, to, '\n').trim()
       if (fragment.length > 0) {
         selectedText = fragment
         isFullDoc = false
-      } else {
-        from = 0
-        to = state.doc.content.size
-        selectedText = state.doc.textBetween(from, to, '\n').trim()
-        isFullDoc = true
+        sectionName = 'Selected text'
+        sectionType = 'Paragraph'
       }
     }
 
@@ -264,9 +292,6 @@ const EditorAIBridge = ({
     notifyPreviewSession(true)
     setIsLoading(true)
 
-    const sectionName = isFullDoc ? 'Full SOP' : 'Selected text'
-    const sectionType = isFullDoc ? 'Full Document' : 'Paragraph'
-
     try {
       console.info('[kl-editor-bridge-received]', {
         action,
@@ -287,6 +312,7 @@ const EditorAIBridge = ({
         edit_scope: isFullDoc ? 'full_document' : 'section_only',
         sop_entity_id: documentIdRef.current || null,
         triggered_by: AI_ACTION_TRIGGERED_BY.KL_ASSISTANT,
+        assistant_instruction: actionPrompt.trim() || null,
       })
 
       const safeSuggestedHtml = formatAiSuggestionForUi({
@@ -388,7 +414,27 @@ const EditorAIBridge = ({
   }, [])
 
   useEffect(() => {
-    const unsubSnapshot = subscribeEditorSnapshotRequest(({ requestId, prompt }) => {
+    const onSelectionQuery = (event) => {
+      const requestId = event.detail?.requestId
+      const liveEditor = editorRef.current
+      if (!requestId) return
+      let hasSelection = false
+      if (liveEditor && !liveEditor.isDestroyed && isEditableRef.current) {
+        const sel = liveEditor.state.selection
+        hasSelection = Boolean(sel && !sel.empty)
+      }
+      window.dispatchEvent(
+        new CustomEvent(EDITOR_SELECTION_RESPONSE_EVENT, {
+          detail: { requestId, hasSelection },
+        }),
+      )
+    }
+    window.addEventListener(EDITOR_SELECTION_QUERY_EVENT, onSelectionQuery)
+    return () => window.removeEventListener(EDITOR_SELECTION_QUERY_EVENT, onSelectionQuery)
+  }, [])
+
+  useEffect(() => {
+    const unsubSnapshot = subscribeEditorSnapshotRequest(({ requestId, prompt, sectionHint, targetScope }) => {
       const liveEditor = editorRef.current
       if (!liveEditor || liveEditor.isDestroyed || !isEditableRef.current) {
         dispatchEditorSnapshotResponse({
@@ -414,6 +460,8 @@ const EditorAIBridge = ({
         const target = resolveTargetInEditor(liveEditor, {
           prompt: String(prompt || ''),
           selection: selectionPayload,
+          sectionHint: String(sectionHint || ''),
+          targetScope: String(targetScope || ''),
         })
         if (!target?.text || target.from == null || target.to == null) {
           dispatchEditorSnapshotResponse({

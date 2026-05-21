@@ -44,7 +44,7 @@ export function extractSuggestedPlainForInline(action, result) {
     return {
       plain: '',
       error:
-        'The server returned a narrative briefing instead of editable SOP text. Use the Actions tab Rewrite button (not Chat) while the SOP is open in the editor.',
+        'The server returned a narrative briefing instead of editable SOP text. Ask to rewrite the section in chat while the SOP is open in the editor.',
     }
   }
 

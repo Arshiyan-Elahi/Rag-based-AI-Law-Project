@@ -38,10 +38,19 @@ def sanitize_text_for_metadata_extraction(text: str) -> str:
 
 
 _SOP_TOKEN = r"SOP(?:[-/][A-Z0-9]+){2,}"
+# Standard departmental IDs (e.g. SOP-IT-001) — preferred over generic token matches.
+_SOP_TOKEN_STRICT = r"SOP-[A-Z]{2,12}-\d{1,6}(?:\.\d+)?"
 _SOP_ID_LINE = re.compile(
     rf"(?i)(?:SOP\s*(?:ID|Nr\.?|Number)?|Dokumenten?\s*(?:ID|Nr\.?))\s*(?:\+\s*(?:Titel|Title))?\s*[:#]?\s*({_SOP_TOKEN})"
 )
 _SOP_ID_GENERIC = re.compile(rf"\b({_SOP_TOKEN})\b", re.I)
+_SOP_ID_STRICT = re.compile(rf"\b({_SOP_TOKEN_STRICT})\b", re.I)
+_IMPORT_PLACEHOLDER_NUMBER = re.compile(r"^IMPORT-[A-Z0-9-]{6,}$", re.I)
+_RANDOM_SOP_NUMBER = re.compile(r"^SOP-[A-F0-9]{8}$", re.I)
+
+_COMBINED_INLINE_ID_TITLE = re.compile(
+    rf"(?im)^\s*({_SOP_TOKEN})\s*[-–—:|]\s*(.+?)\s*$"
+)
 
 # Title on same row as label (may be empty if continued on next lines)
 _TITLE_SAME_LINE = re.compile(
@@ -95,7 +104,7 @@ _FLATTENED_LABELS = [
 ]
 
 _TITLE_BAD_VERBS = re.compile(
-    r"(?i)\b(documents?|verifies?|approves?|reviews?|performs?|ensures?|records?|collects?|"
+    r"(?i)\b(verifies?|approves?|performs?|ensures?|records?|collects?|"
     r"validates?|grants?|applies?|restores?|coordinates?|executes?)\b"
 )
 
@@ -196,11 +205,44 @@ _DEPT_FROM_SOP_SEGMENT = {
 
 _STATUS_VALUE_PATTERNS = [
     (re.compile(r"(?i)\b(effective|freigegeben)\b"), "effective"),
+    (re.compile(r"(?i)\b(active|aktiv)\b"), "active"),
     (re.compile(r"(?i)\b(under\s*review|in\s*review|prüfung|pruefung)\b"), "under_review"),
-    (re.compile(r"(?i)\b(approved)\b"), "approved"),
+    (re.compile(r"(?i)\b(approved|genehmigt)\b"), "approved"),
+    (re.compile(r"(?i)\b(superseded|ersetzt)\b"), "superseded"),
+    (re.compile(r"(?i)\b(retired|zurückgezogen|zurueckgezogen)\b"), "retired"),
     (re.compile(r"(?i)\b(obsolete|obsolet)\b"), "obsolete"),
     (re.compile(r"(?i)\b(draft|entwurf)\b"), "draft"),
 ]
+
+_KNOWN_DOCUMENT_STATUSES = frozenset(
+    {
+        "draft",
+        "under_review",
+        "effective",
+        "approved",
+        "active",
+        "obsolete",
+        "retired",
+        "superseded",
+    }
+)
+
+_STATUS_ALIAS_MAP = {
+    "in_review": "under_review",
+    "underreview": "under_review",
+    "freigegeben": "effective",
+    "entwurf": "draft",
+    "prufung": "under_review",
+    "pruefung": "under_review",
+    "genehmigt": "approved",
+    "aktiv": "active",
+    "obsolet": "obsolete",
+}
+
+_INCIDENTAL_STATUS_LINE = re.compile(
+    r"(?i)\b(?:Datum|Linked\s+DEV|Deviation|DEV-[A-Z0-9-]+|Change\s*Record|Änderungshistorie)\b"
+    r"|Status\s*:\s*(?:Closed|Open|In\s+Progress|Implemented)\b"
+)
 
 
 def _normalize_date(raw: str) -> str:
@@ -222,19 +264,156 @@ def _normalize_date(raw: str) -> str:
     return ""
 
 
+def normalize_sop_id_token(raw: str) -> str:
+    """Normalize a raw token to canonical SOP-DEPT-NNN form when possible."""
+    if not raw:
+        return ""
+    compact = re.sub(r"\s+", "", str(raw).strip()).upper()
+    m = _SOP_ID_STRICT.search(compact) or _SOP_ID_GENERIC.search(compact)
+    return m.group(1).upper() if m else ""
+
+
+def is_generated_import_sop_number(sop_number: str) -> bool:
+    """True for async-import placeholders, not real document IDs."""
+    s = (sop_number or "").strip().upper()
+    if not s:
+        return True
+    return bool(_IMPORT_PLACEHOLDER_NUMBER.match(s)) or bool(_RANDOM_SOP_NUMBER.match(s))
+
+
+def strip_sop_id_from_title(title: str, sop_id: str) -> str:
+    """Remove leading SOP ID and separators so title is human-readable only."""
+    if not title:
+        return ""
+    t = _clean_title_value(title)
+    if not sop_id:
+        return t
+    sid = sop_id.strip()
+    if not sid:
+        return t
+    escaped = re.escape(sid)
+    t = re.sub(rf"^\s*{escaped}\s*[-–—:|]+\s*", "", t, flags=re.I)
+    t = re.sub(rf"^\s*{escaped}\s+", "", t, flags=re.I)
+    return _clean_title_value(t)
+
+
+def _score_sop_id_candidate(token: str, position: int) -> tuple:
+    """Higher is better: strict pattern, numeric suffix, earlier in document."""
+    t = token.upper()
+    strict = bool(_SOP_ID_STRICT.fullmatch(t))
+    has_digit = bool(re.search(r"\d", t))
+    segment_count = len(re.findall(r"[-/]", t))
+    return (strict, has_digit, segment_count, -position, len(t))
+
+
+def _pick_best_sop_id(candidates: List[tuple[int, str]]) -> str:
+    if not candidates:
+        return ""
+    ranked = sorted(
+        candidates,
+        key=lambda item: _score_sop_id_candidate(item[1], item[0]),
+        reverse=True,
+    )
+    return ranked[0][1].upper()
+
+
+def _find_combined_id_title(text: str) -> tuple[str, str]:
+    """Cover-page lines like 'SOP-IT-001 – Zugriffsmanagement …'."""
+    for line in (text or "").splitlines()[:60]:
+        sl = line.strip()
+        if not sl:
+            continue
+        m = _COMBINED_INLINE_ID_TITLE.match(sl)
+        if m:
+            sop_id = normalize_sop_id_token(m.group(1))
+            title = strip_sop_id_from_title(_clean_title_value(m.group(2)), sop_id)
+            if sop_id and title and not _invalid_title(title, sop_id):
+                return sop_id, title
+        m = _COMBINED_SOP_TITLE.search(sl)
+        if m:
+            id_m = _SOP_ID_GENERIC.search(sl)
+            sop_id = normalize_sop_id_token(id_m.group(1) if id_m else "")
+            title = strip_sop_id_from_title(_clean_title_value(m.group(1)), sop_id)
+            if sop_id and title and not _invalid_title(title, sop_id):
+                return sop_id, title
+    return "", ""
+
+
+def _metadata_from_blocks(blocks: Optional[List[Dict[str, Any]]]) -> tuple[str, str]:
+    """Read SOP ID / title from structured two-column cover tables."""
+    sop_id = ""
+    title = ""
+    if not blocks:
+        return sop_id, title
+
+    id_labels = re.compile(r"(?i)sop\s*id|document\s*id|dokumenten?\s*id|sop\s*nr")
+    title_labels = re.compile(r"(?i)^(?:title|titel|betreff|bezeichnung|document\s*title|sop\s*title)$")
+
+    for block in blocks:
+        if str(block.get("type", "")).lower() != "two_column_row":
+            continue
+        left = str(block.get("left", "")).strip()
+        right = str(block.get("right", "")).strip()
+        if not right:
+            continue
+        if id_labels.search(left):
+            combined_id, combined_title = _find_combined_id_title(right)
+            if combined_id:
+                sop_id = combined_id
+                if combined_title:
+                    title = combined_title
+            else:
+                sop_id = normalize_sop_id_token(right) or sop_id
+        elif title_labels.match(left):
+            cand = strip_sop_id_from_title(_clean_title_value(right), sop_id)
+            if cand and not _invalid_title(cand, sop_id):
+                title = cand
+
+    if not sop_id:
+        for block in blocks[:30]:
+            if str(block.get("type", "")).lower() != "two_column_row":
+                continue
+            right = str(block.get("right", "")).strip()
+            combined_id, combined_title = _find_combined_id_title(right)
+            if combined_id:
+                sop_id = combined_id
+                if combined_title and not title:
+                    title = combined_title
+                break
+
+    return sop_id, title
+
+
 def _find_sop_id(text: str) -> str:
-    explicit = _extract_labeled_value(text, ["SOP ID", "SOP Nr.", "SOP Number", "Document ID", "Dokumenten ID"])
+    head = "\n".join((text or "").splitlines()[:80])
+    candidates: List[tuple[int, str]] = []
+
+    explicit = _extract_labeled_value(
+        head,
+        ["SOP ID", "SOP Nr.", "SOP Number", "Document ID", "Dokumenten ID", "Dokument-Nr."],
+    )
     if explicit:
-        m_explicit = _SOP_ID_GENERIC.search(explicit)
-        if m_explicit:
-            return m_explicit.group(1).strip().upper()
-    m = _SOP_ID_LINE.search(text)
-    if m:
-        return m.group(1).strip().upper()
-    m = _SOP_ID_GENERIC.search(text)
-    if m:
-        return m.group(1).strip().upper()
-    return ""
+        tok = normalize_sop_id_token(explicit)
+        if tok:
+            candidates.append((0, tok))
+
+    for m in _SOP_ID_LINE.finditer(head):
+        candidates.append((m.start(), normalize_sop_id_token(m.group(1))))
+
+    for pattern in (_SOP_ID_STRICT, _SOP_ID_GENERIC):
+        for m in pattern.finditer(head):
+            tok = normalize_sop_id_token(m.group(1))
+            if tok:
+                candidates.append((m.start(), tok))
+
+    if not candidates:
+        for pattern in (_SOP_ID_STRICT, _SOP_ID_GENERIC):
+            for m in pattern.finditer(text or ""):
+                tok = normalize_sop_id_token(m.group(1))
+                if tok:
+                    candidates.append((m.start(), tok))
+
+    return _pick_best_sop_id(candidates)
 
 
 def _label_stop_pattern(exclude_labels: Optional[List[str]] = None) -> re.Pattern:
@@ -349,6 +528,8 @@ def _find_title(text: str, sop_id: str) -> str:
     for ln in lines[:40]:
         sl = ln.strip()
         if not sl:
+            continue
+        if re.match(r"^[-*•]\s+", sl):
             continue
         if sop_id and sl.strip().upper() == sop_id.upper():
             continue
@@ -834,6 +1015,11 @@ def _find_category(text: str, title: str) -> str:
 
 
 def _normalize_status(value: str) -> str:
+    return normalize_document_status(value)
+
+
+def normalize_document_status(value: str) -> str:
+    """Normalize a raw status label/value to a canonical document status token."""
     if not value:
         return ""
     v = str(value).strip()
@@ -841,23 +1027,51 @@ def _normalize_status(value: str) -> str:
         if rx.search(v):
             return normalized
     compact = re.sub(r"[\s-]+", "_", v.lower())
-    return compact if compact in {"draft", "under_review", "effective", "obsolete", "approved"} else ""
+    compact = _STATUS_ALIAS_MAP.get(compact, compact)
+    return compact if compact in _KNOWN_DOCUMENT_STATUSES else ""
 
 
-def _find_status(text: str) -> str:
+def _status_from_text_chunk(text: str) -> str:
+    if not text:
+        return ""
     explicit = _extract_labeled_value(text, ["Status", "Freigabestatus", "Dokumentstatus"])
     if explicit:
         normalized = _normalize_status(explicit)
         if normalized:
             return normalized
 
-    m = _STATUS_LABEL.search(text or "")
+    m = _STATUS_LABEL.search(text)
     if m:
         normalized = _normalize_status(m.group(1))
         if normalized:
             return normalized
-    # fallback scan if label parser misses line format
-    for line in (text or "").splitlines()[:120]:
+
+    pipe_m = re.search(r"(?i)(?:^|[\|])\s*Status\s*[:#]\s*([^|\n]+)", text)
+    if pipe_m:
+        normalized = _normalize_status(pipe_m.group(1))
+        if normalized:
+            return normalized
+    return ""
+
+
+def _is_incidental_status_line(line: str) -> bool:
+    """Skip change-log / deviation rows that also contain 'Status: …'."""
+    return bool(_INCIDENTAL_STATUS_LINE.search(line or ""))
+
+
+def _find_status(text: str) -> str:
+    text = text or ""
+    lines = text.splitlines()
+    header = "\n".join(lines[:40]) if lines else ""
+
+    for chunk in (header, text):
+        found = _status_from_text_chunk(chunk)
+        if found:
+            return found
+
+    for line in lines[:120]:
+        if _is_incidental_status_line(line):
+            continue
         if re.search(r"(?i)\bstatus\b", line):
             normalized = _normalize_status(line)
             if normalized:
@@ -867,14 +1081,23 @@ def _find_status(text: str) -> str:
 
 def _rules_extract(text: str, blocks: Optional[List[Dict[str, Any]]]) -> Dict[str, str]:
     text = text or ""
-    sop_id = _find_sop_id(text)
-    title = _find_title(text, sop_id)
+    combined_id, combined_title = _find_combined_id_title(text)
+    block_id, block_title = _metadata_from_blocks(blocks)
+
+    sop_id = combined_id or block_id or _find_sop_id(text)
+    title = combined_title or block_title or _find_title(text, sop_id)
+    if sop_id and title:
+        title = strip_sop_id_from_title(title, sop_id)
     if _invalid_title(title, sop_id):
         title = ""
     if not title:
         for ln in text.splitlines()[:35]:
             sl = ln.strip()
             if len(sl) < 12:
+                continue
+            if re.match(r"^[-*•]\s+", sl):
+                continue
+            if re.match(r"^\d+(?:\.\d+)*\s+(?:SECTION|Section|Kapitel)\b", sl, re.I):
                 continue
             c = _clean_title_value(sl)
             if not _invalid_title(c, sop_id):
@@ -1019,15 +1242,35 @@ def to_frontend_sop_metadata(structured: Dict[str, Any]) -> Dict[str, Any]:
     """Map extractor output into sopMetadata shape used by the editor."""
     eff = (structured.get("effective_date") or structured.get("date") or "").strip()
     rev_d = (structured.get("review_date") or "").strip()
+    sop_id = normalize_sop_id_token(structured.get("sop_id") or "")
+    title = strip_sop_id_from_title(str(structured.get("title") or "").strip(), sop_id)
+    status = _normalize_status(structured.get("status") or "")
     return {
-        "documentId": structured.get("sop_id") or "",
-        "title": structured.get("title") or "",
+        "documentId": sop_id,
+        "title": title,
         "department": structured.get("department") or "",
         "docType": structured.get("type") or "SOP",
         "category": structured.get("category") or "",
         "sopVersion": structured.get("version") or "",
-        "sopStatus": _normalize_status(structured.get("status") or ""),
-        "status": _normalize_status(structured.get("status") or ""),
+        "sopStatus": status,
+        "status": status,
         "effectiveDate": eff,
         "reviewDate": rev_d,
     }
+
+
+def resolve_status_from_metadata(raw_meta: dict | None) -> str:
+    """Read sopStatus/status from metadata_json (top-level or nested sopMetadata)."""
+    if not isinstance(raw_meta, dict):
+        return ""
+    sm = raw_meta.get("sopMetadata") if isinstance(raw_meta.get("sopMetadata"), dict) else {}
+    for candidate in (
+        raw_meta.get("sopStatus"),
+        raw_meta.get("status"),
+        sm.get("sopStatus"),
+        sm.get("status"),
+    ):
+        normalized = normalize_document_status(str(candidate or ""))
+        if normalized:
+            return normalized
+    return ""

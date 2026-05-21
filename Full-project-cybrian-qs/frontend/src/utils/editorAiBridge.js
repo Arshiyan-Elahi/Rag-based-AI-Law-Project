@@ -61,7 +61,13 @@ const IMPROVE_PATTERNS = [
   /\bverbessere?n?\b/i,
   /\boptimieren?\b/i,
   /\bverfeinern\b/i,
-  /\b(make|machen)\s+(it|sie|es)?\s*(besser|better)\b/i,
+  /\b(make|machen)\s+(it|sie|es|this)?\s*(besser|better|formal(?:er)?)\b/i,
+  /\bmore\s+formal\b/i,
+  /\bformeller\b/i,
+  /\bformal(?:er|ere)?\s+machen\b/i,
+  /\bimprovement\s+suggestions?\b/i,
+  /\bverbesserungsvorschläge?\b/i,
+  /\bgenerate\s+improvement\b/i,
 ]
 
 const GAP_PATTERNS = [
@@ -74,6 +80,9 @@ const GAP_PATTERNS = [
   /\bl(?:ü|ue)cken[\s-]?(analyse|pr(?:ü|ue)fung|check)\b/i,
   /\bqa\s*review\b/i,
   /\bwelche\s+lücken\b/i,
+  /\bidentify\s+risks?\b/i,
+  /\brisks?\s+and\s+gaps?\b/i,
+  /\brisiken\s+und\s+lücken\b/i,
 ]
 
 const READ_PATTERNS = [
@@ -91,6 +100,8 @@ const SUMMARIZE_PATTERNS = [
   /\bexecutive\s+summary\b/i,
   /\bzusammenfass/i,
   /\bkurzfassung\b/i,
+  /\bsummarize\s+this\s+sop\s+in\s+\d+\s+words?\b/i,
+  /\bzusammenfass(?:en|ung).*\b\d+\s+wörter\b/i,
 ]
 
 const ANALYZE_PATTERNS = [
@@ -109,7 +120,8 @@ const COMPARE_PATTERNS = [
 ]
 
 /**
- * Detect an editor-action intent in free-form text.
+ * Legacy regex intent detector (bubble menu / offline fallback only).
+ * Prefer {@link classifyAssistantMessage} from assistantIntentRouter.js for chat routing.
  * Returns one of EDITOR_AI_ACTIONS values, or null when no intent matches.
  */
 export function detectEditorIntent(rawText) {

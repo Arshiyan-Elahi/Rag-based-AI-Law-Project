@@ -1,5 +1,5 @@
 from pydantic import BaseModel, ConfigDict
-from typing import Any, Optional, List
+from typing import Any, Dict, Optional, List
 from uuid import UUID
 from datetime import datetime
 
@@ -34,6 +34,23 @@ class LinkRequest(BaseModel):
 class UpdateVersionStatusRequest(BaseModel):
     status: str
     metadata_json: Optional[Any] = None
+
+
+class SOPImportJobStatusResponse(BaseModel):
+    job_id: str
+    sop_id: str
+    version_id: str
+    status: str
+    message: Optional[str] = None
+    filename: Optional[str] = None
+    scanned_pdf: bool = False
+    error: Optional[str] = None
+    semantic_error: Optional[str] = None
+    updated_at: Optional[str] = None
+    sop_number: Optional[str] = None
+    title: Optional[str] = None
+    doc_json_ready: bool = False
+    extraction: Optional[Dict[str, Any]] = None
 
 
 # ==========================================
@@ -81,6 +98,12 @@ class EditorDocResponse(BaseModel):
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class AsyncSOPImportResponse(BaseModel):
+    job_id: str
+    import_status: SOPImportJobStatusResponse
+    document: EditorDocResponse
 
 
 # Older alias kept for any internal usage (not used in new routes)
@@ -306,6 +329,8 @@ class AIActionRequest(BaseModel):
     sop_title: Optional[str] = None
     section_name: Optional[str] = None
     section_type: Optional[str] = None
+    # Free-text author goal (e.g. KL assistant message + structured hints). Optional.
+    assistant_instruction: Optional[str] = None
     # section_only | full_document — drives prompt scope (partial vs whole SOP)
     edit_scope: Optional[str] = None
     # When the client already holds a validated structured result (e.g. re-apply), skip LLM.

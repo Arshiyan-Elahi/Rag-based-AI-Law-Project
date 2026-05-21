@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy import inspect as sa_inspect
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 from sentence_transformers import SentenceTransformer 
@@ -38,6 +39,8 @@ from retrieval.hybrid_retriever import invalidate_bm25_cache
 
 logger = logging.getLogger(__name__)
 
+_SOURCE_REF_VERSION_COLUMN_OK: bool | None = None
+
 BGE_M3_MODEL = "BAAI/bge-m3"
 DEFAULT_COLLECTION = os.getenv("SEMANTIC_QDRANT_COLLECTION", "qa_semantic_chunks")
 ENTITY_TYPES = {"sop", "deviation", "capa", "audit_finding", "decision"}
@@ -54,6 +57,7 @@ LINK_RULES = {
 _embedder: Any | None = None
 _qdrant: QdrantClient | None = None
 _embedder_lock = threading.Lock()
+_enqueue_lock = threading.Lock()
 
 
 def _resolve_hf_cache_dir() -> str:
@@ -179,6 +183,54 @@ def _sections_content_fingerprint(sections: list[tuple[str, str]]) -> str:
     return hashlib.sha256(
         "\n\n".join([f"{name}\n{text}" for name, text in sections]).encode("utf-8", errors="ignore")
     ).hexdigest()
+
+
+def _source_references_support_version_scope(db: Session) -> bool:
+    """True when ORM and DB both expose source_references.entity_version_id."""
+    global _SOURCE_REF_VERSION_COLUMN_OK
+    if _SOURCE_REF_VERSION_COLUMN_OK is not None:
+        return _SOURCE_REF_VERSION_COLUMN_OK
+    if not hasattr(SourceReference, "entity_version_id"):
+        _SOURCE_REF_VERSION_COLUMN_OK = False
+        return False
+    try:
+        insp = sa_inspect(db.get_bind())
+        if "source_references" not in insp.get_table_names():
+            _SOURCE_REF_VERSION_COLUMN_OK = False
+        else:
+            cols = {c["name"] for c in insp.get_columns("source_references")}
+            _SOURCE_REF_VERSION_COLUMN_OK = "entity_version_id" in cols
+    except Exception as exc:
+        logger.warning(
+            "[semantic-pipeline] could not inspect source_references columns: %s",
+            exc,
+        )
+        _SOURCE_REF_VERSION_COLUMN_OK = False
+    return _SOURCE_REF_VERSION_COLUMN_OK
+
+
+def _source_reference_delete_query(
+    db: Session,
+    entity_type: str,
+    entity_id: uuid.UUID,
+    resolved_version: uuid.UUID | None,
+):
+    """Build a delete query for source references; version scope only when column exists."""
+    query = db.query(SourceReference).filter(
+        SourceReference.entity_type == entity_type,
+        SourceReference.entity_id == entity_id,
+    )
+    if resolved_version is None:
+        return query
+    if _source_references_support_version_scope(db):
+        return query.filter(SourceReference.entity_version_id == resolved_version)
+    logger.warning(
+        "[semantic-pipeline] source_references.entity_version_id missing in DB — "
+        "deleting source references by entity scope only (entity_type=%s entity_id=%s)",
+        entity_type,
+        entity_id,
+    )
+    return query
 
 
 class SemanticPipelineService:
@@ -578,15 +630,21 @@ class SemanticPipelineService:
                     db.commit()
                     return False
 
-        db.query(KnowledgeChunk).filter(
+        chunk_delete = db.query(KnowledgeChunk).filter(
             KnowledgeChunk.entity_type == "sop",
             KnowledgeChunk.entity_id == entity_id,
-        ).delete(synchronize_session=False)
-        db.query(SourceReference).filter(
-            SourceReference.entity_type == "sop",
-            SourceReference.entity_id == entity_id,
-        ).delete(synchronize_session=False)
+        )
+        if resolved_version:
+            chunk_delete = chunk_delete.filter(
+                KnowledgeChunk.entity_version_id == resolved_version
+            )
+        source_delete = _source_reference_delete_query(
+            db, "sop", entity_id, resolved_version
+        )
+        chunk_delete.delete(synchronize_session=False)
+        source_delete.delete(synchronize_session=False)
         db.commit()
+        db.expire_all()
 
         display = SemanticPipelineService._entity_rag_fields(db, "sop", entity_id)
         doc_type_norm = SemanticPipelineService._doc_type_for_entity("sop")
@@ -646,8 +704,13 @@ class SemanticPipelineService:
         job.embeddings_status = "processing"
         db.commit()
 
-        rows = (
-            db.query(KnowledgeChunk)
+        chunk_rows = (
+            db.query(
+                KnowledgeChunk.id,
+                KnowledgeChunk.chunk_order,
+                KnowledgeChunk.chunk_text,
+                KnowledgeChunk.metadata_json,
+            )
             .filter(
                 KnowledgeChunk.entity_type == "sop",
                 KnowledgeChunk.entity_id == entity_id,
@@ -656,7 +719,7 @@ class SemanticPipelineService:
             .order_by(KnowledgeChunk.chunk_order.asc())
             .all()
         )
-        if not rows:
+        if not chunk_rows:
             SemanticPipelineService._fail_embedding_job(db, job, "Chunks missing after chunking stage")
             logger.error("[sop-pipeline] embeddings aborted — no rows job=%s", job_id)
             return False
@@ -664,7 +727,7 @@ class SemanticPipelineService:
         embedder = _get_embedder()
         example_vec = embedder.encode(["dimension_probe"], normalize_embeddings=True)[0]
         SemanticPipelineService._ensure_collection(len(example_vec))
-        texts = [r.chunk_text for r in rows]
+        texts = [row.chunk_text for row in chunk_rows]
         embedding_vectors = embedder.encode(
             texts,
             normalize_embeddings=True,
@@ -706,7 +769,8 @@ class SemanticPipelineService:
             logger.warning("[sop-pipeline] qdrant delete non-fatal job=%s err=%s", job_id, ex)
 
         points: list[qmodels.PointStruct] = []
-        for row, emb_arr in zip(rows, embedding_vectors):
+        chunk_ids_for_rag: list[uuid.UUID] = []
+        for row, emb_arr in zip(chunk_rows, embedding_vectors):
             ord_ = row.chunk_order
             md = row.metadata_json if isinstance(row.metadata_json, dict) else {}
             section_name = md.get("section_name", "General")
@@ -730,16 +794,20 @@ class SemanticPipelineService:
                 "rag_ready": True,
             }
             points.append(qmodels.PointStruct(id=qid, vector=emb, payload=pl))
+            chunk_ids_for_rag.append(row.id)
 
         if points:
             client.upsert(collection_name=DEFAULT_COLLECTION, points=points, wait=True)
             invalidate_bm25_cache(DEFAULT_COLLECTION)
 
-        for row in rows:
-            md = dict(row.metadata_json) if isinstance(row.metadata_json, dict) else {}
+        for chunk_id in chunk_ids_for_rag:
+            chunk_row = db.get(KnowledgeChunk, chunk_id)
+            if not chunk_row:
+                continue
+            md = dict(chunk_row.metadata_json) if isinstance(chunk_row.metadata_json, dict) else {}
             md["rag_ready"] = True
             md["embedding_model"] = BGE_M3_MODEL
-            row.metadata_json = md
+            chunk_row.metadata_json = md
 
         if resolved_version:
             version_row = db.query(SOPVersion).filter(SOPVersion.id == resolved_version).first()
@@ -781,6 +849,18 @@ class SemanticPipelineService:
 
     @staticmethod
     def enqueue_reindex(entity_type: str, entity_id: uuid.UUID, version_id: uuid.UUID | None = None, job_type: str = "entity_reindex") -> uuid.UUID | None:
+        with _enqueue_lock:
+            return SemanticPipelineService._enqueue_reindex_locked(
+                entity_type, entity_id, version_id, job_type
+            )
+
+    @staticmethod
+    def _enqueue_reindex_locked(
+        entity_type: str,
+        entity_id: uuid.UUID,
+        version_id: uuid.UUID | None = None,
+        job_type: str = "entity_reindex",
+    ) -> uuid.UUID | None:
         db = SessionLocal()
         try:
             if entity_type not in ENTITY_TYPES:
@@ -827,11 +907,13 @@ class SemanticPipelineService:
                     .filter(
                         EmbeddingJob.entity_type == "sop",
                         EmbeddingJob.entity_id == entity_id,
-                        EmbeddingJob.status == "pending",
+                        EmbeddingJob.status.in_(("pending", "processing")),
                     )
                     .all()
                 )
                 for j in stale_pending:
+                    if reuse and j.id == reuse.id:
+                        continue
                     j.status = "cancelled"
                     j.finished_at = datetime.utcnow()
                     for fn in SemanticPipelineService._pipeline_stage_names():
@@ -1166,12 +1248,17 @@ class SemanticPipelineService:
             KnowledgeChunk.entity_type == entity_type,
             KnowledgeChunk.entity_id == entity_id,
         )
+        if resolved_version:
+            delete_query = delete_query.filter(
+                KnowledgeChunk.entity_version_id == resolved_version
+            )
+        source_delete = _source_reference_delete_query(
+            db, entity_type, entity_id, resolved_version
+        )
         delete_query.delete(synchronize_session=False)
-        db.query(SourceReference).filter(
-            SourceReference.entity_type == entity_type,
-            SourceReference.entity_id == entity_id,
-        ).delete(synchronize_session=False)
+        source_delete.delete(synchronize_session=False)
         db.commit()
+        db.expire_all()
         t_delete = time.perf_counter()
 
         embedder = _get_embedder()

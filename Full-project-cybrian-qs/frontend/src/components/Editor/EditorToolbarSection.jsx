@@ -94,7 +94,7 @@ export default function EditorToolbarSection({
           <label className={`figma-btn figma-btn-small${isHistoricalView || isImporting ? ' disabled' : ''}`}>
             {isImporting ? <Loader2 size={15} className="figma-spin" /> : <Import size={15} />}
             {isImporting ? 'Importing SOP...' : 'Import SOP'}
-            <input type="file" accept=".pdf,.docx,.txt,.md" hidden onChange={triggerImport} disabled={isHistoricalView || isImporting} />
+            <input type="file" accept=".pdf,.docx,.txt" hidden onChange={triggerImport} disabled={isHistoricalView || isImporting} />
           </label>
           <button type="button" className="figma-btn figma-btn-small" onClick={insertPlaceholder} disabled={isHistoricalView}>{t.insertPlaceholder}</button>
           <div className="figma-language-select">

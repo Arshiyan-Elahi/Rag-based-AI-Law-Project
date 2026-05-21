@@ -1,6 +1,6 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useRef, useState, memo } from 'react'
 import { useLocation } from 'react-router-dom'
-import { AlertTriangle, Check, Sparkles, Wand2, X } from 'lucide-react'
+import { Check, X } from 'lucide-react'
 import { performAIAction } from '../../api/editorApi'
 import { selectionLooksLikeFormattedAiReport } from '../../utils/aiActionSelection'
 import { buildGapCheckSidebarReport } from '../../utils/actionsTabGapReport'
@@ -33,9 +33,12 @@ const ACTION_TEXT_WARNING_CHARS = 7000
 const INLINE_SHOWN_EVENT = 'editor-actions-inline-shown'
 const INLINE_APPLIED_EVENT = 'editor-actions-inline-applied'
 
-export default function ActionsTab({ onSwitchToActions }) {
+/**
+ * Runs rewrite / improve / gap_check from chat (via dispatchActionsTabRun) and
+ * shows accept/reject review UI inside the KI Assistant chat panel.
+ */
+function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
   const location = useLocation()
-  const [prompt, setPrompt] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [pending, setPending] = useState(null)
@@ -56,7 +59,7 @@ export default function ActionsTab({ onSwitchToActions }) {
   }, [])
 
   const runGapCheck = useCallback(async (instructionText = '') => {
-    const instruction = String(instructionText || prompt || '').trim()
+    const instruction = String(instructionText || '').trim()
     const { target, result, normalized } = await runEditorGapCheck({ instruction })
     const report = buildGapCheckSidebarReport(result)
 
@@ -70,12 +73,16 @@ export default function ActionsTab({ onSwitchToActions }) {
       range: { from: target.from, to: target.to },
       appendHtml: normalized.suggestedHtml,
     })
-  }, [prompt])
+  }, [])
 
-  const runRewriteImprove = useCallback(async (action, instructionText = '') => {
+  const runInlineContentAction = useCallback(async (action, instructionText = '', targetOptions = {}) => {
     const documentId = getActiveEditorDocumentId()
-    const instruction = String(instructionText || prompt || '').trim()
-    const snapshot = await requestEditorSnapshot({ prompt: instruction })
+    const instruction = String(instructionText || '').trim()
+    const snapshot = await requestEditorSnapshot({
+      prompt: instruction,
+      sectionHint: targetOptions.sectionHint || '',
+      targetScope: targetOptions.targetScope || '',
+    })
     const target = snapshot.target
     if (target?.from == null || target?.to == null || !target?.text) {
       throw new Error(snapshot.error || 'Could not find that heading or paragraph in the open SOP.')
@@ -121,6 +128,7 @@ export default function ActionsTab({ onSwitchToActions }) {
           }),
       sop_entity_id: documentId,
       triggered_by: AI_ACTION_TRIGGERED_BY.EDITOR_BUBBLE,
+      assistant_instruction: instruction || null,
     })
 
     const normalized = normalizeAiActionResult(action, result)
@@ -172,25 +180,29 @@ export default function ActionsTab({ onSwitchToActions }) {
       previewHtml: inlineHtml,
       range: { from: target.from, to: target.to },
     })
-  }, [prompt])
+  }, [])
 
-  const runAction = useCallback(async (action, instructionText = '') => {
+  const runAction = useCallback(async (action, instructionText = '', targetOptions = {}) => {
     if (inFlightRef.current) return
     if (!hasActiveSopEditor(location.pathname)) {
-      setError('Open an SOP in the editor to use Actions.')
+      const msg = 'Open an SOP in the editor first.'
+      setError(msg)
+      onRunError?.(msg)
       return
     }
 
     if (!getActiveEditorDocumentId()) {
-      setError('No active SOP. Open a document in the editor first.')
+      const msg = 'No active SOP. Open a document in the editor first.'
+      setError(msg)
+      onRunError?.(msg)
       return
     }
 
-    const instruction = String(instructionText || prompt || '').trim()
+    const instruction = String(instructionText || '').trim()
     if (!instruction) {
-      setError(
-        'Describe the target, e.g. "gap check CAPAs (zugehörig zu SOP-IT-003)" or "DEVIATIONS rewrite this".',
-      )
+      const msg = 'Describe what to run on the open SOP (e.g. rewrite this section, gap check CAPAs).'
+      setError(msg)
+      onRunError?.(msg)
       return
     }
 
@@ -198,32 +210,55 @@ export default function ActionsTab({ onSwitchToActions }) {
     inFlightRef.current = true
     setLoading(true)
     setError('')
+    onRunStart?.(action, instruction)
 
     try {
       if (action === 'gap_check') {
         await runGapCheck(instruction)
+      } else if (action === 'rewrite' || action === 'improve' || action === 'summarize') {
+        await runInlineContentAction(action, instruction, targetOptions)
       } else {
-        await runRewriteImprove(action, instruction)
+        throw new Error(`Unsupported inline action: ${action}`)
       }
+      onRunComplete?.(action, instruction)
     } catch (err) {
-      setError(err?.message || 'Action failed.')
+      const msg = err?.message || 'Action failed.'
+      setError(msg)
       clearPending()
+      onRunError?.(msg)
     } finally {
       inFlightRef.current = false
       setLoading(false)
     }
-  }, [location.pathname, prompt, clearPending, runGapCheck, runRewriteImprove])
+  }, [location.pathname, clearPending, runGapCheck, runInlineContentAction, onRunStart, onRunComplete, onRunError])
+
+  const runActionWithTarget = useCallback(
+    (action, instructionText, targetOptions = {}) => {
+      if (action === 'gap_check') {
+        return runAction('gap_check', instructionText)
+      }
+      return runAction(action, instructionText, targetOptions)
+    },
+    [runAction],
+  )
 
   useEffect(() => {
-    const unsubscribe = subscribeActionsTabRun(({ action, prompt: runPrompt }) => {
-      if (typeof onSwitchToActions === 'function') onSwitchToActions()
-      if (runPrompt) setPrompt(runPrompt)
+    const unsubscribe = subscribeActionsTabRun(({ action, prompt: runPrompt, sectionHint, targetScope }) => {
       const normalizedAction =
-        action === 'gap_check' ? 'gap_check' : action === 'improve' ? 'improve' : 'rewrite'
-      runAction(normalizedAction, runPrompt || '')
+        action === 'gap_check'
+          ? 'gap_check'
+          : action === 'improve'
+            ? 'improve'
+            : action === 'summarize'
+              ? 'summarize'
+              : 'rewrite'
+      runActionWithTarget(normalizedAction, runPrompt || '', {
+        sectionHint: sectionHint || '',
+        targetScope: targetScope || '',
+      })
     })
     return unsubscribe
-  }, [runAction, onSwitchToActions])
+  }, [runActionWithTarget])
 
   const handleAccept = useCallback(() => {
     if (!pending?.requestId || pending.action === 'gap_check') return
@@ -234,7 +269,6 @@ export default function ActionsTab({ onSwitchToActions }) {
     if (!pending?.appendHtml) return
     appendGapFindingsToEditor(pending.appendHtml)
     setPending(null)
-    setPrompt('')
     setError('')
   }, [pending])
 
@@ -251,7 +285,6 @@ export default function ActionsTab({ onSwitchToActions }) {
         return
       }
       setPending(null)
-      setPrompt('')
       setError('')
     }
     window.addEventListener(INLINE_APPLIED_EVENT, onApplied)
@@ -260,60 +293,13 @@ export default function ActionsTab({ onSwitchToActions }) {
 
   useEffect(() => () => clearPending(), [clearPending])
 
+  if (!loading && !error && !pending) return null
+
   const isGapPending = pending?.action === 'gap_check'
 
   return (
-    <div className="ai-actions-tab">
-      <p className="ai-actions-tab__hint">
-        Name a <strong>section</strong> or the <strong>full SOP</strong> — Rewrite/Improve show inline diff in the editor;
-        <strong> Gap Check</strong> shows the full audit report here (same as select → Gap Check).
-      </p>
-
-      <label className="ai-actions-tab__label" htmlFor="ai-actions-prompt">
-        What to run on the open SOP
-      </label>
-      <textarea
-        id="ai-actions-prompt"
-        className="ai-actions-tab__textarea"
-        rows={4}
-        placeholder='gap check 🟠 CAPAs (zugehörig zu SOP-IT-003) — or — gap check this SOP'
-        value={prompt}
-        onChange={(e) => setPrompt(e.target.value)}
-        disabled={loading}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-            e.preventDefault()
-            runAction('gap_check', prompt)
-          }
-        }}
-      />
-
-      <div className="ai-actions-tab__chips" role="group" aria-label="Editor actions">
-        <button
-          type="button"
-          className="ai-action-chip ai-action-chip--gap"
-          disabled={loading}
-          onClick={() => runAction('gap_check', prompt)}
-        >
-          <AlertTriangle size={14} />
-          <span className="ai-action-chip__text">Gap Check</span>
-        </button>
-        <button
-          type="button"
-          className="ai-action-chip ai-action-chip--primary"
-          disabled={loading}
-          onClick={() => runAction('rewrite', prompt)}
-        >
-          <Wand2 size={14} />
-          <span className="ai-action-chip__text">Rewrite</span>
-        </button>
-        <button type="button" className="ai-action-chip" disabled={loading} onClick={() => runAction('improve', prompt)}>
-          <Sparkles size={14} />
-          <span className="ai-action-chip__text">Improve</span>
-        </button>
-      </div>
-
-      {loading ? <p className="ai-actions-tab__status" role="status">Running…</p> : null}
+    <div className="ai-chat-editor-actions">
+      {loading ? <p className="ai-actions-tab__status" role="status">Running editor action…</p> : null}
       {error ? <p className="ai-actions-tab__error" role="alert">{error}</p> : null}
 
       {pending ? (
@@ -332,8 +318,7 @@ export default function ActionsTab({ onSwitchToActions }) {
             </p>
           ) : (
             <p className="ai-actions-tab__pending-hint">
-              Full compliance gap analysis for this scope. The editor scrolls to the audited section; findings are not
-              shown inline.
+              Full compliance gap analysis for this scope. Accept appends findings to the SOP.
             </p>
           )}
 
@@ -411,3 +396,5 @@ export default function ActionsTab({ onSwitchToActions }) {
     </div>
   )
 }
+
+export default memo(EditorChatActions)

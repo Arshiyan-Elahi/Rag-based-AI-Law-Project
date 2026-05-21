@@ -83,3 +83,40 @@ export const DEFAULT_SOP_VERSION_METADATA = {
     replacementDocumentId: '',
     obsoleteReason: '',
 }
+
+/** Normalize raw status labels to canonical tokens (draft, effective, …). */
+export function normalizeSOPStatusToken(value) {
+    const raw = String(value || '').trim()
+    if (!raw) return ''
+    const compact = raw.toLowerCase().replace(/[\s-]+/g, '_')
+    const aliases = {
+        in_review: 'under_review',
+        underreview: 'under_review',
+        freigegeben: 'effective',
+        entwurf: 'draft',
+        genehmigt: 'approved',
+        aktiv: 'active',
+        obsolet: 'obsolete',
+    }
+    return aliases[compact] || compact
+}
+
+/**
+ * Resolve list/editor status: prefer extracted metadata when DB column is still import default draft.
+ */
+export function resolveSOPDisplayStatus({
+    externalStatus,
+    metadataJson,
+    fallback = 'draft',
+} = {}) {
+    const meta = metadataJson && typeof metadataJson === 'object' ? metadataJson : {}
+    const sm = meta.sopMetadata && typeof meta.sopMetadata === 'object' ? meta.sopMetadata : {}
+    const metaStatus = normalizeSOPStatusToken(
+        meta.sopStatus || meta.status || sm.sopStatus || sm.status,
+    )
+    const colStatus = normalizeSOPStatusToken(externalStatus)
+    if (metaStatus && (!colStatus || (colStatus === 'draft' && metaStatus !== 'draft'))) {
+        return metaStatus
+    }
+    return colStatus || metaStatus || fallback
+}

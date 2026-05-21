@@ -28,6 +28,7 @@ class ChatSession(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    sop_id = Column(UUID(as_uuid=True), ForeignKey("sops.id", ondelete="SET NULL"), nullable=True, index=True)
     title = Column(String(500), nullable=True)
     collection_name = Column(String(255), nullable=False, default="docs_sops")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -151,6 +152,16 @@ class SOPVersion(Base):
     content_json = Column(JSONB, nullable=False)
     metadata_json = Column(JSONB, nullable=True)
     superseded_by_version_id = Column(UUID(as_uuid=True), ForeignKey("sop_versions.id"), nullable=True)
+
+    extraction_status = Column(String(50), nullable=True)
+    extraction_engine = Column(String(50), nullable=True)
+    extraction_job_id = Column(String(100), nullable=True)
+    extracted_markdown = Column(Text, nullable=True)
+    extracted_json = Column(JSONB, nullable=True)
+    extraction_error = Column(Text, nullable=True)
+    extraction_cache_key = Column(String(64), nullable=True)
+    extraction_started_at = Column(TIMESTAMP, nullable=True)
+    extraction_completed_at = Column(TIMESTAMP, nullable=True)
 
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
@@ -348,6 +359,7 @@ class SourceReference(Base):
     tenant_id = Column(UUID(as_uuid=True), nullable=False)
     entity_type = Column(String(50), nullable=False)
     entity_id = Column(UUID(as_uuid=True), nullable=False)
+    entity_version_id = Column(UUID(as_uuid=True), nullable=True, index=True)
     reference_type = Column(String(50), nullable=False)
     reference_label = Column(String(255), nullable=True)
     reference_value = Column(String(255), nullable=False)

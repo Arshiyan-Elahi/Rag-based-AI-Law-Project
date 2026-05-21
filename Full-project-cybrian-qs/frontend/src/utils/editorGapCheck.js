@@ -54,6 +54,7 @@ export async function runEditorGapCheck({ instruction, documentId: docIdOverride
         }),
     sop_entity_id: documentId,
     triggered_by: AI_ACTION_TRIGGERED_BY.EDITOR_BUBBLE,
+    assistant_instruction: instructionText || null,
   })
 
   const normalized = normalizeAiActionResult('gap_check', result)

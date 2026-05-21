@@ -542,6 +542,47 @@
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+  align-items: center;
+}
+
+.sops-import-notice {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  max-width: min(520px, 100%);
+  border: 1px solid transparent;
+}
+
+.sops-import-notice-success {
+  background: #ecfdf5;
+  color: #065f46;
+  border-color: #a7f3d0;
+}
+
+.sops-import-notice-error {
+  background: #fef2f2;
+  color: #991b1b;
+  border-color: #fecaca;
+}
+
+.sops-import-notice-dismiss {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px;
+  margin-left: 4px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: inherit;
+  opacity: 0.7;
+}
+
+.sops-import-notice-dismiss:hover {
+  opacity: 1;
 }
 
 .sops-action-btn {
@@ -1314,4 +1355,94 @@
 .sop-delete-btn:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+
+/* SOP import upload feedback modal */
+.sop-import-modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  background: rgba(15, 23, 42, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.sop-import-modal {
+  width: min(420px, 100%);
+  background: #ffffff;
+  border-radius: 16px;
+  border: 1px solid #a7f3d0;
+  box-shadow: 0 16px 48px rgba(15, 23, 42, 0.22);
+  padding: 28px 24px 22px;
+  text-align: center;
+}
+
+.sop-import-modal-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0 auto 14px;
+  color: #059669;
+}
+
+.sop-import-modal--uploading .sop-import-modal-icon {
+  color: var(--primary, #16a34a);
+}
+
+.sop-import-modal--success .sop-import-modal-icon {
+  color: #059669;
+}
+
+.sop-import-modal--error {
+  border-color: #fecaca;
+}
+
+.sop-import-modal--error .sop-import-modal-icon {
+  color: #dc2626;
+}
+
+.sop-import-modal-message {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.55;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.sop-import-modal--uploading .sop-import-modal-message {
+  color: #065f46;
+}
+
+.sop-import-modal--success .sop-import-modal-message {
+  color: #065f46;
+}
+
+.sop-import-modal--error .sop-import-modal-message {
+  color: #991b1b;
+  font-weight: 500;
+}
+
+.sop-import-modal-actions {
+  margin-top: 18px;
+  display: flex;
+  justify-content: center;
+}
+
+.sop-import-modal-btn {
+  min-width: 108px;
+  border-radius: 999px;
+  border: 1px solid #d9f99d;
+  padding: 10px 18px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  background: #ecfccb;
+  color: #166534;
+  transition: all 0.2s ease;
+}
+
+.sop-import-modal-btn:hover {
+  background: #dcf8b1;
 }

@@ -685,10 +685,17 @@
   background: #ffffff;
   border-left: 1px solid rgba(0, 0, 0, 0.1);
   overflow: hidden;
+  position: relative;
+  scrollbar-gutter: stable;
 }
 
 .assistant-action-toast {
-  margin: 10px 14px 0;
+  position: absolute;
+  top: 8px;
+  left: 14px;
+  right: 14px;
+  z-index: 2;
+  margin: 0;
   padding: 9px 12px;
   border-radius: 6px;
   border: 1px solid rgba(53, 120, 86, 0.25);
@@ -698,6 +705,7 @@
   font-size: 11px;
   font-weight: 600;
   flex-shrink: 0;
+  pointer-events: none;
 }
 
 /* Header section (n_93fb9 > n_00925, n_93f3c, n_544b4) */
@@ -779,7 +787,8 @@
   border-bottom-color: #ffffff;
 }
 
-.ai-actions-tab {
+.ai-actions-tab,
+.ai-chat-editor-actions {
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -787,6 +796,13 @@
   flex: 1;
   min-height: 0;
   overflow: auto;
+}
+
+.ai-chat-editor-actions {
+  flex: 0 0 auto;
+  max-height: min(42vh, 360px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .ai-actions-tab__hint {
@@ -1268,6 +1284,42 @@
   gap: 12px;
   scrollbar-width: thin;
   scrollbar-color: rgba(53, 120, 86, 0.4) transparent;
+  scrollbar-gutter: stable;
+  contain: layout style;
+}
+
+/* Pinned footer: quick suggestions + chat input stay fixed while messages scroll */
+.ai-widget-bottom-stack {
+  flex: 0 0 auto;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  contain: layout style;
+  background: #ffffff;
+}
+
+.ai-editor-actions-slot {
+  flex: 0 0 auto;
+  min-height: 0;
+  max-height: 0;
+  overflow: hidden;
+}
+
+.ai-editor-actions-slot:not(:empty) {
+  max-height: min(42vh, 360px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border-top: 1px solid #e8ecf1;
+  background: #fafbfc;
+}
+
+.ai-widget-chat-footer {
+  flex: 0 0 auto;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  contain: layout style;
 }
 
 .ai-messages-section::-webkit-scrollbar {
@@ -1441,21 +1493,27 @@
   padding: 12px 18px;
   border-top: 1px solid rgba(0, 0, 0, 0.1);
   flex-shrink: 0;
+  min-height: 58px;
+  box-sizing: border-box;
 }
 
 .ai-bottom-input-group {
   display: flex;
   gap: 6px;
-  align-items: stretch;
+  align-items: center;
+  min-height: 34px;
 }
 
 .ai-bottom-input {
   flex: 1;
-  padding: 8px 11px;
+  height: 34px;
+  box-sizing: border-box;
+  padding: 0 11px;
   border: 1px solid rgba(0, 0, 0, 0.1);
   border-radius: 4px;
   font-family: Inter, sans-serif;
   font-size: 12px;
+  line-height: 34px;
   color: #202020;
   background: #ffffff;
   outline: none;

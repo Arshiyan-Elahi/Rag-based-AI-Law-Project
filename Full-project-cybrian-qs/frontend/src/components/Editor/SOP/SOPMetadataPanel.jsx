@@ -68,8 +68,11 @@ const formatStatusForDisplay = (value) => {
         accepted: 'Accepted',
         rejected: 'Rejected',
         approved: 'Approved',
+        active: 'Active',
         effective: 'Effective',
         obsolete: 'Obsolete',
+        retired: 'Retired',
+        superseded: 'Superseded',
     }
     return map[normalized] || String(value || '').trim()
 }

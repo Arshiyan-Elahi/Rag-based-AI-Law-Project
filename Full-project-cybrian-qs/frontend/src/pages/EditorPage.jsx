@@ -33,21 +33,32 @@ import {
   createDocument,
   createVersion,
   getDocument,
+  getImportJobStatus,
   getRelatedContext,
   getVersion,
   getVersions,
   updateDocument,
   updateVersionStatus,
 } from '../api/editorApi'
-import { DEFAULT_SOP_VERSION_METADATA, SOP_ORDER, SOP_STATES } from '../utils/sopConstants'
+import {
+  DEFAULT_SOP_VERSION_METADATA,
+  resolveSOPDisplayStatus,
+  SOP_ORDER,
+  SOP_STATES,
+} from '../utils/sopConstants'
 import {
   applySOPImportMetadata,
   buildSOPDisplayLabel,
+  importStatusToModalMessage,
   normalizeSOPTitleForDisplay,
   prepareEditorSOPImport,
 } from '../utils/sopImportService'
 import { InlineAiSuggestion } from '../extensions/InlineAiSuggestion'
 import { notifySopEditorContextChanged } from '../utils/editorAiBridge'
+import {
+  applyTipTapContentToEditor,
+  isEditorContentEmpty,
+} from '../utils/editorUtils'
 import '../assets/styles/global.css'
 
 const PreviewModal = lazy(() => import('../components/Common/PreviewModal'))
@@ -245,6 +256,7 @@ const normalizeEditorMetadataTitle = (inputMetadata) => {
 const EditorPage = ({
   isEmbedded = false,
   initialDocId = null,
+  initialDocJson = null,
   initialMetadataJson = null,
   initialStatus = '',
   initialDocTitle = '',
@@ -285,8 +297,19 @@ const EditorPage = ({
   const [relatedContextRefreshToken, setRelatedContextRefreshToken] = useState(0)
   const [relatedContextSnapshot, setRelatedContextSnapshot] = useState(null)
   const hydrationRef = useRef(false)
+  const pendingInitialHydrationRef = useRef(Boolean(initialDocId))
+  const hydrateSeqRef = useRef(0)
   const saveInFlightRef = useRef(false)
   const [isEditorMounted, setIsEditorMounted] = useState(false)
+
+  useEffect(() => {
+    if (initialDocId) {
+      setDocumentId(initialDocId)
+      pendingInitialHydrationRef.current = true
+    } else {
+      pendingInitialHydrationRef.current = false
+    }
+  }, [initialDocId])
 
   useEffect(() => {
     if (!initialMetadataJson || typeof initialMetadataJson !== 'object') return
@@ -380,7 +403,7 @@ const EditorPage = ({
   ].filter(Boolean)
   const breadcrumbLabel = headerParts.length ? headerParts.join(' · ') : currentVersionLabel
 
-  const applyVersionState = useCallback((versionRecord, fallbackTitle = '') => {
+  const applyVersionState = useCallback((versionRecord, fallbackTitle = '', htmlFallback = '') => {
     if (!editor || !versionRecord || !isEditorMounted || editor.isDestroyed) return
 
     hydrationRef.current = true
@@ -395,12 +418,22 @@ const EditorPage = ({
 
     setMetadata(normalizeEditorMetadataTitle(normalized))
     setSopStatus(
-      normalizeWorkflowStatus(versionRecord.status || versionRecord.metadata?.sopStatus)
-      || DEFAULT_SOP_VERSION_METADATA.sopStatus,
+      resolveSOPDisplayStatus({
+        externalStatus: versionRecord.status,
+        metadataJson: versionRecord.metadata,
+      }),
     )
     setAuditTrail(versionRecord.metadata?.auditTrail || [])
     setVersionNote(versionRecord.metadata?.versionNote || '')
-    editor.commands.setContent(versionRecord.json || EMPTY_DOC, false)
+
+    const incomingJson = versionRecord.json || EMPTY_DOC
+    const editorHasContent = !isEditorContentEmpty(editor.getJSON())
+    if (!isEditorContentEmpty(incomingJson) || !editorHasContent) {
+      applyTipTapContentToEditor(editor, {
+        docJson: incomingJson,
+        html: htmlFallback,
+      })
+    }
 
     window.setTimeout(() => {
       hydrationRef.current = false
@@ -410,6 +443,8 @@ const EditorPage = ({
   const hydrateFromDocument = useCallback(async (docId) => {
     if (!docId || !editor || !isEditorMounted || editor.isDestroyed) return
 
+    const seq = hydrateSeqRef.current + 1
+    hydrateSeqRef.current = seq
     setIsLoadingDocument(true)
 
     try {
@@ -417,6 +452,7 @@ const EditorPage = ({
         getDocument(docId),
         getVersions(docId),
       ])
+      if (seq !== hydrateSeqRef.current) return
       console.debug('[SOP Open] hydrateFromDocument response', {
         requestedDocId: docId,
         returnedDocId: doc?.id,
@@ -459,15 +495,100 @@ const EditorPage = ({
       setCompareBaseVersionId(normalizedCurrent.id)
       setCompareTargetVersionId(normalizedCurrent.id)
       applyVersionState(normalizedCurrent, doc.title || '')
-      
+
       // CRITICAL: Always use the UUID from the backend for subsequent API calls (like Related Context)
       if (doc.id) {
         setDocumentId(doc.id)
       }
     } finally {
+      if (seq === hydrateSeqRef.current) {
+        pendingInitialHydrationRef.current = false
+      }
       setIsLoadingDocument(false)
     }
   }, [editor, applyVersionState, isEditorMounted])
+
+  useEffect(() => {
+    if (!editor || !isEditorMounted || editor.isDestroyed || !initialDocId) return
+    if (!initialDocJson || !pendingInitialHydrationRef.current) return
+    hydrationRef.current = true
+    applyTipTapContentToEditor(editor, { docJson: initialDocJson })
+    window.setTimeout(() => {
+      hydrationRef.current = false
+    }, 0)
+  }, [editor, isEditorMounted, initialDocId, initialDocJson])
+
+  useEffect(() => {
+    if (!documentId || !editor || !isEditorMounted || editor.isDestroyed) return undefined
+
+    let cancelled = false
+    let timerId = null
+
+    const pollBackgroundImport = async () => {
+      try {
+        const doc = await getDocument(documentId)
+        const job = doc?.metadata_json?._import_job
+        if (!job || typeof job !== 'object') return
+
+        const status = String(job.status || '').toLowerCase()
+        const contentReady = Boolean(job.doc_json_ready)
+          || status === 'rendering_ready'
+          || status === 'semantic_processing'
+          || status === 'indexing'
+          || status === 'completed'
+        if (contentReady && status !== 'failed') {
+          if (!cancelled) {
+            pendingInitialHydrationRef.current = true
+            await hydrateFromDocument(documentId)
+            if (status === 'completed') {
+              setImportNotice('')
+              return
+            }
+          }
+        }
+        if (status === 'completed') {
+          return
+        }
+        if (status === 'failed') {
+          if (!cancelled) {
+            setImportNotice(job.error || job.message || 'Background import failed.')
+          }
+          return
+        }
+
+        if (!cancelled) {
+          setImportNotice(
+            importStatusToModalMessage(status, job.message) || 'Processing import…',
+          )
+          pendingInitialHydrationRef.current = true
+        }
+        if (!cancelled) {
+          if (job.job_id) {
+            try {
+              await getImportJobStatus(job.job_id, {
+                versionId: doc?.version_id,
+                sopId: doc?.sop_id,
+              })
+            } catch {
+              // fall back to document metadata polling
+            }
+          }
+          timerId = window.setTimeout(pollBackgroundImport, 2000)
+        }
+      } catch (err) {
+        if (!cancelled) {
+          console.error('Import status poll failed:', err)
+          timerId = window.setTimeout(pollBackgroundImport, 3000)
+        }
+      }
+    }
+
+    pollBackgroundImport()
+    return () => {
+      cancelled = true
+      if (timerId) window.clearTimeout(timerId)
+    }
+  }, [documentId, editor, isEditorMounted, hydrateFromDocument])
 
   useEffect(() => {
     console.debug('[SOP Status Debug] final rendered status', {
@@ -587,11 +708,19 @@ const EditorPage = ({
   }, [editor, isEditorMounted, persistKlEditorContext])
 
   const persistDocument = useCallback(async ({ showSavingIndicator = true } = {}) => {
-    if (!editor || !isEditorMounted || editor.isDestroyed || isHistoricalView || hydrationRef.current) return
+    if (
+      !editor
+      || !isEditorMounted
+      || editor.isDestroyed
+      || isHistoricalView
+      || hydrationRef.current
+      || pendingInitialHydrationRef.current
+    ) return
     if (saveInFlightRef.current) return
 
     const currentJson = editor.getJSON()
     if (!documentId && !hasMeaningfulDraft(currentJson, metadata)) return
+    if (documentId && isEditorContentEmpty(currentJson)) return
 
     saveInFlightRef.current = true
     if (showSavingIndicator) {
@@ -671,7 +800,12 @@ const EditorPage = ({
     if (!editor || !isEditorMounted || editor.isDestroyed) return
 
     const handleUpdate = () => {
-      if (hydrationRef.current || isHistoricalView || aiPreviewSessionActive) return
+      if (
+        hydrationRef.current
+        || pendingInitialHydrationRef.current
+        || isHistoricalView
+        || aiPreviewSessionActive
+      ) return
       debouncedSave()
     }
 
@@ -684,7 +818,12 @@ const EditorPage = ({
   }, [editor, isEditorMounted, debouncedSave, isHistoricalView, aiPreviewSessionActive])
 
   useEffect(() => {
-    if (hydrationRef.current || isHistoricalView || aiPreviewSessionActive) return
+    if (
+      hydrationRef.current
+      || pendingInitialHydrationRef.current
+      || isHistoricalView
+      || aiPreviewSessionActive
+    ) return
     debouncedSave()
   }, [metadata, sopStatus, auditTrail, versionNote, debouncedSave, isHistoricalView, aiPreviewSessionActive])
 
@@ -888,7 +1027,10 @@ const EditorPage = ({
       console.debug('[OCR] metadata received', imported.metadata || imported.response?.sop_metadata || {})
       // Yield one frame so UI can paint loading state before heavy content insert.
       await new Promise((resolve) => window.requestAnimationFrame(resolve))
-      editor.commands.setContent(imported.docJson || imported.html, false)
+      applyTipTapContentToEditor(editor, {
+        docJson: imported.docJson,
+        html: imported.html,
+      })
 
       const ui = imported.metadata || {}
       if (ui && typeof ui === 'object') {

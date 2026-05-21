@@ -11,7 +11,7 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
-from app.models import ChatMessage, ChatSession
+from app.models import ChatMessage, ChatSession, SOP
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,38 @@ def _parse_session_uuid(raw: object) -> UUID | None:
         return UUID(str(raw).strip())
     except (ValueError, AttributeError, TypeError):
         return None
+
+
+def _sop_uuid_from_assistant_context(assistant_context: dict | None) -> UUID | None:
+    if not isinstance(assistant_context, dict):
+        return None
+    for key in ("active_sop_id", "current_document_id"):
+        raw = assistant_context.get(key)
+        if raw is not None and str(raw).strip():
+            parsed = _parse_session_uuid(raw)
+            if parsed is not None:
+                return parsed
+    snap = _sop_snapshot(assistant_context)
+    if snap and snap.get("sop_id"):
+        return _parse_session_uuid(snap["sop_id"])
+    return None
+
+
+def _find_active_session_for_sop(
+    db: Session,
+    *,
+    sop_id: UUID,
+    uid: UUID | None,
+) -> ChatSession | None:
+    q = db.query(ChatSession).filter(
+        ChatSession.sop_id == sop_id,
+        ChatSession.is_active == True,  # noqa: E712
+    )
+    if uid is not None:
+        q = q.filter(ChatSession.user_id == uid)
+    else:
+        q = q.filter(ChatSession.user_id.is_(None))
+    return q.order_by(ChatSession.updated_at.desc(), ChatSession.created_at.desc()).first()
 
 
 def _parse_user_uuid(user_id: str | None) -> UUID | None:
@@ -146,16 +178,38 @@ def persist_chat_query_exchange(
         title_hint = (question or "").strip().replace("\n", " ")[:MAX_TITLE] or "Chat"
         cat_filter = (str(category).strip()[:100] if category else None) or None
 
+        sop_id = _sop_uuid_from_assistant_context(assistant_context)
         sid = _parse_session_uuid(client_session_id)
         session_row = None
         reused = False
-        if sid is not None:
-            q = (
-                db.query(ChatSession)
-                .filter(
+
+        if sop_id is not None and not db.query(SOP.id).filter(SOP.id == sop_id).first():
+            sop_id = None
+
+        if sop_id is not None:
+            session_row = _find_active_session_for_sop(db, sop_id=sop_id, uid=uid)
+            if session_row is not None:
+                reused = True
+            elif sid is not None:
+                q = db.query(ChatSession).filter(
                     ChatSession.id == sid,
                     ChatSession.is_active == True,  # noqa: E712
                 )
+                if uid is not None:
+                    q = q.filter(ChatSession.user_id == uid)
+                else:
+                    q = q.filter(ChatSession.user_id.is_(None))
+                candidate = q.first()
+                if candidate is not None and (
+                    candidate.sop_id is None or candidate.sop_id == sop_id
+                ):
+                    candidate.sop_id = sop_id
+                    session_row = candidate
+                    reused = True
+        elif sid is not None:
+            q = db.query(ChatSession).filter(
+                ChatSession.id == sid,
+                ChatSession.is_active == True,  # noqa: E712
             )
             if uid is not None:
                 q = q.filter(ChatSession.user_id == uid)
@@ -168,6 +222,7 @@ def persist_chat_query_exchange(
         if session_row is None:
             session_row = ChatSession(
                 user_id=uid,
+                sop_id=sop_id,
                 title=title_hint,
                 collection_name=coll,
                 is_active=True,
@@ -175,17 +230,21 @@ def persist_chat_query_exchange(
             db.add(session_row)
             db.flush()
             logger.info(
-                "[chat-history-session-create] user_id=%s session_id=%s title=%s collection=%s",
+                "[chat-history-session-create] user_id=%s session_id=%s sop_id=%s title=%s collection=%s",
                 uid or "anon",
                 session_row.id,
+                sop_id or "none",
                 title_hint[:80],
                 coll,
             )
         else:
+            if sop_id is not None and session_row.sop_id is None:
+                session_row.sop_id = sop_id
             logger.info(
-                "[chat-history-session-reuse] user_id=%s session_id=%s reused=%s",
+                "[chat-history-session-reuse] user_id=%s session_id=%s sop_id=%s reused=%s",
                 uid or "anon",
                 session_row.id,
+                session_row.sop_id or "none",
                 reused,
             )
 
