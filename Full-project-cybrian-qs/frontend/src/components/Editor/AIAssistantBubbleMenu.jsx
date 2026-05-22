@@ -7,6 +7,7 @@ import { AI_ACTION_TRIGGERED_BY } from '../../utils/editorAiBridge'
 import AIComparisonModal from './AIComparisonModal'
 import './AIAssistantUI.css'
 import { formatAiSuggestionForUi } from '../../utils/aiOutputFormatter'
+import { resolveRewriteImproveTarget, runRewriteImproveWithInlinePreview } from '../../utils/editorInlineAiFlow'
 import {
   selectionLooksLikeFormattedAiReport,
   selectionMatchesLastAiSuggestion,
@@ -15,40 +16,12 @@ import {
   captureEditorSelectionForAction,
   inferSectionMetaForSelection,
 } from '../../utils/editScopeInference'
+import { buildPatchScopePayload } from '../../utils/tiptapScope'
+import { getFriendlyErrorMessage } from '../../utils/friendlyErrorMessage'
+import { useLanguage } from '../../context/LanguageContext'
 
 const buildStructuredSelectionText = (editor, from, to) =>
   editor.state.doc.textBetween(from, to, '\n').trim()
-
-const stripHtml = (value) =>
-  String(value || '')
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/p>/gi, '\n')
-    .replace(/<\/div>/gi, '\n')
-    .replace(/<[^>]+>/g, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim()
-
-const buildAcceptedContent = (aiResult, selectionMeta) => {
-  const action = String(aiResult?.action || '').toLowerCase()
-  const structured = aiResult?.structured_data || {}
-  const selectedFraction = Number(selectionMeta?.selectedFraction || 0)
-  const isPartialSelection = selectedFraction > 0 && selectedFraction < 0.6
-
-  // Partial-range edits should stay text-safe to avoid accidental document-wide
-  // structural rewrites when only a small snippet is selected.
-  if (isPartialSelection && (action === 'rewrite' || action === 'improve' || action === 'gap_check')) {
-    if (action === 'rewrite') {
-      return stripHtml(structured.rewritten_text || aiResult?.suggested_text)
-    }
-    if (action === 'improve') {
-      return stripHtml(structured.improved_text || structured.improved_version || aiResult?.suggested_text)
-    }
-    return stripHtml(structured.analysis || aiResult?.suggested_text)
-  }
-
-  // Full/large selections can preserve richer formatting output.
-  return aiResult?.suggested_text || ''
-}
 
 const isEditorViewReady = (editor) =>
   Boolean(editor && editor.view && editor.view.dom && !editor.isDestroyed)
@@ -116,9 +89,10 @@ function computeBubbleMenuPosition(editor, menuEl) {
 const ACTION_TEXT_WARNING_CHARS = 7000
 
 const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true, onPreviewSessionChange }) => {
+  const { language } = useLanguage()
   const [isAILoading, setIsAILoading] = useState(false)
-  const [aiResult, setAIResult] = useState(null)
-  const [isModalOpen, setIsModalOpen] = useState(false)
+  const [gapModalOpen, setGapModalOpen] = useState(false)
+  const [gapResult, setGapResult] = useState(null)
   const [menuPosition, setMenuPosition] = useState(null)
   const selectionRef = useRef(null)
   /** Range locked when an action starts (used for accept/reject). */
@@ -366,76 +340,106 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true, onPrevi
     notifyPreviewSession(true)
     setIsAILoading(true)
     try {
-      const result = await performAIAction({
-        action,
-        text: textForApi,
-        document_id: sopMetadata?.documentId || null,
-        section_id: `${savedSelection.from}-${savedSelection.to}`,
-        sop_title: sopMetadata?.title || 'Untitled SOP',
-        section_name: sectionName,
-        section_type: sectionType,
-        edit_scope: editScope,
-        client_structured_json: clientStructured,
-        sop_entity_id: sopMetadata?.sop_entity_id || null,
-        triggered_by: AI_ACTION_TRIGGERED_BY.EDITOR_BUBBLE,
-      })
+      if (action === 'rewrite' || action === 'improve') {
+        const target =
+          resolveRewriteImproveTarget(editor, { instruction: '' })
+          || {
+            from: savedSelection.from,
+            to: savedSelection.to,
+            text: textForApi,
+            isFullDoc: false,
+            sectionName,
+            sectionType,
+            selectedFraction: savedSelection.selectedFraction || 0.3,
+            editScope,
+          }
+        const requestId = `bubble-${Date.now().toString(36)}`
+        const { normalized } = await runRewriteImproveWithInlinePreview({
+          editor,
+          action,
+          requestId,
+          sopTitle: sopMetadata?.title || 'Untitled SOP',
+          documentId: sopMetadata?.documentId || sopMetadata?.sop_entity_id || null,
+          triggeredBy: AI_ACTION_TRIGGERED_BY.EDITOR_BUBBLE,
+          instruction: '',
+          target,
+        })
+        lastAiReplyRef.current = {
+          action,
+          structured: normalized.structured,
+          suggestedPlain: normalized.suggestedPlain,
+          originalText: normalized.originalText || structuredPayload,
+        }
+        lastMenuPositionRef.current = null
+        setMenuPosition(null)
+      } else if (action === 'gap_check') {
+        const contentJson = editor?.isDestroyed ? null : editor.getJSON()
+        const patchScope = buildPatchScopePayload(editor, {
+          from: savedSelection.from,
+          to: savedSelection.to,
+          text: textForApi,
+          contentJson,
+        })
+        const result = await performAIAction({
+          action,
+          text: textForApi,
+          document_id: sopMetadata?.documentId || null,
+          section_id: `${savedSelection.from}-${savedSelection.to}`,
+          sop_title: sopMetadata?.title || 'Untitled SOP',
+          section_name: sectionName,
+          section_type: sectionType,
+          edit_scope: editScope,
+          patch_node_ids: patchScope.patch_node_ids,
+          content_json: contentJson,
+          client_structured_json: clientStructured,
+          sop_entity_id: sopMetadata?.sop_entity_id || null,
+          triggered_by: AI_ACTION_TRIGGERED_BY.EDITOR_BUBBLE,
+        })
+        if (!result) return
 
-      const safeSuggestedText = formatAiSuggestionForUi({
-        action: result?.action || action,
-        suggestedText: result?.suggested_text,
-        structuredData: result?.structured_data,
-      })
+        const safeSuggestedText = formatAiSuggestionForUi({
+          action: result?.action || action,
+          suggestedText: result?.suggested_text,
+          structuredData: result?.structured_data,
+        })
 
-      lastAiReplyRef.current = {
-        action: result?.action || action,
-        structured: result?.structured_data || null,
-        suggestedPlain: stripHtml(safeSuggestedText),
-        originalText: result?.original_text || structuredPayload,
+        setGapResult({
+          ...result,
+          suggested_text: safeSuggestedText,
+          section_name: sectionName,
+        })
+        setGapModalOpen(true)
+        lastMenuPositionRef.current = null
+        setMenuPosition(null)
       }
-
-      setAIResult({
-        ...result,
-        suggested_text: safeSuggestedText,
-        section_name: sectionName,
-      })
-      setIsModalOpen(true)
-      lastMenuPositionRef.current = null
-      setMenuPosition(null)
     } catch (err) {
       pauseBubblePositioningRef.current = false
       notifyPreviewSession(false)
       console.error('AI action failed:', err)
-      const lines = [err.message || 'AI action failed. Please try again.']
-      if (err.validationOrParseError) {
-        lines.push('Technical detail (validation / parse):', err.validationOrParseError)
-      }
-      if (err.hint) {
-        lines.push('Hint:', err.hint)
-      }
-      alert(lines.join('\n\n'))
+      alert(getFriendlyErrorMessage(language))
     } finally {
       actionInFlightRef.current = false
       setIsAILoading(false)
     }
   }
 
-  const handleAccept = () => {
-    if (!aiResult) return
+  const handleGapAccept = () => {
+    if (!gapResult) return
     const range = actionRangeRef.current || selectionRef.current
     if (!range) return
-
-    const { from, to } = range
-    const acceptedContent = buildAcceptedContent(aiResult, selectionRef.current || range)
-    if (!acceptedContent) return
-    editor.chain().focus().insertContentAt({ from, to }, acceptedContent).run()
-
-    setIsModalOpen(false)
-    setAIResult(null)
+    const docEnd = editor.state.doc.content.size
+    const appendix = gapResult.suggested_text || ''
+    editor
+      .chain()
+      .focus()
+      .insertContentAt(docEnd, appendix, { updateSelection: false })
+      .run()
+    setGapModalOpen(false)
+    setGapResult(null)
     pauseBubblePositioningRef.current = false
     notifyPreviewSession(false)
     selectionRef.current = null
     actionRangeRef.current = null
-    lastAiReplyRef.current = null
   }
 
   const actionMenu = menuPosition ? (
@@ -495,24 +499,26 @@ const AIAssistantBubbleMenu = ({ editor, sopMetadata, isEditable = true, onPrevi
         ? createPortal(actionMenu, document.body)
         : actionMenu}
 
-      <AIComparisonModal
-        isOpen={isModalOpen}
-        onClose={() => {
-          pauseBubblePositioningRef.current = false
-          notifyPreviewSession(false)
-          setIsModalOpen(false)
-          setAIResult(null)
-          actionRangeRef.current = null
-        }}
-        action={aiResult?.action}
-        originalText={aiResult?.original_text}
-        suggestedText={aiResult?.suggested_text}
-        explanation={aiResult?.explanation}
-        structuredData={aiResult?.structured_data}
-        onAccept={handleAccept}
-        sectionName={aiResult?.section_name}
-        sopTitle={sopMetadata?.title}
-      />
+      {gapModalOpen ? (
+        <AIComparisonModal
+          isOpen={gapModalOpen}
+          onClose={() => {
+            pauseBubblePositioningRef.current = false
+            notifyPreviewSession(false)
+            setGapModalOpen(false)
+            setGapResult(null)
+            actionRangeRef.current = null
+          }}
+          action={gapResult?.action}
+          originalText={gapResult?.original_text}
+          suggestedText={gapResult?.suggested_text}
+          explanation={gapResult?.explanation}
+          structuredData={gapResult?.structured_data}
+          onAccept={handleGapAccept}
+          sectionName={gapResult?.section_name}
+          sopTitle={sopMetadata?.title}
+        />
+      ) : null}
     </>
   )
 }

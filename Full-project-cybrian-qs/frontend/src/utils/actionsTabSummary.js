@@ -1,6 +1,7 @@
 /**
  * Build sidebar summary for Actions-tab rewrite/improve results.
  */
+import { getAppLanguage, getFriendlyErrorMessage } from './friendlyErrorMessage'
 
 const stripHtml = (value) =>
   String(value || '')
@@ -19,7 +20,8 @@ export function looksLikeChatBriefing(text) {
   return hasSummaryDetails || hasPrescriptiveBrief
 }
 
-export function extractSuggestedPlainForInline(action, result) {
+export function extractSuggestedPlainForInline(action, result, language) {
+  const friendly = getFriendlyErrorMessage(language ?? getAppLanguage())
   const structured = result?.structured_data || {}
   const actionKey = String(action || '').toLowerCase()
 
@@ -41,15 +43,11 @@ export function extractSuggestedPlainForInline(action, result) {
   }
 
   if (!plain && looksLikeChatBriefing(result?.suggested_text || result?.explanation)) {
-    return {
-      plain: '',
-      error:
-        'The server returned a narrative briefing instead of editable SOP text. Ask to rewrite the section in chat while the SOP is open in the editor.',
-    }
+    return { plain: '', error: friendly }
   }
 
   if (!plain) {
-    return { plain: '', error: 'No rewrite text was returned. Try a shorter selection or check the LLM connection.' }
+    return { plain: '', error: friendly }
   }
 
   return { plain, error: null }

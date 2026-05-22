@@ -5,6 +5,7 @@ import {
   ExternalLink, Eye, FileText, Network, AlertTriangle, HelpCircle
 } from 'lucide-react'
 import { getKnowledgeStats, searchKnowledge } from '../api/editorApi'
+import { useLanguage } from '../context/LanguageContext'
 import './KnowledgePage.css'
 
 // ── Badge color mapping for result type ───────────────────────
@@ -90,6 +91,7 @@ function KnowledgeResultCard({ result, onOpen }) {
 // KnowledgePage
 // ═══════════════════════════════════════════════════════════════
 export default function KnowledgePage() {
+  const { friendlyError } = useLanguage()
   const navigate = useNavigate()
   const [query, setQuery] = useState('')
   const [loading, setLoading] = useState(false)
@@ -186,7 +188,7 @@ export default function KnowledgePage() {
       setResults([])
       setSummary({
         query: text || query,
-        text: "Fehler beim Laden der Suchergebnisse aus dem Backend.",
+        text: friendlyError,
         sources: [],
         timestamp: new Date()
       })

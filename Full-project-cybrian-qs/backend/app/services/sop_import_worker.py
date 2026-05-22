@@ -99,8 +99,14 @@ def build_import_job_payload(
     scanned_pdf: bool = False,
     error: str | None = None,
     semantic_error: str | None = None,
+    doc_json_ready: bool | None = None,
     extra: Dict[str, Any] | None = None,
 ) -> dict:
+    ready = (
+        doc_json_ready
+        if doc_json_ready is not None
+        else status in CONTENT_READY_STATUSES
+    )
     payload = {
         "job_id": job_id,
         "status": status,
@@ -109,6 +115,7 @@ def build_import_job_payload(
         "scanned_pdf": scanned_pdf,
         "error": error,
         "semantic_error": semantic_error,
+        "doc_json_ready": bool(ready),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     if extra:
@@ -188,6 +195,7 @@ def _update_job(
             scanned_pdf=scanned,
             error=error,
             semantic_error=resolved_semantic,
+            doc_json_ready=status in CONTENT_READY_STATUSES,
         ),
     )
     version.metadata_json = meta
@@ -215,9 +223,9 @@ def _update_job(
 
 SOP_IMPORT_STATUS_MESSAGES = {
     IMPORT_STATUS_UPLOADING: "Upload received. Processing in background…",
-    IMPORT_STATUS_QUEUED: "Queued for local Marker PDF extraction…",
-    IMPORT_STATUS_PROCESSING_MARKER: "Running local Marker PDF extraction…",
-    IMPORT_STATUS_CONVERTING_BLOCKS: "Converting Marker output to structured blocks…",
+    IMPORT_STATUS_QUEUED: "Queued for reading-order extraction…",
+    IMPORT_STATUS_PROCESSING_MARKER: "Extracting document structure…",
+    IMPORT_STATUS_CONVERTING_BLOCKS: "Extracting document structure in reading order…",
     IMPORT_STATUS_SAVING_EDITOR_CONTENT: "Saving structured content to the editor…",
     IMPORT_STATUS_RENDERING_READY: "Document ready in the editor.",
     IMPORT_STATUS_SEMANTIC: "Linking entities and building search index…",
@@ -286,63 +294,55 @@ def _extract_file(
     job_id: str | None = None,
     version: SOPVersion | None = None,
     db: Session | None = None,
-) -> Tuple[list, str, bool]:
-    """Run extraction; on_stage(status, message) for progress."""
-    name = (filename or "").lower()
-    scanned_pdf = False
+) -> Tuple[list, list, str, bool]:
+    """
+    Fast reading-order extraction (pdfplumber / fitz OCR / DOCX XML walk / TXT).
+    Returns (blocks, elements, text, scanned_pdf). No chunking or semantic work here.
+    """
+    from .document_extraction import apply_extraction_fields
+    from .sequential_import import EXTRACTION_ENGINE_SEQUENTIAL, extract_sequential_upload
 
-    if name.endswith(".pdf"):
-        from .document_extraction import apply_extraction_fields
-        from .local_marker_extractor import EXTRACTION_ENGINE
-        from .pdf_extractor import _pdf_is_scanned, extract_pdf_bytes_robust
+    on_stage(
+        IMPORT_STATUS_CONVERTING_BLOCKS,
+        "Extracting document structure in reading order…",
+    )
 
-        scanned_pdf = _pdf_is_scanned(raw)
+    if version is not None and db is not None:
+        apply_extraction_fields(
+            version,
+            job_id=job_id,
+            status=IMPORT_STATUS_CONVERTING_BLOCKS,
+            engine=EXTRACTION_ENGINE_SEQUENTIAL,
+            mark_started=True,
+        )
+        db.add(version)
+        db.commit()
 
-        if version is not None and db is not None:
+    elements, blocks, text, scanned_pdf = extract_sequential_upload(raw, filename)
+    text = strip_invalid_control_chars(text)
+
+    if version is not None and db is not None:
+        try:
             apply_extraction_fields(
                 version,
                 job_id=job_id,
-                status=IMPORT_STATUS_PROCESSING_MARKER,
-                engine=EXTRACTION_ENGINE,
-                mark_started=True,
+                status="completed",
+                engine=EXTRACTION_ENGINE_SEQUENTIAL,
+                mark_completed=True,
             )
             db.add(version)
             db.commit()
+        except Exception as exc:
+            logger.warning("[sop-import] sequential extraction persist skipped: %s", exc)
 
-        on_stage(
-            IMPORT_STATUS_PROCESSING_MARKER,
-            SOP_IMPORT_STATUS_MESSAGES[IMPORT_STATUS_PROCESSING_MARKER],
-        )
-
-        def _on_marker_phase(phase: str, message: str) -> None:
-            status = _MARKER_PHASE_TO_STATUS.get(phase, IMPORT_STATUS_PROCESSING_MARKER)
-            on_stage(status, message)
-
-        blocks, text = extract_pdf_bytes_robust(
-            raw,
-            job_id=job_id,
-            on_phase=_on_marker_phase,
-        )
-        text = strip_invalid_control_chars(text)
-        return blocks, text, scanned_pdf
-
-    if name.endswith(".docx"):
-        on_stage(IMPORT_STATUS_CONVERTING_BLOCKS, "Extracting DOCX structure…")
-        from .pdf_extractor import extract_docx_bytes
-
-        blocks, text = extract_docx_bytes(raw)
-        text = strip_invalid_control_chars(text)
-        return blocks, text, False
-
-    if name.endswith(".txt"):
-        on_stage(IMPORT_STATUS_CONVERTING_BLOCKS, "Parsing text file…")
-        from .document_structure import structure_blocks_from_text
-
-        text = strip_invalid_control_chars(raw.decode("utf-8", errors="replace"))
-        blocks = structure_blocks_from_text(text)
-        return blocks, text, False
-
-    raise ValueError("Unsupported file type")
+    logger.info(
+        "[sop-import] sequential extract done elements=%s blocks=%s chars=%s scanned=%s",
+        len(elements),
+        len(blocks),
+        len(text or ""),
+        scanned_pdf,
+    )
+    return blocks, elements, text, scanned_pdf
 
 
 def _apply_extracted_identity(
@@ -383,7 +383,7 @@ def _apply_extracted_identity(
             sop.sop_number = extracted_id
             document_id = extracted_id
     elif is_generated_import_sop_number(sop.sop_number):
-        document_id = sop.sop_number
+        document_id = ""
     else:
         document_id = sop.sop_number
 
@@ -399,11 +399,25 @@ def _save_extracted_sop_content(
     job_id: str,
     filename: str,
     blocks: list,
+    elements: list | None = None,
     text: str,
     scanned_pdf: bool,
     sop_ui: dict,
 ) -> None:
-    doc_json = map_blocks_to_tiptap_doc(blocks, text)
+    content_source = elements if elements else blocks
+    from ..utils.tiptap_builder import sanitize_tiptap_doc
+
+    doc_json = map_blocks_to_tiptap_doc(content_source, text)
+    doc_json, sanitize_stats = sanitize_tiptap_doc(
+        doc_json,
+        source="sop_import_save",
+    )
+    if any(sanitize_stats.values()):
+        logger.info(
+            "[sop-import] tiptap sanitized job_id=%s stats=%s",
+            job_id,
+            sanitize_stats,
+        )
     fallback_title = Path(filename).stem or "Imported SOP"
     document_id, resolved_title = _apply_extracted_identity(
         db,
@@ -460,6 +474,8 @@ def _save_extracted_sop_content(
         meta["sopStatus"] = meta.get("sopStatus") or "draft"
 
     meta["sopMetadata"] = sm
+    if elements:
+        meta["_import_elements"] = elements
 
     version.content_json = doc_json
     version.metadata_json = meta
@@ -519,7 +535,7 @@ def _run_import_job(
         db.expire_all()
         sop, version = _load_import_entities(db, sop_id, version_id)
 
-        blocks, text, scanned_pdf = _extract_file(
+        blocks, elements, text, scanned_pdf = _extract_file(
             raw,
             filename,
             on_stage,
@@ -527,34 +543,8 @@ def _run_import_job(
             version=version,
             db=db,
         )
-        if not (text or "").strip() and not blocks:
+        if not (text or "").strip() and not blocks and not elements:
             raise ValueError("No text content could be extracted from the file.")
-
-        if version and filename.lower().endswith(".pdf"):
-            try:
-                from .document_extraction import apply_extraction_fields
-                from .local_marker_extractor import (
-                    EXTRACTION_ENGINE,
-                    cache_key_for_pdf,
-                    load_cached_marker_result,
-                )
-
-                cache_key = cache_key_for_pdf(raw, scanned=scanned_pdf)
-                cached = load_cached_marker_result(cache_key)
-                apply_extraction_fields(
-                    version,
-                    job_id=job_id,
-                    status="completed",
-                    engine=EXTRACTION_ENGINE,
-                    cache_key=cache_key,
-                    markdown=cached.markdown if cached else text,
-                    meta_json=cached.metadata if cached else None,
-                    mark_completed=True,
-                )
-                db.add(version)
-                db.commit()
-            except Exception as exc:
-                logger.warning("[sop-import] extraction persist skipped: %s", exc)
 
         from .document_structure import enrich_metadata_text
 
@@ -590,6 +580,7 @@ def _run_import_job(
             job_id=job_id,
             filename=filename,
             blocks=blocks,
+            elements=elements,
             text=text,
             scanned_pdf=scanned_pdf,
             sop_ui=sop_ui,
@@ -639,7 +630,7 @@ def _run_import_job(
                     version_fail,
                     job_id=job_id,
                     status="failed",
-                    engine="local_marker",
+                    engine="sequential",
                     error=str(exc)[:500],
                     mark_completed=True,
                 )

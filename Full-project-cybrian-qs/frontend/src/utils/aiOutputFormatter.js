@@ -119,8 +119,16 @@ export const sanitizeRenderedHtml = (html = '') => {
 
 export const formatAiSuggestionForUi = ({ action, suggestedText, structuredData }) => {
   const normalizedAction = String(action || '').toLowerCase()
-  const fallbackRaw = ensureString(suggestedText)
-  const gapRaw = normalizedAction === 'gap_check' ? ensureString(structuredData?.analysis || fallbackRaw) : fallbackRaw
+  const structured = structuredData && typeof structuredData === 'object' ? structuredData : {}
+  let previewSource = ensureString(suggestedText)
+  if (normalizedAction === 'rewrite' && structured.rewritten_text) {
+    previewSource = ensureString(structured.rewritten_text)
+  } else if (normalizedAction === 'improve') {
+    previewSource = ensureString(structured.improved_text || structured.improved_version || previewSource)
+  }
+  const gapRaw = normalizedAction === 'gap_check'
+    ? ensureString(structured.analysis || previewSource)
+    : previewSource
 
   const asHtml =
     /<\/?[a-z][\s\S]*>/i.test(gapRaw)

@@ -33,10 +33,23 @@ import {
   planEditorActionExecution,
 } from '../../utils/assistantIntentRouter'
 import EditorChatActions from './EditorChatActions'
-import { dispatchActionsTabRun } from '../../utils/editorActionsBridge'
-import { runEditorGapCheck } from '../../utils/editorGapCheck'
-import { buildGapCheckSidebarReport } from '../../utils/actionsTabGapReport'
+import ChatActionPreview from './ChatActionPreview'
+import {
+  applyEditorInlineSuggestion,
+  clearEditorInlineSuggestion,
+} from '../../utils/editorActionsBridge'
+import { INLINE_APPLIED_EVENT } from '../../utils/editorInlineAiFlow'
+import { useLanguage } from '../../context/LanguageContext'
+import { getAppLanguage, getFriendlyErrorMessage } from '../../utils/friendlyErrorMessage'
 import './DashboardComponents.css'
+
+const REWRITE_IMPROVE_ACTIONS = new Set([EDITOR_AI_ACTIONS.REWRITE, EDITOR_AI_ACTIONS.IMPROVE])
+
+function actionPreviewIntro(action, sectionName = '') {
+  const label = action === EDITOR_AI_ACTIONS.IMPROVE ? 'improvement' : 'rewrite'
+  const scope = sectionName ? ` for “${sectionName}”` : ''
+  return `Suggested ${label}${scope}. Review below and choose Accept or Reject.`
+}
 
 resetAssistantStateOnce()
 
@@ -83,6 +96,9 @@ const AIWidgetMessageList = memo(function AIWidgetMessageList({
   messagesScrollRef,
   chatEndRef,
   onCreateSop,
+  onAcceptActionPreview,
+  onRejectActionPreview,
+  previewBusyRequestId,
 }) {
   return (
     <div className="ai-messages-section" ref={messagesScrollRef}>
@@ -94,7 +110,19 @@ const AIWidgetMessageList = memo(function AIWidgetMessageList({
           {idx === 0 && String(m.id).startsWith('greeting') ? (
             <p className="ai-greeting-text">{m.text}</p>
           ) : (
-            <div className="ai-message-content" dangerouslySetInnerHTML={{ __html: toHtml(m.text) }} />
+            <>
+              <div className="ai-message-content" dangerouslySetInnerHTML={{ __html: toHtml(m.text) }} />
+              {m.actionPreview?.status === 'pending' ? (
+                <ChatActionPreview
+                  action={m.actionPreview.action}
+                  sectionName={m.actionPreview.sectionName}
+                  previewHtml={m.actionPreview.previewHtml}
+                  disabled={previewBusyRequestId === m.actionPreview.requestId}
+                  onAccept={() => onAcceptActionPreview?.(m.actionPreview.requestId, m.id)}
+                  onReject={() => onRejectActionPreview?.(m.actionPreview.requestId, m.id)}
+                />
+              ) : null}
+            </>
           )}
           {m.tags && m.tags.length > 0 && (
             <div className="ai-message-tags">
@@ -197,6 +225,7 @@ const AIWidgetComposeFooter = memo(function AIWidgetComposeFooter({
 })
 
 function AIWidget() {
+  const { language, friendlyError } = useLanguage()
   const location = useLocation()
   const navigate = useNavigate()
   const routeMeta = getAssistantRouteMeta(location.pathname)
@@ -205,6 +234,7 @@ function AIWidget() {
   const [sending, setSending] = useState(false)
   const [pendingDeleteAction, setPendingDeleteAction] = useState(null)
   const [actionToast, setActionToast] = useState('')
+  const [previewBusyRequestId, setPreviewBusyRequestId] = useState('')
   const chatEndRef = useRef(null)
   const messagesScrollRef = useRef(null)
   const messagesRef = useRef(messages)
@@ -364,6 +394,10 @@ function AIWidget() {
     loadChatHistory()
   }, [activeSopId, location.pathname, loadChatHistory])
 
+  const updateBridgeMessage = useCallback((messageId, patch) => {
+    setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, ...patch, time: nowTime() } : m)))
+  }, [])
+
   useEffect(() => {
     const pending = pendingBridgeRef.current
     const unsubscribe = subscribeEditorAiActionResult((detail) => {
@@ -372,38 +406,95 @@ function AIWidget() {
       const entry = pending.get(requestId)
       if (!entry) return
       console.info('[kl-editor-bridge-received]', { requestId, status: detail?.status, action: detail?.action })
+      const { messageId, action: entryAction } = entry
+      const action = detail?.action || entryAction
+      const status = detail?.status
+
+      if (
+        status === EDITOR_AI_ACTION_STATUS.DISPLAYED
+        && REWRITE_IMPROVE_ACTIONS.has(action)
+        && (detail.preview_excerpt || detail.preview)
+      ) {
+        pending.delete(requestId)
+        updateBridgeMessage(messageId, {
+          text: actionPreviewIntro(action, detail.section_name),
+          isError: false,
+          _pendingBridge: false,
+          actionPreview: {
+            status: 'pending',
+            requestId,
+            action,
+            sectionName: detail.section_name || '',
+            previewHtml: detail.preview_excerpt || detail.preview || '',
+          },
+        })
+        return
+      }
+
       pending.delete(requestId)
-      const statusText = describeEditorAiResult(detail)
-      const isError = detail?.status === EDITOR_AI_ACTION_STATUS.ERROR
-      setMessages((prev) => prev.map((m) => (
-        m.id === entry.messageId
-          ? { ...m, text: statusText, isError, _pendingBridge: false, time: nowTime() }
-          : m
-      )))
+      const statusText = describeEditorAiResult(detail, language)
+      const isError = status === EDITOR_AI_ACTION_STATUS.ERROR
+      updateBridgeMessage(messageId, {
+        text: statusText,
+        isError,
+        _pendingBridge: false,
+        actionPreview: undefined,
+      })
+      if (status === EDITOR_AI_ACTION_STATUS.APPLIED || status === EDITOR_AI_ACTION_STATUS.CANCELLED) {
+        setPreviewBusyRequestId('')
+      }
     })
     return () => {
       unsubscribe()
       pending.clear()
     }
+  }, [language, updateBridgeMessage])
+
+  useEffect(() => {
+    const onApplied = (event) => {
+      const { requestId, ok } = event.detail || {}
+      if (!requestId || ok) {
+        if (requestId) setPreviewBusyRequestId('')
+        return
+      }
+      setPreviewBusyRequestId('')
+      setMessages((prev) => prev.map((m) => {
+        if (m.actionPreview?.requestId !== requestId) return m
+        return {
+          ...m,
+          text: friendlyError,
+          isError: true,
+          actionPreview: undefined,
+          time: nowTime(),
+        }
+      }))
+    }
+    window.addEventListener(INLINE_APPLIED_EVENT, onApplied)
+    return () => window.removeEventListener(INLINE_APPLIED_EVENT, onApplied)
+  }, [friendlyError])
+
+  const handleAcceptActionPreview = useCallback((requestId) => {
+    if (!requestId) return
+    setPreviewBusyRequestId(requestId)
+    applyEditorInlineSuggestion(requestId)
   }, [])
 
-  const bridgeStatusText = (intent) => {
-    if (intent === EDITOR_AI_ACTIONS.REWRITE) {
-      return 'Rewrite wird im Editor vorbereitet. Prüfe die Inline-Vorschau und wähle Accept oder Reject unten.'
-    }
-    if (intent === EDITOR_AI_ACTIONS.IMPROVE) {
-      return 'Verbesserung wird im Editor vorbereitet. Prüfe die Inline-Vorschau und wähle Accept oder Reject unten.'
-    }
-    if (intent === EDITOR_AI_ACTIONS.GAP_CHECK) {
-      return 'Gap Check läuft…'
+  const handleRejectActionPreview = useCallback((requestId) => {
+    if (!requestId) return
+    clearEditorInlineSuggestion(requestId)
+  }, [])
+
+  const bridgeStatusText = (intent, phase = 'preparing') => {
+    if (phase === 'preparing') {
+      if (REWRITE_IMPROVE_ACTIONS.has(intent)) return 'Preparing preview…'
+      if (intent === EDITOR_AI_ACTIONS.GAP_CHECK) return 'Preparing gap check preview…'
+      if (intent === EDITOR_AI_ACTIONS.SUMMARIZE) return 'Preparing summary preview…'
+      return 'Preparing preview…'
     }
     if (intent === EDITOR_AI_ACTIONS.READ) return 'Bestätige aktive SOP im Editor…'
-    if (intent === EDITOR_AI_ACTIONS.SUMMARIZE) {
-      return 'Zusammenfassung wird als Inline-Vorschau im Editor vorbereitet. Prüfe Accept oder Reject unten.'
-    }
     if (intent === EDITOR_AI_ACTIONS.ANALYZE) return 'Analyse wird im Editor vorbereitet…'
     if (intent === EDITOR_AI_ACTIONS.COMPARE) return 'Versionsvergleich wird geöffnet…'
-    return 'Editor-Aktion wird vorbereitet…'
+    return 'Preparing preview…'
   }
 
   /**
@@ -414,79 +505,11 @@ function AIWidget() {
     const { explicitAction = null } = opts
     if (!hasActiveSopEditor(location.pathname)) return false
 
-    const plan = planEditorActionExecution(classification, { explicitAction })
+    const plan = planEditorActionExecution(classification, { explicitAction, message: text, fromChat: true })
     const intent = plan.intent
     if (!intent) return false
 
     const actionPrompt = buildEnrichedActionPrompt(text, classification)
-    const { sectionHint, targetScope } = plan.snapshotOptions
-
-    if (intent === EDITOR_AI_ACTIONS.GAP_CHECK) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `gap-pending-${Date.now()}`,
-          role: 'ai',
-          text: bridgeStatusText(intent),
-          tags: ['Gap Check'],
-          time: nowTime(),
-        },
-      ])
-      try {
-        const { result, target } = await runEditorGapCheck({ instruction: actionPrompt })
-          const report = buildGapCheckSidebarReport(result)
-          const parts = report.sections.map((s) => {
-            if (s.gapItems?.length) {
-              return `${s.title}\n${s.gapItems.map((g) => `- ${g.issue}${g.recommendation ? `\n  → ${g.recommendation}` : ''}`).join('\n')}`
-            }
-            return s.body ? `${s.title}\n${s.body}` : s.title
-          })
-          const plain = parts.filter(Boolean).join('\n\n') || report.analysisPlain
-        setMessages((prev) => [
-          ...prev.filter((m) => !String(m.id).startsWith('gap-pending-')),
-          {
-            id: `gap-chat-${Date.now()}`,
-            role: 'ai',
-            text: `Gap check — ${target.sectionName}${target.isFullDoc ? ' (full SOP)' : ''}\n\n${plain}`,
-            tags: ['Gap Check'],
-            time: nowTime(),
-          },
-        ])
-        return true
-      } catch (err) {
-        setMessages((prev) => [
-          ...prev.filter((m) => !String(m.id).startsWith('gap-pending-')),
-          {
-            id: `gap-err-${Date.now()}`,
-            role: 'ai',
-            text: err?.message || 'Gap check failed.',
-            isError: true,
-            time: nowTime(),
-          },
-        ])
-        return true
-      }
-    }
-
-    if (plan.useInline) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `editor-action-${Date.now()}`,
-          role: 'ai',
-          text: bridgeStatusText(plan.inlineAction || intent),
-          tags: [],
-          time: nowTime(),
-        },
-      ])
-      dispatchActionsTabRun({
-        action: plan.inlineAction || intent,
-        prompt: actionPrompt,
-        sectionHint,
-        targetScope,
-      })
-      return true
-    }
 
     if (!plan.useBridge) return false
 
@@ -509,7 +532,7 @@ function AIWidget() {
     const placeholderMsg = {
       id: placeholderId,
       role: 'ai',
-      text: bridgeStatusText(intent),
+      text: bridgeStatusText(intent, 'preparing'),
       tags: [],
       time: nowTime(),
       _pendingBridge: true,
@@ -521,8 +544,11 @@ function AIWidget() {
     dispatchEditorAiActionRequest({
       action: intent,
       prompt: actionPrompt,
+      userMessage: text,
       requestId,
       source: 'kl_assistant',
+      targetScope: plan.snapshotOptions?.targetScope || '',
+      sectionHint: plan.snapshotOptions?.sectionHint || '',
     })
 
     window.setTimeout(() => {
@@ -531,13 +557,13 @@ function AIWidget() {
       pendingBridgeRef.current.delete(requestId)
       setMessages((prev) => prev.map((m) => (
         m.id === stillPending.messageId
-          ? { ...m, text: 'Editor-Aktion hat zu lange gedauert. Bitte erneut versuchen.', isError: true, _pendingBridge: false }
+          ? { ...m, text: friendlyError, isError: true, _pendingBridge: false, actionPreview: undefined }
           : m
       )))
-    }, 360000)
+    }, 620000)
 
     return true
-  }, [location.pathname, setMessages])
+  }, [location.pathname, setMessages, friendlyError])
 
   const sendMessage = useCallback(async (text, opts = {}) => {
     const trimmed = text.trim()
@@ -665,7 +691,7 @@ function AIWidget() {
       const errMsg = {
         id: Date.now() + 1,
         role: 'ai',
-        text: `Fehler: ${err.message || 'Unbekannter Fehler'}`,
+        text: friendlyError,
         isError: true,
         time: nowTime(),
       }
@@ -779,6 +805,9 @@ function AIWidget() {
         messagesScrollRef={messagesScrollRef}
         chatEndRef={chatEndRef}
         onCreateSop={handleCreateSOP}
+        onAcceptActionPreview={handleAcceptActionPreview}
+        onRejectActionPreview={handleRejectActionPreview}
+        previewBusyRequestId={previewBusyRequestId}
       />
 
       <div className="ai-widget-bottom-stack">

@@ -2,8 +2,10 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import { AlertTriangle, ClipboardCheck, HelpCircle, Link, ShieldCheck } from 'lucide-react'
 
 import { getRelatedContext } from '../../../api/editorApi'
+import { useLanguage } from '../../../context/LanguageContext'
 
 const RelatedContextSidebar = ({ sopId, onLinkClick, refreshToken = 0 }) => {
+  const { friendlyError } = useLanguage()
   const [context, setContext] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -20,12 +22,13 @@ const RelatedContextSidebar = ({ sopId, onLinkClick, refreshToken = 0 }) => {
       const data = await getRelatedContext(sopId)
       setContext(data)
     } catch (err) {
+      console.error('Related context load failed:', err)
       setContext(null)
-      setError(err.message || 'Failed to load related context.')
+      setError(friendlyError)
     } finally {
       setLoading(false)
     }
-  }, [sopId])
+  }, [sopId, friendlyError])
 
   useEffect(() => {
     fetchContext()

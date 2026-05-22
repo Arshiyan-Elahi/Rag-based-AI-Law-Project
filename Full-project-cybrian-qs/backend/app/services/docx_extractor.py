@@ -167,3 +167,59 @@ def _blocks_to_plain_text(blocks: List[Dict[str, Any]]) -> str:
             if left and right:
                 parts.append(f"{left}: {right}")
     return "\n\n".join(parts).strip()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Sequential Elements Extraction — unified format for instant frontend loading
+# ──────────────────────────────────────────────────────────────────────────────
+
+def extract_docx_elements(docx_bytes: bytes) -> List[Dict[str, Any]]:
+    """
+    Extract DOCX in perfect reading order using pre-mapped XML element references.
+
+    Pre-builds two O(1) lookup dicts before the body walk:
+      p_map   : {paragraph._p  → Paragraph}  — avoids repeated python-docx wrapping
+      tbl_map : {table._tbl    → Table}
+
+    This sidesteps the O(N²) performance cliff caused by python-docx re-wrapping
+    XML nodes on every access when iterating large documents sequentially.
+
+    Returns unified elements list:
+      {"type": "text",  "style": "heading"|"paragraph", "content": "<str>"}
+      {"type": "table", "content": [["H1","H2"], ["R1C1","R1C2"]]}
+    """
+    document = Document(BytesIO(docx_bytes))
+
+    # Pre-map native XML → python-docx wrappers for O(1) per child
+    p_map: Dict[Any, Paragraph] = {p._p: p for p in document.paragraphs}  # noqa: SLF001
+    tbl_map: Dict[Any, Table] = {t._tbl: t for t in document.tables}  # noqa: SLF001
+
+    elements: List[Dict[str, Any]] = []
+
+    for child in document.element.body.iterchildren():
+        tag = child.tag
+
+        if tag == qn("w:p"):
+            # Resolve via pre-map (O(1)); fall back to fresh wrap if not found
+            para: Paragraph = p_map.get(child) or Paragraph(child, document)
+            text = _clean_line(para.text)
+            if not text:
+                continue
+            level = _heading_level_from_style(para.style.name if para.style else "")
+            if level is not None:
+                elements.append({"type": "text", "style": "heading", "content": text})
+            else:
+                elements.append({"type": "text", "style": "paragraph", "content": text})
+
+        elif tag == qn("w:tbl"):
+            # Resolve via pre-map (O(1)); fall back to fresh wrap if not found
+            tbl: Table = tbl_map.get(child) or Table(child, document)
+            rows: List[List[str]] = []
+            for row in tbl.rows:
+                cells = [_clean_line(cell.text) for cell in row.cells]
+                if any(cells):
+                    rows.append(cells)
+            if rows:
+                elements.append({"type": "table", "content": rows})
+
+    return elements

@@ -1,14 +1,14 @@
 import React, { useCallback, useEffect, useRef, useState, memo } from 'react'
 import { useLocation } from 'react-router-dom'
 import { Check, X } from 'lucide-react'
-import { performAIAction } from '../../api/editorApi'
 import { selectionLooksLikeFormattedAiReport } from '../../utils/aiActionSelection'
 import { buildGapCheckSidebarReport } from '../../utils/actionsTabGapReport'
+import { normalizeAiActionResult } from '../../utils/editorAiActionShared'
 import {
-  buildAcceptedInsertContent,
-  buildInlineSuggestionHtml,
-  normalizeAiActionResult,
-} from '../../utils/editorAiActionShared'
+  INLINE_SHOWN_EVENT,
+  fetchRewriteImproveSuggestion,
+  presentInlineRewriteImproveSuggestion,
+} from '../../utils/editorInlineAiFlow'
 import { buildActionSummary } from '../../utils/actionsTabSummary'
 import {
   applyEditorInlineSuggestion,
@@ -16,7 +16,6 @@ import {
   clearEditorInlineSuggestion,
   requestEditorSnapshot,
   scrollEditorToRange,
-  showEditorInlineSuggestion,
   subscribeActionsTabRun,
 } from '../../utils/editorActionsBridge'
 import {
@@ -25,12 +24,12 @@ import {
   hasActiveSopEditor,
 } from '../../utils/editorAiBridge'
 import { inferEditScope } from '../../utils/editScopeInference'
-import { wantsFullSopIntent } from '../../utils/sopActionIntent'
 import { runEditorGapCheck } from '../../utils/editorGapCheck'
 import { sanitizeRenderedHtml } from '../../utils/aiOutputFormatter'
+import { useLanguage } from '../../context/LanguageContext'
+import { getFriendlyErrorMessage } from '../../utils/friendlyErrorMessage'
 
 const ACTION_TEXT_WARNING_CHARS = 7000
-const INLINE_SHOWN_EVENT = 'editor-actions-inline-shown'
 const INLINE_APPLIED_EVENT = 'editor-actions-inline-applied'
 
 /**
@@ -38,6 +37,7 @@ const INLINE_APPLIED_EVENT = 'editor-actions-inline-applied'
  * shows accept/reject review UI inside the KI Assistant chat panel.
  */
 function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
+  const { language } = useLanguage()
   const location = useLocation()
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -107,77 +107,45 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
           ? 1
           : 0.3
 
-    const result = await performAIAction({
-      action,
+    const scopeTarget = {
+      from: target.from,
+      to: target.to,
       text: target.text,
-      document_id: documentId,
-      section_id: `${target.from}-${target.to}`,
-      sop_title: snapshot.sopTitle || 'Untitled SOP',
-      section_name: target.sectionName || 'Selected text',
-      section_type: target.isFullDoc || wantsFullSopIntent(instruction)
-        ? 'Full Document'
-        : target.sectionType || 'Paragraph',
-      edit_scope: target.isFullDoc || wantsFullSopIntent(instruction)
+      isFullDoc: Boolean(target.isFullDoc),
+      sectionName: target.sectionName || 'Selected text',
+      sectionType: target.sectionType || 'Paragraph',
+      selectedFraction,
+      editScope: target.isFullDoc
         ? 'full_document'
-        : inferEditScope({
-            text: target.text,
-            from: target.from,
-            to: target.to,
-            docSize: snapshot.docSize || target.to,
-            instruction,
-          }),
-      sop_entity_id: documentId,
-      triggered_by: AI_ACTION_TRIGGERED_BY.EDITOR_BUBBLE,
-      assistant_instruction: instruction || null,
-    })
-
-    const normalized = normalizeAiActionResult(action, result)
-    if (!normalized.suggestedPlain) {
-      throw new Error('No suggestion returned.')
+        : inferEditScope({ text: target.text, instruction }),
     }
 
-    const acceptedContent = buildAcceptedInsertContent(normalized.raw, {
-      selectedFraction,
-      isFullDoc: Boolean(target.isFullDoc),
-    })
-    const inlineHtml = buildInlineSuggestionHtml(normalized)
     const requestId = `actions-${Date.now().toString(36)}`
+    const { result, normalized } = await fetchRewriteImproveSuggestion({
+      action,
+      target: scopeTarget,
+      contentJson: snapshot.contentJson || null,
+      sopTitle: snapshot.sopTitle || 'Untitled SOP',
+      documentId,
+      triggeredBy: AI_ACTION_TRIGGERED_BY.ACTIONS_TAB,
+      instruction,
+    })
 
-    await new Promise((resolve, reject) => {
-      const timer = window.setTimeout(() => {
-        window.removeEventListener(INLINE_SHOWN_EVENT, onShow)
-        reject(new Error('Could not show inline suggestion at the target location.'))
-      }, 12000)
-
-      const onShow = (event) => {
-        if (event.detail?.requestId !== requestId) return
-        window.clearTimeout(timer)
-        window.removeEventListener(INLINE_SHOWN_EVENT, onShow)
-        resolve(event.detail || {})
-      }
-      window.addEventListener(INLINE_SHOWN_EVENT, onShow)
-      showEditorInlineSuggestion({
-        requestId,
-        from: target.from,
-        to: target.to,
-        originalText: target.text,
-        suggestedPlain: normalized.suggestedPlain,
-        suggestedHtml: inlineHtml,
-        structuredData: normalized.structured,
-        action,
-        isFullDoc: Boolean(target.isFullDoc),
-        acceptedContent,
-        selectedFraction,
-      })
+    await presentInlineRewriteImproveSuggestion({
+      requestId,
+      target: scopeTarget,
+      normalized,
+      action,
     })
 
     setPending({
       requestId,
       action,
-      sectionName: target.sectionName,
-      isFullDoc: Boolean(target.isFullDoc),
+      sectionName: scopeTarget.sectionName,
+      isFullDoc: scopeTarget.isFullDoc,
       summarySections: buildActionSummary(action, result),
-      previewHtml: inlineHtml,
+      previewHtml: normalized.suggestedHtml,
+      suggestedContentJson: normalized.suggestedContentJson,
       range: { from: target.from, to: target.to },
     })
   }, [])
@@ -222,7 +190,8 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
       }
       onRunComplete?.(action, instruction)
     } catch (err) {
-      const msg = err?.message || 'Action failed.'
+      console.error('[editor-chat-actions] action failed', err)
+      const msg = getFriendlyErrorMessage(language)
       setError(msg)
       clearPending()
       onRunError?.(msg)
@@ -281,7 +250,8 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
       const { requestId, ok, message } = event.detail || {}
       if (!pendingRef.current || pendingRef.current.requestId !== requestId) return
       if (!ok) {
-        setError(message || 'Could not apply suggestion.')
+        console.error('[editor-chat-actions] inline apply failed', message)
+        setError(getFriendlyErrorMessage(language))
         return
       }
       setPending(null)

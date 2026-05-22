@@ -526,3 +526,209 @@ def extract_docx_bytes(docx_bytes: bytes) -> Tuple[List[Dict[str, Any]], str]:
     from .docx_extractor import extract_docx_bytes as extract_docx_structured
 
     return extract_docx_structured(docx_bytes)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Sequential Elements Extraction — unified format for instant frontend loading
+# Each element: {"type": "text", "style": "heading"|"paragraph", "content": str}
+#           or: {"type": "table", "content": [[row1col1, row1col2, ...], ...]}
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _extract_elements_fitz_ocr(file_bytes: bytes) -> List[Dict[str, Any]]:
+    """
+    Scanned PDF path: fitz (PyMuPDF) get_textpage_ocr with whitespace preservation.
+    Falls back to pytesseract if fitz is unavailable.
+    """
+    elements: List[Dict[str, Any]] = []
+    try:
+        import fitz  # type: ignore  # PyMuPDF
+
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        for page_idx, page in enumerate(doc, start=1):
+            try:
+                # Preferred: fast native OCR with layout preservation
+                tp = page.get_textpage_ocr(
+                    flags=fitz.TEXT_PRESERVE_WHITESPACE, full=True
+                )
+                raw_text: str = tp.extractTEXT()
+            except Exception:
+                raw_text = page.get_text("text") or ""
+
+            if not raw_text.strip():
+                continue
+
+            # Split on blank lines → candidate paragraphs
+            for raw_para in re.split(r"\n\s*\n", raw_text):
+                para = _clean_line(raw_para.strip())
+                if not para:
+                    continue
+                style = "heading" if _is_likely_heading(para) else "paragraph"
+                elements.append({"type": "text", "style": style, "content": para})
+
+        doc.close()
+
+    except ImportError:
+        logger.warning(
+            "fitz (PyMuPDF) not installed; falling back to pytesseract for scanned PDF."
+        )
+        if HAS_OCR_DEPS:
+            # Best-effort: run OCR on page 1 only (fast preview)
+            ocr_lines = _run_ocr_lines_on_page(file_bytes, 1)
+            for line in ocr_lines:
+                clean = _clean_line(line)
+                if clean:
+                    style = "heading" if _is_likely_heading(clean) else "paragraph"
+                    elements.append({"type": "text", "style": style, "content": clean})
+    except Exception as exc:
+        logger.exception("[sequential-extract] fitz OCR extraction failed: %s", exc)
+
+    return elements
+
+
+def _extract_elements_pdfplumber(file_bytes: bytes) -> List[Dict[str, Any]]:
+    """
+    Digital PDF path: pdfplumber word-level extraction with table-bbox word filtering.
+
+    Algorithm per page:
+      1. Detect all tables; collect their bounding boxes.
+      2. Extract every word via extract_words(); discard any word whose bbox
+         overlaps a table bbox (prevents text-duplication / bleeding).
+      3. Quantise word tops into 3-pt buckets → reconstruct text lines.
+      4. Build a sorted event list (lines + table anchors) by vertical position.
+      5. Walk events in order, accumulating lines into paragraphs and flushing
+         when a table interrupts or a vertical gap > threshold is detected.
+    """
+    elements: List[Dict[str, Any]] = []
+    _LINE_Y_TOLERANCE: float = 3.0   # points: words ≤3 pt apart share a line
+    _PARA_GAP_THRESHOLD: float = 14.0  # points: gap > this → new paragraph
+
+    try:
+        with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+            for page in pdf.pages:
+                # ── 1. Detect tables ──────────────────────────────────────────
+                table_finders: List[Any] = []
+                try:
+                    table_finders = list(page.find_tables() or [])
+                except Exception:
+                    pass
+                table_finders.sort(key=lambda t: float(t.bbox[1]))
+                table_bboxes: List[Tuple[float, float, float, float]] = [
+                    (
+                        float(t.bbox[0]),
+                        float(t.bbox[1]),
+                        float(t.bbox[2]),
+                        float(t.bbox[3]),
+                    )
+                    for t in table_finders
+                ]
+
+                # ── 2. Extract words, filter those inside table bboxes ────────
+                try:
+                    all_words = page.extract_words(x_tolerance=3, y_tolerance=3) or []
+                except Exception:
+                    all_words = []
+
+                def _word_in_table(w: Dict[str, Any]) -> bool:
+                    wx0 = float(w["x0"])
+                    wtop = float(w["top"])
+                    wx1 = float(w["x1"])
+                    wbot = float(w["bottom"])
+                    for tx0, ttop, tx1, tbot in table_bboxes:
+                        # 2-pt tolerance on all edges
+                        if (
+                            wx0 >= tx0 - 2
+                            and wx1 <= tx1 + 2
+                            and wtop >= ttop - 2
+                            and wbot <= tbot + 2
+                        ):
+                            return True
+                    return False
+
+                text_words = [w for w in all_words if not _word_in_table(w)]
+
+                # ── 3. Group words into lines via y-bucket ────────────────────
+                from collections import defaultdict
+
+                buckets: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+                for word in text_words:
+                    bucket = int(
+                        round(float(word["top"]) / _LINE_Y_TOLERANCE) * _LINE_Y_TOLERANCE
+                    )
+                    buckets[bucket].append(word)
+
+                lines_data: List[Tuple[float, str]] = []
+                for bucket_top in sorted(buckets.keys()):
+                    words_in_line = sorted(
+                        buckets[bucket_top], key=lambda w: float(w["x0"])
+                    )
+                    line_text = " ".join(w["text"] for w in words_in_line).strip()
+                    if line_text:
+                        lines_data.append((float(bucket_top), line_text))
+
+                # ── 4. Build sorted event list (lines + table anchors) ────────
+                events: List[Tuple[float, str, Any]] = []
+                for top, line in lines_data:
+                    events.append((top, "line", line))
+                for tbl in table_finders:
+                    events.append((float(tbl.bbox[1]), "table", tbl))
+                events.sort(key=lambda e: e[0])
+
+                # ── 5. Walk events in reading order ───────────────────────────
+                para_buffer: List[str] = []
+                last_line_top: float | None = None
+
+                def _flush_para() -> None:
+                    if not para_buffer:
+                        return
+                    joined = _clean_line(" ".join(para_buffer))
+                    if joined:
+                        style = "heading" if _is_likely_heading(joined) else "paragraph"
+                        elements.append(
+                            {"type": "text", "style": style, "content": joined}
+                        )
+                    para_buffer.clear()
+
+                for top, kind, obj in events:
+                    if kind == "table":
+                        _flush_para()
+                        last_line_top = None
+                        rows = _table_rows_from_finder(obj)
+                        if rows:
+                            elements.append({"type": "table", "content": rows})
+                    else:  # "line"
+                        if (
+                            last_line_top is not None
+                            and (top - last_line_top) > _PARA_GAP_THRESHOLD
+                        ):
+                            _flush_para()
+                        para_buffer.append(obj)
+                        last_line_top = top
+
+                _flush_para()
+
+    except Exception as exc:
+        logger.exception("[sequential-extract] pdfplumber extraction failed: %s", exc)
+
+    return elements
+
+
+def extract_sequential_elements(file_bytes: bytes) -> List[Dict[str, Any]]:
+    """
+    Public entry-point: ultra-fast, reading-order sequential content extractor.
+
+    Routes to the appropriate extractor based on whether the PDF has a native
+    text layer (digital) or is image-only (scanned/OCR path).
+
+    Returns a flat chronological list of elements ready for instant frontend
+    rendering — no chunking, no embedding, no DB writes occur here.
+
+    Element shapes:
+      {"type": "text",  "style": "heading"|"paragraph", "content": "<str>"}
+      {"type": "table", "content": [["Header1","Header2"], ["Row1C1","Row1C2"]]}
+    """
+    if not file_bytes:
+        return []
+
+    if _pdf_is_scanned(file_bytes):
+        return _extract_elements_fitz_ocr(file_bytes)
+    return _extract_elements_pdfplumber(file_bytes)

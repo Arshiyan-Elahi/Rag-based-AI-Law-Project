@@ -46,7 +46,17 @@ from action.utils import (
     truncate_prompt_for_llm,
 )
 from schemas.sop_actions import ActionRequest, GapCheckResponse, ImproveResponse, RewriteResponse
-from .schemas import AIActionRequest, AIActionResponse
+from .schemas import (
+    AIActionRequest,
+    AIActionResponse,
+    AIActionJobStartResponse,
+    AIActionJobStatusResponse,
+)
+from .services.ai_action_job import (
+    action_should_run_async,
+    build_job_status_response,
+    enqueue_ai_action_job,
+)
 from .database import SessionLocal
 from .auth_routes import get_current_user_optional
 from .models import (
@@ -1076,11 +1086,38 @@ def _response_looks_cut(text: str) -> bool:
     return s[-1].isalnum() and not s.endswith((".", "!", "?", "}", "]", '"'))
 
 
-def _call_action_llm(runtime: Any, prompt: str, *, input_char_budget: int = 0, action: str = "unknown") -> str:
+def _call_action_llm(
+    runtime: Any,
+    prompt: str,
+    *,
+    input_char_budget: int = 0,
+    action: str = "unknown",
+    soft_fail: bool = False,
+) -> str:
     base_n = _action_output_token_budget(input_char_budget) if input_char_budget else int(
         os.getenv("ACTION_LLM_MAX_TOKENS") or os.getenv("ACTION_MAX_OUTPUT_TOKENS") or "4096"
     )
-    if action == "rewrite" and input_char_budget:
+    if "tiptap_scope" in action:
+        try:
+            scope_cap = int(os.getenv("ACTION_TIPTAP_SCOPE_MAX_TOKENS", "8192"))
+        except (TypeError, ValueError):
+            scope_cap = 8192
+        if input_char_budget:
+            scaled = max(2048, int(input_char_budget * 2.0) + 1200)
+            base_n = min(scope_cap, scaled)
+        else:
+            base_n = min(scope_cap, 4096)
+    elif "tiptap_batch" in action or action.endswith("_tiptap"):
+        try:
+            patch_cap = int(os.getenv("ACTION_TIPTAP_PATCH_MAX_TOKENS", "4096"))
+        except (TypeError, ValueError):
+            patch_cap = 4096
+        if input_char_budget:
+            scaled = max(1024, int(input_char_budget * 1.2) + 800)
+            base_n = min(patch_cap, scaled)
+        else:
+            base_n = min(patch_cap, 2048)
+    elif action == "rewrite" and input_char_budget:
         configured_cap = int(
             os.getenv("ACTION_LLM_MAX_TOKENS")
             or os.getenv("ACTION_MAX_OUTPUT_TOKENS")
@@ -1197,6 +1234,13 @@ def _call_action_llm(runtime: Any, prompt: str, *, input_char_budget: int = 0, a
     finish_reason = str(last_meta.get("finish_reason") or "").lower()
     looks_cut = _response_looks_cut(out)
     if not (out or "").strip():
+        if soft_fail:
+            logger.warning(
+                "[ai-action-llm-soft] empty response action=%s finish_reason=%s",
+                action,
+                finish_reason or "unknown",
+            )
+            return ""
         raise HTTPException(
             status_code=422,
             detail={
@@ -1206,6 +1250,13 @@ def _call_action_llm(runtime: Any, prompt: str, *, input_char_budget: int = 0, a
             },
         )
     if finish_reason == "length" or (length_limited_seen and finish_reason == "length"):
+        if soft_fail:
+            logger.warning(
+                "[ai-action-llm-soft] truncated response action=%s output_chars=%s",
+                action,
+                len(out or ""),
+            )
+            return out or ""
         raise HTTPException(
             status_code=422,
             detail={
@@ -1215,6 +1266,13 @@ def _call_action_llm(runtime: Any, prompt: str, *, input_char_budget: int = 0, a
             },
         )
     if looks_cut and finish_reason not in ("stop", "end_turn", "end"):
+        if soft_fail:
+            logger.warning(
+                "[ai-action-llm-soft] response appears cut action=%s finish_reason=%s",
+                action,
+                finish_reason or "unknown",
+            )
+            return out or ""
         raise HTTPException(
             status_code=422,
             detail={
@@ -1275,17 +1333,10 @@ def _render_dynamic_gap_check(gaps: list[dict[str, str]]) -> str:
 
 
 def _infer_edit_scope_from_payload(payload: AIActionRequest) -> str | None:
+    if bool(getattr(payload, "full_sop_background", False)):
+        return "full_document"
     raw = str(getattr(payload, "edit_scope", None) or "").strip().lower()
-    st = str(payload.section_type or "").strip().lower()
-    name = str(payload.section_name or "").strip().lower()
-    if raw == "full_document" or st in ("full document", "full sop") or name in (
-        "full document",
-        "full sop",
-        "gesamte sop",
-        "komplette sop",
-        "entire sop",
-        "whole sop",
-    ):
+    if raw == "full_document":
         return "full_document"
     text = str(payload.text or "")
     if is_traceability_register_block(text):
@@ -1478,6 +1529,11 @@ def _load_uploaded_sop_context(request: ActionRequest) -> dict[str, Any]:
             legacy = meta.get("nlp_analysis") if isinstance(meta.get("nlp_analysis"), dict) else None
             stored_nlp = legacy
 
+        content_json = (
+            version.content_json
+            if version and isinstance(version.content_json, dict)
+            else None
+        )
         return {
             "detected": True,
             "sop_id": str(sop.id),
@@ -1485,6 +1541,7 @@ def _load_uploaded_sop_context(request: ActionRequest) -> dict[str, Any]:
             "title": sop.title,
             "version_id": str(version.id) if version else None,
             "text": sop_text or "",
+            "content_json": content_json,
             "nlp_analysis": stored_nlp,
             "version_metadata_compact": compact_vm,
             "version_metadata_keys": meta_keys,
@@ -1827,9 +1884,90 @@ def _rewrite_industry_scaffold_with_llm(runtime: Any, request: ActionRequest, sc
     return combined.strip(), True, None
 
 
+def _resolve_action_content_json(
+    payload: AIActionRequest,
+    sop_ctx: dict[str, Any],
+) -> dict | None:
+    """Prefer editor-supplied TipTap JSON; fall back to DB current version."""
+    raw = getattr(payload, "content_json", None)
+    if isinstance(raw, dict) and raw.get("type") == "doc":
+        return raw
+    db_doc = sop_ctx.get("content_json")
+    if isinstance(db_doc, dict) and db_doc.get("type") == "doc":
+        return db_doc
+    return None
+
+
+def _run_tiptap_structured_action_required(
+    payload: AIActionRequest,
+    action: str,
+    request: ActionRequest,
+    *,
+    runtime: Any,
+    context: str,
+    nlp_block: str,
+    style_profile: dict[str, Any],
+    nlp_summary: dict[str, Any],
+    ch_budget: int,
+    content_json: dict,
+) -> AIActionResponse:
+    """Batched TipTap patches only — never fall back to plain-text rewrite when content_json exists."""
+    from .services.tiptap_ai_action import run_tiptap_structured_action
+    from .utils.tiptap_ai_patch import TiptapStructureError
+
+    try:
+        return run_tiptap_structured_action(
+            payload=payload,
+            action=action,
+            request=request,
+            content_json=content_json,
+            context=context,
+            nlp_block=nlp_block,
+            style_profile=style_profile,
+            nlp_summary=nlp_summary,
+            call_llm=lambda prompt, **kw: _call_action_llm(
+                runtime,
+                prompt,
+                input_char_budget=kw.get("input_char_budget", ch_budget),
+                action=kw.get("action", action),
+                soft_fail=bool(kw.get("soft_fail", True)),
+            ),
+            ch_budget=ch_budget,
+        )
+    except HTTPException:
+        raise
+    except TiptapStructureError as exc:
+        logger.error("[ai-action] tiptap structured %s failed (no plain-text fallback): %s", action, exc)
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": (
+                    "Structure-preserving AI action failed. "
+                    "The document layout was not modified."
+                ),
+                "validation_or_parse_error": str(exc)[:500],
+                "hint": (
+                    "TipTap content_json is required; plain-text fallback is disabled. "
+                    "Retry with a smaller selection if the model times out."
+                ),
+            },
+        ) from exc
+    except Exception as exc:
+        logger.exception("[ai-action] tiptap structured %s error (no plain-text fallback)", action)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "Structure-preserving AI action failed unexpectedly.",
+                "validation_or_parse_error": f"{type(exc).__name__}: {exc!s}"[:500],
+            },
+        ) from exc
+
+
 def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionResponse:
     request = _build_action_request(payload)
-    if action == "rewrite" and _rewrite_should_use_industry_scaffold(request):
+    payload_doc = getattr(payload, "content_json", None)
+    has_editor_tiptap = isinstance(payload_doc, dict) and payload_doc.get("type") == "doc"
+    if action == "rewrite" and _rewrite_should_use_industry_scaffold(request) and not has_editor_tiptap:
         style_profile = _derive_sop_style_profile(request.section_text)
         scaffold = _build_industry_rewrite_text(request)
         runtime = _get_action_runtime()
@@ -1900,11 +2038,6 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
         style_profile.get("imperative_ratio"),
     )
 
-    bypass = _try_client_structured_ai_response(payload, action, request, style_profile)
-    if bypass is not None:
-        logger.info("[ai-action] using client_structured_json bypass action=%s", action)
-        return bypass
-
     _ensure_profile_detection_row(sop_ctx, action)
 
     nlp_bundle, nlp_block = build_nlp_bundle_for_action(action, request, sop_ctx, style_profile)
@@ -1932,6 +2065,30 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
         cfg.model,
         len(nlp_block or ""),
     )
+
+    content_json = _resolve_action_content_json(payload, sop_ctx)
+    if action in ("improve", "rewrite") and content_json:
+        logger.info(
+            "[ai-action] using batched TipTap patch path action=%s (plain-text fallback disabled)",
+            action,
+        )
+        return _run_tiptap_structured_action_required(
+            payload,
+            action,
+            request,
+            runtime=runtime,
+            context=context,
+            nlp_block=nlp_block,
+            style_profile=style_profile,
+            nlp_summary=nlp_summary,
+            ch_budget=ch_budget,
+            content_json=content_json,
+        )
+
+    bypass = _try_client_structured_ai_response(payload, action, request, style_profile)
+    if bypass is not None:
+        logger.info("[ai-action] using client_structured_json bypass action=%s", action)
+        return bypass
 
     if action == "improve":
         prompt = build_improve_prompt(request, context, nlp_block)
@@ -2034,7 +2191,7 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
         )
 
     if action == "rewrite":
-        if _rewrite_should_use_industry_scaffold(request):
+        if _rewrite_should_use_industry_scaffold(request) and not content_json:
             rewritten = _build_industry_rewrite_text(request)
             logger.info(
                 "[ai-action-result] action=rewrite ok=1 mode=industry_scaffold suggested_chars=%s",
@@ -2760,12 +2917,44 @@ def _execute_sop_action(
     return None
 
 
+@ai_router.post("/api/ai/action/jobs", response_model=AIActionJobStartResponse)
+async def start_ai_action_job(payload: AIActionRequest):
+    """Queue rewrite / improve / gap_check for background processing; poll GET /jobs/{job_id}."""
+    action = _normalize_action(payload.action)
+    if not action_should_run_async(action, payload):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Action '{action}' uses synchronous POST /api/ai/action unless "
+                "edit_scope is full_document with an explicit full-SOP request."
+            ),
+        )
+    raw_in = (payload.text or "").strip()
+    payload.text = normalize_action_input_text(payload.text)
+    if not payload.text:
+        raise HTTPException(status_code=422, detail="Selected text is required.")
+    job_id = enqueue_ai_action_job(payload, action)
+    return AIActionJobStartResponse(
+        job_id=job_id,
+        action=action,
+        status="queued",
+        message="Queued for processing…",
+    )
+
+
+@ai_router.get("/api/ai/action/jobs/{job_id}", response_model=AIActionJobStatusResponse)
+async def get_ai_action_job(job_id: str):
+    row = build_job_status_response(job_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="AI action job not found.")
+    return AIActionJobStatusResponse(**row)
+
+
 @ai_router.post("/api/ai/action", response_model=AIActionResponse)
 async def perform_ai_action(payload: AIActionRequest):
     """
-    Perform a structured AI action on selected SOP text.
-    The current implementation uses deterministic structured generation so the
-    frontend can reliably support compare-and-confirm workflows.
+    Perform a structured AI action on selected SOP text (synchronous response).
+    Rewrite, improve, and gap_check return suggested_content_json when TipTap JSON is supplied.
     """
     action = _normalize_action(payload.action)
     raw_in = (payload.text or "").strip()

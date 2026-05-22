@@ -28,7 +28,7 @@ const REQUIRED_FIELD_DEFS = [
     { key: 'docType', type: 'text', label: 'Document Type', aliases: ['doc_type', 'type', 'documentType'] },
     { key: 'category', type: 'text', label: 'Category' },
     { key: 'department', type: 'text', label: 'Department' },
-    { key: 'sopVersion', type: 'text', label: 'Document Revision', aliases: ['version', 'document_revision', 'revision'] },
+    { key: 'sopVersion', type: 'text', label: 'Document Version', aliases: ['version', 'document_revision', 'revision'] },
     { key: 'sopStatus', type: 'text', label: 'Status', source: 'status' },
     { key: 'author', type: 'text', label: 'Author' },
     { key: 'reviewer', type: 'text', label: 'Reviewer' },

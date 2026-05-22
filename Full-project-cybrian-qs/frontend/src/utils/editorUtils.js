@@ -40,6 +40,20 @@ export function extractTextFromNode(node) {
  * @param {object|null} tiptapJson - The result of editor.getJSON()
  * @returns {boolean} true if the document has no meaningful content
  */
+const IMPORT_PLACEHOLDER_SNIPPET =
+  'your document is being processed. content will appear here when extraction finishes'
+
+/**
+ * True when TipTap JSON is the async-import processing shell (not real document content).
+ * @param {object|null} tiptapJson
+ */
+export function isImportPlaceholderDoc(tiptapJson) {
+  if (!tiptapJson || typeof tiptapJson !== 'object') return false
+  const text = extractTextFromNode(tiptapJson).trim().toLowerCase()
+  if (!text) return false
+  return text.includes(IMPORT_PLACEHOLDER_SNIPPET)
+}
+
 export function isEditorContentEmpty(tiptapJson) {
   if (!tiptapJson || typeof tiptapJson !== 'object') return true
 
@@ -208,9 +222,24 @@ const tableBlockFromParagraphText = (text = '') => {
 }
 
 /**
- * Map backend PDF/OCR blocks to a TipTap-compatible doc JSON (StarterKit + table).
- * @param {Array<{type: string, text?: string, items?: string[], rows?: string[][]}>} blocks
- * @param {string} fallbackText
+ * Map backend PDF/OCR blocks — or the new unified sequential elements array —
+ * to a TipTap-compatible doc JSON (StarterKit + table extension).
+ *
+ * Accepts two formats transparently:
+ *
+ * NEW (sequential elements — preferred):
+ *   { type: 'text',  style: 'heading'|'paragraph', content: string }
+ *   { type: 'table', content: string[][] }          ← 2-D rows array
+ *
+ * LEGACY (typed blocks):
+ *   { type: 'section_heading'|'heading', text, level? }
+ *   { type: 'paragraph', text }
+ *   { type: 'table', rows: string[][] }
+ *   { type: 'bullet_list'|'numbered_list', items: string[] }
+ *   { type: 'two_column_row', left, right }
+ *
+ * @param {Array<object>} blocks  Elements or legacy blocks from the backend
+ * @param {string}        fallbackText  Plain text rendered when blocks are empty
  * @returns {{ type: 'doc', content: object[] }}
  */
 export function mapBlocksToTipTapDoc(blocks, fallbackText = '') {
@@ -218,9 +247,69 @@ export function mapBlocksToTipTapDoc(blocks, fallbackText = '') {
   if (!Array.isArray(blocks) || blocks.length === 0) {
     const t = String(fallbackText || '').trim()
     if (t) content.push({ type: 'paragraph', content: [_text(t)] })
-    return { type: 'doc', content }
+    return sanitizeTipTapDoc({ type: 'doc', content }, { source: 'mapBlocksToTipTapDoc-empty' })
   }
 
+  // ── NEW FORMAT DETECTION ─────────────────────────────────────────────────
+  // The new sequential elements format uses type="text" with a "style" string
+  // and "content" string.  One match is enough to route the whole array.
+  const isNewFormat = blocks.some(
+    (b) => b && b.type === 'text' && typeof b.style === 'string' && typeof b.content === 'string',
+  )
+
+  if (isNewFormat) {
+    // ── NEW FORMAT PATH ────────────────────────────────────────────────────
+    for (const el of blocks) {
+      if (!el || typeof el !== 'object') continue
+
+      if (el.type === 'text') {
+        const text = String(el.content || '').trim()
+        if (!text) continue
+        const style = String(el.style || 'paragraph').toLowerCase()
+        if (style === 'heading') {
+          content.push(headingNode(text, 2))
+        } else {
+          // Paragraph: run inline table / list detection same as legacy path
+          if (paragraphTextLooksLikeTable(text)) {
+            const pseudo = tableBlockFromParagraphText(text)
+            const node = pseudo ? tableNodeFromBlock(pseudo) : null
+            if (node) { content.push(node); continue }
+          }
+          const lines = text.includes('\n')
+            ? text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
+            : splitParagraphLines(text)
+          if (!lines.length) continue
+          if (lines.every(isBulletLine)) {
+            content.push({
+              type: 'bulletList',
+              content: lines.map((l) => listItemNode(l.replace(/^[-*•]\s+/, '').trim())),
+            })
+            continue
+          }
+          if (lines.every(isNumberedLine)) {
+            content.push({
+              type: 'orderedList',
+              content: lines.map((l) => listItemNode(l.replace(/^\(?[A-Za-z0-9]+\)?[.)]\s+/, '').trim())),
+            })
+            continue
+          }
+          content.push(paragraphFromMultiline(text))
+        }
+      } else if (el.type === 'table' && Array.isArray(el.content) && el.content.length) {
+        // New format: el.content is a 2-D array of string rows (same as legacy "rows")
+        const node = tableNodeFromBlock({ rows: el.content })
+        if (node) content.push(node)
+      }
+    }
+
+    if (!content.length) {
+      const t = String(fallbackText || '').trim()
+      if (t) content.push({ type: 'paragraph', content: [_text(t)] })
+    }
+    return sanitizeTipTapDoc({ type: 'doc', content }, { source: 'mapBlocksToTipTapDoc-sequential' })
+  }
+
+  // ── LEGACY FORMAT PATH ─────────────────────────────────────────────────────
   for (const block of blocks) {
     const typ = String(block.type || '').toLowerCase()
     if ((typ === 'section_heading' || typ === 'heading') && block.text) {
@@ -304,7 +393,7 @@ export function mapBlocksToTipTapDoc(blocks, fallbackText = '') {
     if (t) content.push({ type: 'paragraph', content: [_text(t)] })
   }
 
-  return { type: 'doc', content }
+  return sanitizeTipTapDoc({ type: 'doc', content }, { source: 'mapBlocksToTipTapDoc' })
 }
 
 const ALLOWED_BLOCK_TYPES = new Set([
@@ -322,30 +411,51 @@ const ALLOWED_BLOCK_TYPES = new Set([
   'horizontalRule',
 ])
 
-const sanitizeInlineContent = (content) => {
+const emptyParagraphNode = () => ({ type: 'paragraph' })
+
+const sanitizeInlineContent = (content, removed = null) => {
   if (!Array.isArray(content)) return []
-  return content
-    .map((node) => {
-      if (!node || typeof node !== 'object') return null
-      if (node.type === 'text') {
-        const text = String(node.text ?? '')
-        if (!text) return null
-        const out = { type: 'text', text }
-        if (Array.isArray(node.marks) && node.marks.length) {
-          out.marks = node.marks.filter((m) => m && typeof m === 'object' && m.type)
-        }
-        return out
+  const out = []
+  for (const node of content) {
+    if (!node || typeof node !== 'object') continue
+    if (node.type === 'text') {
+      const raw = node.text
+      if (raw == null || raw === undefined) {
+        if (removed) removed.empty_text += 1
+        continue
       }
-      if (node.type === 'hardBreak') return { type: 'hardBreak' }
-      return null
-    })
-    .filter(Boolean)
+      const text = String(raw)
+      if (!text.trim()) {
+        if (removed) removed.empty_text += 1
+        continue
+      }
+      const cleaned = { type: 'text', text }
+      if (Array.isArray(node.marks) && node.marks.length) {
+        cleaned.marks = node.marks.filter((m) => m && typeof m === 'object' && m.type)
+      }
+      out.push(cleaned)
+      continue
+    }
+    if (node.type === 'hardBreak') {
+      if (out.length && out[out.length - 1].type === 'text') {
+        out.push({ type: 'hardBreak' })
+      }
+    }
+  }
+  while (out.length && out[out.length - 1].type === 'hardBreak') {
+    out.pop()
+  }
+  return out
 }
 
-const sanitizeTextblock = (node, defaultType = 'paragraph') => {
+const sanitizeTextblock = (node, defaultType = 'paragraph', removed = null) => {
   const type = node?.type === 'heading' ? 'heading' : defaultType
-  const content = sanitizeInlineContent(node?.content)
-  if (!content.length) return null
+  const content = sanitizeInlineContent(node?.content, removed)
+  if (!content.length) {
+    if (removed) removed.empty_paragraphs += 1
+    if (type === 'heading') return null
+    return emptyParagraphNode()
+  }
   if (type === 'heading') {
     const level = Math.min(6, Math.max(1, Number(node?.attrs?.level) || 2))
     return { type: 'heading', attrs: { level }, content }
@@ -353,15 +463,22 @@ const sanitizeTextblock = (node, defaultType = 'paragraph') => {
   return { type: 'paragraph', content }
 }
 
-const sanitizeListItem = (node) => {
+const sanitizeListItem = (node, removed = null) => {
   const children = Array.isArray(node?.content) ? node.content : []
   const paragraph = children.find((c) => c?.type === 'paragraph') || children[0]
-  const sanitized = sanitizeTextblock(paragraph || { type: 'paragraph', content: node?.content }, 'paragraph')
-  if (!sanitized) return null
+  const sanitized = sanitizeTextblock(
+    paragraph || { type: 'paragraph', content: node?.content },
+    'paragraph',
+    removed,
+  )
+  if (!sanitized) {
+    if (removed) removed.empty_blocks += 1
+    return null
+  }
   return { type: 'listItem', content: [sanitized] }
 }
 
-const sanitizeTable = (node) => {
+const sanitizeTable = (node, removed = null) => {
   const rows = (node?.content || [])
     .filter((r) => r?.type === 'tableRow')
     .map((row) => {
@@ -371,8 +488,12 @@ const sanitizeTable = (node) => {
           const block = sanitizeTextblock(
             (cell?.content || []).find((c) => c?.type === 'paragraph') || { type: 'paragraph', content: [] },
             'paragraph',
+            removed,
           )
-          if (!block) return null
+          if (!block) {
+            if (removed) removed.empty_table_cells += 1
+            return { type: cellType, content: [emptyParagraphNode()] }
+          }
           return { type: cellType, content: [block] }
         })
         .filter(Boolean)
@@ -400,9 +521,10 @@ const sanitizeTable = (node) => {
     const cells = [...row.content]
     while (cells.length < width) {
       const cellType = rowIndex < headerRows ? 'tableHeader' : 'tableCell'
+      if (removed) removed.empty_table_cells += 1
       cells.push({
         type: cellType,
-        content: [{ type: 'paragraph', content: [{ type: 'text', text: '' }] }],
+        content: [emptyParagraphNode()],
       })
     }
     return { type: 'tableRow', content: cells }
@@ -410,51 +532,125 @@ const sanitizeTable = (node) => {
   return { type: 'table', content: normalizedRows }
 }
 
-const sanitizeBlockNode = (node) => {
+const sanitizeBlockNode = (node, removed = null) => {
   if (!node || typeof node !== 'object' || !node.type) return null
   const type = String(node.type)
   if (!ALLOWED_BLOCK_TYPES.has(type) && type !== 'doc') return null
 
   if (type === 'paragraph' || type === 'heading') {
-    return sanitizeTextblock(node, type)
+    return sanitizeTextblock(node, type, removed)
   }
   if (type === 'bulletList' || type === 'orderedList') {
-    const items = (node.content || []).map(sanitizeListItem).filter(Boolean)
+    const items = (node.content || []).map((item) => sanitizeListItem(item, removed)).filter(Boolean)
     return items.length ? { type, content: items } : null
   }
-  if (type === 'table') return sanitizeTable(node)
-  if (type === 'listItem') return sanitizeListItem(node)
+  if (type === 'table') return sanitizeTable(node, removed)
+  if (type === 'listItem') return sanitizeListItem(node, removed)
   return null
 }
 
 /**
  * Normalize TipTap JSON so ProseMirror can parse it (tables, lists, headings).
+ * Strips empty text nodes and whitespace-only text (TipTap rejects text: "").
  * @param {object|null} docJson
+ * @param {{ source?: string, log?: boolean }} [options]
  * @returns {{ type: 'doc', content: object[] }}
  */
-export function sanitizeTipTapDoc(docJson) {
+export function sanitizeTipTapDoc(docJson, options = {}) {
   if (!docJson || typeof docJson !== 'object') {
     return { type: 'doc', content: [] }
   }
+  const removed = {
+    empty_text: 0,
+    empty_paragraphs: 0,
+    empty_table_cells: 0,
+    empty_blocks: 0,
+  }
   const nodes = Array.isArray(docJson.content) ? docJson.content : []
-  const content = nodes.map(sanitizeBlockNode).filter(Boolean)
-  return { type: 'doc', content }
+  const content = nodes.map((node) => sanitizeBlockNode(node, removed)).filter(Boolean)
+  const sanitized = { type: 'doc', content }
+
+  const shouldLog = options.log !== false
+  if (shouldLog && options.source && Object.values(removed).some((n) => n > 0)) {
+    console.info(
+      `[tiptap-sanitize] source=${options.source} removed=${JSON.stringify(removed)} blocks=${content.length}`,
+    )
+  }
+  return sanitized
+}
+
+/**
+ * Stable fingerprint for TipTap JSON — used to skip redundant setContent calls.
+ * @param {object|null|undefined} docJson
+ * @returns {string}
+ */
+export function hashTipTapDoc(docJson) {
+  if (!docJson || typeof docJson !== 'object') return ''
+  const sanitized = sanitizeTipTapDoc(docJson, { source: 'hashTipTapDoc', log: false })
+  if (isEditorContentEmpty(sanitized)) return ''
+  try {
+    const serialized = JSON.stringify(sanitized)
+    let hash = 5381
+    for (let i = 0; i < serialized.length; i += 1) {
+      hash = ((hash << 5) + hash) ^ serialized.charCodeAt(i)
+    }
+    return `v1:${(hash >>> 0).toString(36)}:${serialized.length}`
+  } catch {
+    return ''
+  }
+}
+
+/** @returns {boolean} True if doc contains any invalid empty text node. */
+export function tipTapDocHasEmptyTextNodes(docJson) {
+  let found = false
+  const walk = (node) => {
+    if (!node || typeof node !== 'object' || found) return
+    if (node.type === 'text') {
+      const text = node.text
+      if (text == null || text === undefined || !String(text).trim()) {
+        found = true
+        return
+      }
+    }
+    const children = node.content
+    if (Array.isArray(children)) children.forEach(walk)
+  }
+  walk(docJson)
+  return found
 }
 
 /**
  * Apply extracted/imported content to a TipTap editor (JSON first, HTML fallback).
  * @param {import('@tiptap/core').Editor} editor
- * @param {{ docJson?: object, html?: string }} payload
- * @returns {boolean} whether meaningful content was applied
+ * @param {{ docJson?: object, html?: string, lastAppliedHashRef?: { current: string } }} payload
+ * @returns {boolean} whether meaningful content was applied (or already matched)
  */
-export function applyTipTapContentToEditor(editor, { docJson, html } = {}) {
+export function applyTipTapContentToEditor(editor, { docJson, html, lastAppliedHashRef } = {}) {
   if (!editor || editor.isDestroyed) return false
 
-  const sanitized = sanitizeTipTapDoc(docJson)
+  const hadInvalidText = tipTapDocHasEmptyTextNodes(docJson)
+  const sanitized = sanitizeTipTapDoc(docJson, {
+    source: hadInvalidText ? 'applyTipTapContentToEditor' : '',
+    log: hadInvalidText,
+  })
   if (!isEditorContentEmpty(sanitized)) {
+    const nextHash = hashTipTapDoc(sanitized)
+    if (nextHash && lastAppliedHashRef?.current === nextHash) {
+      return true
+    }
+    try {
+      const currentHash = hashTipTapDoc(editor.getJSON())
+      if (nextHash && currentHash && nextHash === currentHash) {
+        if (lastAppliedHashRef) lastAppliedHashRef.current = nextHash
+        return true
+      }
+    } catch {
+      // compare best-effort only
+    }
     try {
       const applied = editor.commands.setContent(sanitized, false)
       if (applied && !isEditorContentEmpty(editor.getJSON())) {
+        if (lastAppliedHashRef && nextHash) lastAppliedHashRef.current = nextHash
         return true
       }
     } catch (err) {

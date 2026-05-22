@@ -8,6 +8,9 @@ import {
   isGenericLabelToken,
   wantsFullSopIntent,
 } from './sopActionIntent'
+import { resolveCurrentBlockAtCursor } from './tiptapScope'
+
+export { resolveCurrentBlockAtCursor } from './tiptapScope'
 
 const FULL_SOP_PATTERNS = [
   /\brewrite\s+(?:the\s+)?full\s+sop\b/i,
@@ -51,6 +54,16 @@ const SECTION_LABEL_PATTERNS = [
   /^(.+?)\s+improve\b/i,
 ]
 
+/** Unanchored patterns (work when prompt includes classifier constraint blocks). */
+const SECTION_LABEL_INLINE_PATTERNS = [
+  /\b(?:rewrite|improve|rephrase|umschreiben|verbessern?)\s+(?:the\s+)?(.+?)\s+section(?:\s+only)?\b/i,
+  /\b(?:rewrite|improve)\s+(?:only\s+)?(?:the\s+)?(.+?)\s+section\b/i,
+]
+
+const THIS_SECTION_RE = /\b(?:this|current|selected|diesen?|dieses|aktuellen?)\s+section\b/i
+
+const ASSISTANT_CONSTRAINTS_MARKER = '\n\n[Assistant constraints]'
+
 function normalizeForMatch(value) {
   return String(value || '')
     .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, ' ')
@@ -92,11 +105,39 @@ function buildLabelCandidates(label) {
   return [...candidates].filter((c) => c && c.length >= 3 && !isGenericLabelToken(c))
 }
 
+/** User message only (strip classifier constraint appendix). */
+export function extractUserInstructionPart(promptText = '') {
+  const text = String(promptText || '')
+  const idx = text.indexOf(ASSISTANT_CONSTRAINTS_MARKER)
+  return (idx >= 0 ? text.slice(0, idx) : text).trim()
+}
+
+/** True when the prompt asks for a named section (not just "rewrite" / "improve"). */
+export function promptRequestsNamedSection({ instruction = '', sectionHint = '', targetScope = '' } = {}) {
+  const scope = String(targetScope || '').trim().toLowerCase()
+  if (scope === 'section') return true
+  if (String(sectionHint || '').trim()) return true
+
+  const promptText = String(instruction || '').trim()
+  if (!promptText || wantsFullSopIntent(promptText)) return false
+
+  const labels = extractLabelsFromPrompt(promptText)
+  return labels.some((label) => {
+    const candidates = buildLabelCandidates(label)
+    return candidates.length > 0
+  })
+}
+
 function extractLabelsFromPrompt(promptText) {
   if (wantsFullSopIntent(promptText)) return []
 
-  const text = String(promptText || '').trim()
+  const text = extractUserInstructionPart(promptText)
   const labels = []
+
+  const targetSectionMatch = String(promptText || '').match(/Target section:\s*(.+)/i)
+  if (targetSectionMatch?.[1]) {
+    labels.push(cleanLabel(targetSectionMatch[1]))
+  }
 
   for (const pattern of GAP_LABEL_PATTERNS) {
     const match = text.match(pattern)
@@ -104,6 +145,11 @@ function extractLabelsFromPrompt(promptText) {
   }
 
   for (const pattern of SECTION_LABEL_PATTERNS) {
+    const match = text.match(pattern)
+    if (match?.[1]) labels.push(cleanLabel(match[1]))
+  }
+
+  for (const pattern of SECTION_LABEL_INLINE_PATTERNS) {
     const match = text.match(pattern)
     if (match?.[1]) labels.push(cleanLabel(match[1]))
   }
@@ -132,6 +178,10 @@ function extractLabelsFromPrompt(promptText) {
   DOC_ID_PATTERN.lastIndex = 0
 
   return [...new Set(labels.map((l) => l.trim()).filter((l) => l.length >= 2 && !wantsFullSopIntent(l)))]
+}
+
+export function wantsThisSectionIntent(promptText = '') {
+  return THIS_SECTION_RE.test(extractUserInstructionPart(promptText))
 }
 
 function isRecordEntryLine(text) {
@@ -182,8 +232,16 @@ function blockMatchesLabel(blockText, label) {
   const candidates = buildLabelCandidates(label)
   return candidates.some((c) => {
     if (c.startsWith('sop-')) return blockNorm.includes(c)
-    if (c.length < 5) return false
-    return blockNorm.includes(c)
+    if (c.length < 4) return false
+    if (blockNorm.includes(c)) return true
+    if (c.length >= 5 && blockNorm.split(/\s+/).some((word) => word === c || word.startsWith(c))) {
+      return true
+    }
+    const numberedHeading = blockNorm.match(/^\d+\.\s+(.+)$/)
+    if (numberedHeading?.[1] && (numberedHeading[1].includes(c) || c.includes(numberedHeading[1]))) {
+      return true
+    }
+    return false
   })
 }
 
@@ -335,6 +393,71 @@ function findSectionByHints(doc, hints = []) {
   return null
 }
 
+/** Expand from caret/selection to the full SOP section (heading through next major header). */
+export function resolveSectionAtCursor(editor) {
+  if (!editor || editor.isDestroyed) return null
+
+  const doc = editor.state.doc
+  const blocks = collectBlocks(doc)
+  if (!blocks.length) return null
+
+  const { selection } = editor.state
+  const pos = selection.empty ? selection.from : selection.from
+
+  let cursorIdx = 0
+  for (let i = 0; i < blocks.length; i += 1) {
+    if (blocks[i].start <= pos) cursorIdx = i
+    else break
+  }
+
+  let startIdx = cursorIdx
+  for (let i = cursorIdx; i >= 0; i -= 1) {
+    const block = blocks[i]
+    if (block.isSectionHeader && !block.isRecordEntry) {
+      startIdx = i
+      break
+    }
+    if (block.headingLevel != null && !block.isRecordEntry) {
+      startIdx = i
+      break
+    }
+  }
+
+  const startBlock = blocks[startIdx]
+  const startHeadingLevel = startBlock.headingLevel
+
+  let endIdx = startIdx
+  for (let j = startIdx + 1; j < blocks.length; j += 1) {
+    const block = blocks[j]
+    if (startHeadingLevel != null && block.headingLevel != null) {
+      if (block.headingLevel <= startHeadingLevel) break
+    } else if (block.isSectionHeader) {
+      break
+    }
+    endIdx = j
+  }
+
+  const from = blocks[startIdx].start
+  const to = blocks[endIdx].end
+  const text = doc.textBetween(from, to, '\n').trim()
+  if (!text || text.length < 3) return null
+
+  return {
+    from,
+    to,
+    text,
+    isFullDoc: false,
+    sectionName: blocks[startIdx].text.slice(0, 160),
+    sectionType: getTraceabilitySectionKind(blocks[startIdx].text) ? 'Section' : 'Heading',
+  }
+}
+
+function sectionNotFoundError(missing) {
+  return new Error(
+    `Could not find "${missing}" in the open SOP. Select the section in the editor or name it exactly (e.g. Purpose, Scope, Deviations, CAPA).`,
+  )
+}
+
 /**
  * Resolve target range inside the live editor document.
  *
@@ -352,7 +475,7 @@ export function resolveTargetInEditor(editor, { prompt = '', selection, sectionH
   const scope = String(targetScope || '').trim().toLowerCase()
   const hint = String(sectionHint || '').trim()
 
-  if (scope === 'full_document' || wantsFullSopIntent(promptText)) {
+  if (wantsFullSopIntent(promptText)) {
     return resolveFullDocument(doc)
   }
 
@@ -362,7 +485,17 @@ export function resolveTargetInEditor(editor, { prompt = '', selection, sectionH
     }
   }
 
-  if (scope === 'selection') {
+  const hasSelection = Boolean(selection && !selection.empty)
+
+  if (scope === 'selection' && hasSelection) {
+    const selected = resolveSelectionTarget(editor, selection)
+    if (selected) return selected
+  }
+
+  if (
+    hasSelection
+    && !promptRequestsNamedSection({ instruction: promptText, sectionHint: hint, targetScope: scope })
+  ) {
     const selected = resolveSelectionTarget(editor, selection)
     if (selected) return selected
   }
@@ -372,13 +505,33 @@ export function resolveTargetInEditor(editor, { prompt = '', selection, sectionH
     ...extractLabelsFromPrompt(promptText),
   ].filter(Boolean)
 
+  const isGapRequest = GAP_CHECK_VERB.test(promptText)
+  const isRewriteImprove = REWRITE_IMPROVE_VERB.test(promptText)
+  const namedSectionRequested = promptRequestsNamedSection({
+    instruction: promptText,
+    sectionHint: hint,
+    targetScope: scope,
+  })
+  const thisSectionRequested = wantsThisSectionIntent(promptText)
+
+  if (namedSectionRequested) {
+    const section = findSectionByHints(doc, structuredHints)
+    if (section) return section
+    if (isRewriteImprove || isGapRequest || scope === 'section') {
+      throw sectionNotFoundError(hint || structuredHints[0] || 'that section')
+    }
+  }
+
+  if (thisSectionRequested && (isRewriteImprove || isGapRequest)) {
+    const section = resolveSectionAtCursor(editor)
+    if (section) return section
+    throw sectionNotFoundError('the current section')
+  }
+
   if (scope === 'section' || hint || structuredHints.length) {
     const section = findSectionByHints(doc, structuredHints)
     if (section) return section
   }
-
-  const isGapRequest = GAP_CHECK_VERB.test(promptText)
-  const isRewriteImprove = REWRITE_IMPROVE_VERB.test(promptText)
 
   if (isGapRequest) {
     if (wantsFullSopIntent(promptText)) return resolveFullDocument(doc)
@@ -387,14 +540,15 @@ export function resolveTargetInEditor(editor, { prompt = '', selection, sectionH
     }
     const labels = extractLabelsFromPrompt(promptText)
     if (labels.length === 0 && /\b(?:this\s+)?sop\b/i.test(promptText) && !/\bsection\b/i.test(promptText)) {
-      return resolveFullDocument(doc)
+      const block = resolveCurrentBlockAtCursor(editor)
+      if (block) return block
     }
     const section = findSectionByHints(doc, labels)
     if (section) return section
   }
 
   if (isRewriteImprove) {
-    const section = findSectionByHints(doc, extractLabelsFromPrompt(promptText))
+    const section = resolveSectionAtCursor(editor)
     if (section) return section
   }
 
@@ -403,12 +557,14 @@ export function resolveTargetInEditor(editor, { prompt = '', selection, sectionH
     if (selected) return selected
   }
 
+  if (isRewriteImprove) {
+    const section = resolveSectionAtCursor(editor)
+    if (section) return section
+  }
+
   if (scope === 'section' || hint || isGapRequest || isRewriteImprove) {
     const labels = structuredHints.length ? structuredHints : extractLabelsFromPrompt(promptText)
-    const missing = hint || labels[0] || 'that section'
-    throw new Error(
-      `Could not find "${missing}" in the open SOP. Use the exact section heading (e.g. Purpose, Scope, Procedure) or select the section in the editor.`,
-    )
+    throw sectionNotFoundError(hint || labels[0] || 'that section')
   }
 
   return null

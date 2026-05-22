@@ -3,11 +3,13 @@
  */
 
 import { performAIAction } from '../api/editorApi'
+import { getAppLanguage, getFriendlyErrorMessage } from './friendlyErrorMessage'
 import { normalizeAiActionResult } from './editorAiActionShared'
 import { requestEditorSnapshot, scrollEditorToRange } from './editorActionsBridge'
 import { AI_ACTION_TRIGGERED_BY, getActiveEditorDocumentId } from './editorAiBridge'
 import { inferEditScope } from './editScopeInference'
-import { wantsFullSopIntent } from './sopActionIntent'
+import { isExplicitFullSopRequest, wantsFullSopIntent } from './sopActionIntent'
+import { buildPatchScopePayload } from './tiptapScope'
 
 export async function resolveGapCheckTarget(instruction) {
   const snapshot = await requestEditorSnapshot({ prompt: instruction })
@@ -33,6 +35,11 @@ export async function runEditorGapCheck({ instruction, documentId: docIdOverride
 
   scrollEditorToRange(target.from, target.to)
 
+  const explicitFullSop = isExplicitFullSopRequest({ instruction: instructionText })
+  const patchScope = buildPatchScopePayload(null, {
+    text: target.text,
+    contentJson: snapshot.contentJson || null,
+  })
   const result = await performAIAction({
     action: 'gap_check',
     text: target.text,
@@ -40,22 +47,17 @@ export async function runEditorGapCheck({ instruction, documentId: docIdOverride
     section_id: `${target.from}-${target.to}`,
     sop_title: snapshot.sopTitle || 'Untitled SOP',
     section_name: target.sectionName || 'Selected text',
-    section_type: target.isFullDoc || wantsFullSopIntent(instructionText)
-      ? 'Full Document'
-      : target.sectionType || 'Paragraph',
-    edit_scope: target.isFullDoc || wantsFullSopIntent(instructionText)
-      ? 'full_document'
-      : inferEditScope({
-          text: target.text,
-          from: target.from,
-          to: target.to,
-          docSize: snapshot.docSize || target.to,
-          instruction: instructionText,
-        }),
+    section_type: explicitFullSop ? 'Full Document' : target.sectionType || 'Paragraph',
+    edit_scope: explicitFullSop ? 'full_document' : inferEditScope({ text: target.text, instruction: instructionText }),
+    patch_node_ids: explicitFullSop ? undefined : patchScope.patch_node_ids,
+    content_json: snapshot.contentJson || null,
     sop_entity_id: documentId,
     triggered_by: AI_ACTION_TRIGGERED_BY.EDITOR_BUBBLE,
     assistant_instruction: instructionText || null,
   })
+  if (!result) {
+    throw new Error(getFriendlyErrorMessage(getAppLanguage()))
+  }
 
   const normalized = normalizeAiActionResult('gap_check', result)
   if (!normalized.suggestedPlain && !normalized.suggestedHtml) {

@@ -16,7 +16,7 @@ export default function SOPActions({
     onToggleRelated,
     showRelatedContext = true,
 }) {
-    const { t } = useLanguage()
+    const { t, friendlyError } = useLanguage()
     const config = useSOPConfig()
 
     const [note, setNote] = useState('')
@@ -59,7 +59,12 @@ export default function SOPActions({
         })
 
         if (result?.ok === false) {
-            setError(result.error || t.noteRequired || 'This action requires more information.')
+            if (result.error) {
+                console.error('SOP workflow action failed:', result.error)
+                setError(friendlyError)
+            } else {
+                setError(t.noteRequired || friendlyError)
+            }
             return
         }
 

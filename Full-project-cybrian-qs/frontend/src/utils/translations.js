@@ -50,6 +50,9 @@ export const translations = {
         language: 'Language',
         english: 'English',
         german: 'German',
+        friendlyError: 'Please try again. Sorry for the inconvenience.',
+        unsupportedFileType:
+          'Unsupported file type. Please upload a PDF, DOCX, or TXT file.',
         readOnly: 'Read only',
         loading: 'Loading...',
         historicalVersionLoaded: 'Historical version loaded. Switch back to latest version to edit.',
@@ -235,6 +238,9 @@ export const translations = {
         language: 'Sprache',
         english: 'Englisch',
         german: 'Deutsch',
+        friendlyError: 'Bitte versuchen Sie es erneut. Entschuldigen Sie die Unannehmlichkeiten.',
+        unsupportedFileType:
+          'Nicht unterstützter Dateityp. Bitte laden Sie eine PDF-, DOCX- oder TXT-Datei hoch.',
         readOnly: 'Nur lesen',
         loading: 'Lädt...',
         historicalVersionLoaded: 'Historische Version geladen. Wechsle zur neuesten Version, um zu bearbeiten.',

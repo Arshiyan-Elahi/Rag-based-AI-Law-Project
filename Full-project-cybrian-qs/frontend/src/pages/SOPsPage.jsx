@@ -14,18 +14,21 @@ import {
 } from '../api/editorApi'
 import {
   buildSOPDisplayLabel,
+  isGeneratedImportSopNumber,
+  prepareSOPMetadataJson,
   importStatusToModalMessage,
   importStatusToModalPhase,
   pollImportJobUntilDone,
-  prepareSOPMetadataJson,
   SOP_IMPORT_ACCEPT,
-  SOP_IMPORT_UNSUPPORTED_MESSAGE,
   assertSOPImportFileAllowed,
   validateSOPImportFileTypes,
   normalizeSOPImportMetadata,
   normalizeSOPTitleForDisplay,
 } from '../utils/sopImportService'
 import { resolveSOPDisplayStatus } from '../utils/sopConstants'
+import { useLanguage } from '../context/LanguageContext'
+import { resolveImportUiError } from '../utils/friendlyErrorMessage'
+import { hashTipTapDoc } from '../utils/editorUtils'
 import SOPTable from '../components/SOPs/SOPTable'
 import StatusBadge from '../components/Common/StatusBadge'
 import { getKLAssistantContext } from '../utils/assistantContext'
@@ -162,20 +165,6 @@ function KISummary({ open, onToggle, query, summaryText, sources, loading, error
 
 /** @typedef {'uploading' | 'success' | 'error'} SOPImportModalPhase */
 
-function formatSOPImportError(err) {
-  const msg = String(err?.message || '').trim()
-  if (
-    msg === SOP_IMPORT_UNSUPPORTED_MESSAGE
-    || /unsupported|binary file|not supported.*pdf|\.pdf.*\.docx.*\.txt/i.test(msg)
-  ) {
-    return SOP_IMPORT_UNSUPPORTED_MESSAGE
-  }
-  if (err?.status === 409) {
-    return msg || 'This SOP ID already exists. Please create a new version or choose another SOP ID.'
-  }
-  return msg || 'SOP upload failed. Please try again.'
-}
-
 function SOPImportFeedbackModal({ modal, onClose }) {
   if (!modal?.open) return null
 
@@ -303,6 +292,7 @@ function buildInitialSOPMetadata(sop) {
 // ── Main Page ──────────────────────────────────────────────────────────────
 
 export default function SOPsPage() {
+  const { language, friendlyError } = useLanguage()
   const fileInputRef = React.useRef(null)
   const [importing, setImporting] = useState(false)
   /** @type {[{ open: boolean, phase: SOPImportModalPhase, message: string } | null, Function]} */
@@ -407,7 +397,7 @@ export default function SOPsPage() {
                 initialMetadataJson: initialMetadataJson || tab.initialMetadataJson || null,
                 initialStatus: initialStatus || tab.initialStatus || '',
                 initialDocTitle: initialDocTitle || tab.initialDocTitle || '',
-                initialDocJson: initialDocJson || tab.initialDocJson || null,
+                initialDocJson: initialDocJson ?? tab.initialDocJson ?? null,
                 openRequestKey,
               }
             : tab
@@ -467,7 +457,7 @@ export default function SOPsPage() {
       setSops(mapped)
     } catch (err) {
       console.error('Failed to load SOPs:', err)
-      setError('SOPs konnten nicht geladen werden.')
+      setError(friendlyError)
       setSops([])
     } finally {
       setLoading(false)
@@ -649,7 +639,8 @@ export default function SOPsPage() {
         }
       })
       .catch((err) => {
-        setKIError(err?.message || 'KI-Analyse fehlgeschlagen.')
+        console.error('Knowledge KI query failed:', err)
+        setKIError(friendlyError)
         setKISummaryText('')
         setKISources([])
       })
@@ -683,7 +674,7 @@ export default function SOPsPage() {
       setSopToDelete(null)
     } catch (err) {
       console.error('Failed to delete SOP:', err)
-      alert(`Fehler beim Löschen: ${err.message}`)
+      alert(friendlyError)
     } finally {
       setIsDeletingSOP(false)
     }
@@ -694,7 +685,7 @@ export default function SOPsPage() {
     if (!list?.length) return
 
     const files = Array.from(list)
-    const typeError = validateSOPImportFileTypes(files)
+    const typeError = validateSOPImportFileTypes(files, language)
     if (typeError) {
       showImportModal('error', typeError)
       if (fileInputRef.current) fileInputRef.current.value = ''
@@ -746,7 +737,6 @@ export default function SOPsPage() {
           ).trim()
 
           const tabLabel = buildSOPDisplayLabel(normalizeSOPImportMetadata(shellSm))
-            || shellSm.documentId
             || resolvedTitle
 
           openSOPEditorTab(
@@ -774,28 +764,49 @@ export default function SOPsPage() {
             const importedMeta = newDoc?.metadata_json && typeof newDoc.metadata_json === 'object'
               ? newDoc.metadata_json
               : metadataJson
+            const importedMetadata = normalizeSOPImportMetadata(importedMeta?.sopMetadata || {})
+            const displayDocId = importedMetadata.documentId
+              || (isGeneratedImportSopNumber(newDoc?.sop_number) ? '' : (newDoc?.sop_number || ''))
+            const importedStatus = (
+              importedMeta?.sopStatus
+              || importedMeta?.status
+              || importedMetadata.sopStatus
+              || initialStatus
+            ).trim()
+            const refreshedMetadataJson = prepareSOPMetadataJson(importedMetadata, {
+              author: 'System (Import)',
+              reviewer: '',
+            })
             const imported = {
               resolvedTitle: normalizeSOPTitleForDisplay(
-                importedMeta?.sopMetadata?.title || newDoc.title || '',
-                importedMeta?.sopMetadata?.documentId || '',
+                importedMetadata.title || newDoc?.title || '',
+                displayDocId,
               ) || resolvedTitle,
-              metadataJson: importedMeta,
-              metadata: normalizeSOPImportMetadata(importedMeta?.sopMetadata || {}),
+              metadataJson: refreshedMetadataJson,
+              metadata: importedMetadata,
               docJson: newDoc?.doc_json || { type: 'doc', content: [] },
+              initialStatus: importedStatus,
             }
+            const nextHash = hashTipTapDoc(imported.docJson)
             const refreshKey = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-            setTabs((prev) => prev.map((tab) => (
-              tab.id === `editor-${shellDoc.id}`
-                ? {
-                    ...tab,
-                    label: buildSOPDisplayLabel(imported.metadata) || tab.label,
-                    initialDocJson: imported.docJson,
-                    initialMetadataJson: imported.metadataJson,
-                    initialDocTitle: imported.resolvedTitle,
-                    openRequestKey: refreshKey,
-                  }
-                : tab
-            )))
+            setTabs((prev) => prev.map((tab) => {
+              if (tab.id !== `editor-${shellDoc.id}`) return tab
+              const prevHash = hashTipTapDoc(tab.initialDocJson)
+              const contentChanged = Boolean(nextHash) && nextHash !== prevHash
+              return {
+                ...tab,
+                label: buildSOPDisplayLabel(imported.metadata) || imported.resolvedTitle || tab.label,
+                initialMetadataJson: imported.metadataJson,
+                initialDocTitle: imported.resolvedTitle,
+                initialStatus: imported.initialStatus,
+                ...(contentChanged
+                  ? {
+                      initialDocJson: imported.docJson,
+                      openRequestKey: refreshKey,
+                    }
+                  : {}),
+              }
+            }))
             return { newDoc, imported }
           }
 
@@ -823,7 +834,7 @@ export default function SOPsPage() {
             responseBody: err?.responseBody || null,
             file: file?.name,
           })
-          errors.push(`${file.name}: ${formatSOPImportError(err)}`)
+          errors.push(resolveImportUiError(err, language))
         }
       }
 
@@ -833,15 +844,9 @@ export default function SOPsPage() {
           : `${successCount} SOPs uploaded successfully.`
         showImportModal('success', successMessage)
       } else if (successCount > 0 && errors.length > 0) {
-        showImportModal(
-          'error',
-          `Uploaded ${successCount} of ${files.length}. ${errors.join(' ')}`,
-        )
+        showImportModal('error', friendlyError)
       } else if (errors.length > 0) {
-        showImportModal(
-          'error',
-          errors.length === 1 ? errors[0].replace(/^[^:]+:\s*/, '') : errors.join(' '),
-        )
+        showImportModal('error', errors[0] || friendlyError)
       }
 
       if (fileInputRef.current) fileInputRef.current.value = ''

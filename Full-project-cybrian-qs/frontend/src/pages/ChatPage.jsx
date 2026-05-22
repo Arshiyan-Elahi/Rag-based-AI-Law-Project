@@ -20,6 +20,8 @@ import {
   toVisibleUserMessage,
 } from '../utils/chatAssistant'
 import { deriveSopTitleFromText, htmlToPlainText, plainTextToTiptapDoc } from '../utils/chatSopSave'
+import { useLanguage } from '../context/LanguageContext'
+import { getFriendlyErrorMessage } from '../utils/friendlyErrorMessage'
 import { getAssistantContextStorageKeys, resetAssistantStateOnce } from '../utils/assistantContext'
 import './ChatPage.css'
 
@@ -98,6 +100,7 @@ function createAnonDraftConversation() {
  * ChatPage — DB-backed chat; session_id pointer in localStorage; works with or without login.
  */
 export default function ChatPage() {
+  const { friendlyError } = useLanguage()
   const location = useLocation()
   const navigate = useNavigate()
   const routeMeta = useMemo(() => getAssistantRouteMeta(location.pathname), [location.pathname])
@@ -201,7 +204,8 @@ export default function ChatPage() {
           }
         } catch (err) {
           if (cancelled) return
-          setHistoriesError(err?.message || 'Konnte Chat-Verlauf nicht laden.')
+          console.error('Chat history load failed:', err)
+          setHistoriesError(friendlyError)
           await bootAnonymousFromStorage()
         }
       } else {
@@ -306,7 +310,8 @@ export default function ChatPage() {
         setShowChat(true)
       } catch (err) {
         console.error('[chat-history-session-create] failed', err)
-        window.alert(err?.message || 'Neuer Chat konnte nicht angelegt werden.')
+        console.error('Chat session create failed:', err)
+        window.alert(friendlyError)
       }
       return
     }
@@ -451,7 +456,7 @@ export default function ChatPage() {
           id: `e-${Date.now()}`,
           sender: 'ai',
           time: nowTime(),
-          content: toHtml(`Fehler beim Chatbot-Aufruf: ${err.message || 'Unbekannter Fehler'}`),
+          content: toHtml(friendlyError),
           tags: [],
           showActions: false,
         }
@@ -546,10 +551,8 @@ export default function ChatPage() {
           })
         } catch (createErr) {
           if (createErr?.status === 409) {
-            window.alert(
-              createErr.message ||
-                'This SOP ID already exists. Please create a new version or choose another SOP ID.',
-            )
+            console.error('Create SOP from chat failed (409):', createErr)
+            window.alert(friendlyError)
             return
           }
           throw createErr

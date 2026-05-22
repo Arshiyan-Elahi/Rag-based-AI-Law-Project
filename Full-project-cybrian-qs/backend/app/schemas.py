@@ -335,6 +335,12 @@ class AIActionRequest(BaseModel):
     edit_scope: Optional[str] = None
     # When the client already holds a validated structured result (e.g. re-apply), skip LLM.
     client_structured_json: Optional[dict] = None
+    # TipTap doc JSON from the editor — enables structure-preserving rewrite/improve.
+    content_json: Optional[dict] = None
+    # Stable t1..tn ids to patch (section/block scope). Omit for explicit full-document jobs.
+    patch_node_ids: Optional[list[str]] = None
+    # When true with edit_scope=full_document, run as background job with full internal chunking.
+    full_sop_background: Optional[bool] = None
     # UUID of the SOP row for precise DB + ProfileDetection context (editor bubble / KL assistant).
     sop_entity_id: Optional[str] = None
     # Who invoked the action: ``editor_bubble`` | ``kl_assistant`` (for logs only).
@@ -346,6 +352,25 @@ class AIActionResponse(BaseModel):
     suggested_text: str
     explanation: Optional[str] = None
     structured_data: Optional[dict] = None
+    suggested_content_json: Optional[dict] = None
+
+
+class AIActionJobStartResponse(BaseModel):
+    job_id: str
+    action: str
+    status: str = "queued"
+    message: str = ""
+
+
+class AIActionJobStatusResponse(BaseModel):
+    job_id: str
+    action: Optional[str] = None
+    status: str
+    message: str = ""
+    error: Optional[str] = None
+    progress: dict = {}
+    result: Optional[dict] = None
+    updated_at: Optional[str] = None
 
 
 class SemanticReindexRequest(BaseModel):

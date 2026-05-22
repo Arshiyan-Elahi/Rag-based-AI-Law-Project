@@ -11,9 +11,11 @@ import {
   getDecisions,
   queryAI,
 } from '../api/editorApi'
+import { useLanguage } from '../context/LanguageContext'
 import './DashboardPage.css'
 
 export default function DashboardPage() {
+  const { friendlyError } = useLanguage()
   const [loading, setLoading] = useState(true)
   const [sops, setSops] = useState([])
   const [deviations, setDeviations] = useState([])
@@ -73,11 +75,12 @@ export default function DashboardPage() {
         timestamp: new Date(),
       })
     } catch (err) {
-      setAiError(err.message || 'Die KI-Anfrage konnte nicht verarbeitet werden.')
+      console.error('Dashboard AI search failed:', err)
+      setAiError(friendlyError)
     } finally {
       setAiLoading(false)
     }
-  }, [])
+  }, [friendlyError])
 
   // ──────────────────────────────────────────────────────────────
   // Map all real entities into unified "cases" list for CaseTracker

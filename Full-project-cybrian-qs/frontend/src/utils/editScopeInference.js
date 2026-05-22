@@ -3,6 +3,7 @@
  */
 
 import { wantsFullSopIntent } from './sopActionIntent'
+import { expandSelectionToEditableBlock } from './tiptapScope'
 
 const RECORD_ID_RE = /\b(?:DEV|CAPA|AUD|DEC)-[A-Z0-9]+-\d+\b/gi
 const BACKBONE_RE =
@@ -17,7 +18,10 @@ export function isTraceabilityRegisterSelection(text = '') {
   return true
 }
 
-export function inferEditScope({ text = '', from = 0, to = 0, docSize = 0, instruction = '' } = {}) {
+export function inferEditScope({ text = '', instruction = '', forceFullDocument = false } = {}) {
+  if (forceFullDocument && wantsFullSopIntent(instruction)) {
+    return 'full_document'
+  }
   if (wantsFullSopIntent(instruction)) {
     return 'full_document'
   }
@@ -25,52 +29,34 @@ export function inferEditScope({ text = '', from = 0, to = 0, docSize = 0, instr
   if (isTraceabilityRegisterSelection(t)) {
     return 'section_only'
   }
-  const fraction = docSize > 0 ? Math.abs(to - from) / docSize : 0
-  if (fraction >= 0.92) {
-    return 'full_document'
-  }
   return 'section_only'
 }
 
 /**
  * Snapshot the editor selection at action time (bubble menu / inline actions).
- * Expands near-full spans to the whole document so rewrite/improve/gap use the real range.
+ * Never auto-expands to full document — only the current block or explicit selection.
  */
 export function captureEditorSelectionForAction(editor) {
   if (!editor || editor.isDestroyed) return null
   const { state } = editor
   const { selection } = state
-  if (!selection || selection.empty) return null
+  if (!selection) return null
 
   const docSize = state.doc.content.size
   let from = selection.from
   let to = selection.to
+
+  if (selection.empty) {
+    const block = expandSelectionToEditableBlock(editor, from, to)
+    from = block.from
+    to = block.to
+  }
+
   let text = state.doc.textBetween(from, to, '\n').trim()
   if (!text) return null
 
-  let selectedFraction = Math.abs(to - from) / Math.max(1, docSize)
-  const startsNearDocStart = from <= 2
-  const nearFullFromTop = startsNearDocStart && selectedFraction >= 0.75
-  const nearFullSpan = selectedFraction >= 0.92 || nearFullFromTop
-
-  if (nearFullSpan) {
-    from = 0
-    to = docSize
-    text = state.doc.textBetween(from, to, '\n').trim()
-    selectedFraction = 1
-  }
-
-  const editScope = nearFullSpan
-    ? 'full_document'
-    : inferEditScope({ text, from, to, docSize })
-
-  const isFullDocument = editScope === 'full_document'
-  if (isFullDocument) {
-    from = 0
-    to = docSize
-    text = state.doc.textBetween(from, to, '\n').trim()
-    selectedFraction = 1
-  }
+  const selectedFraction = Math.abs(to - from) / Math.max(1, docSize)
+  const editScope = 'section_only'
 
   return {
     from,
@@ -79,7 +65,7 @@ export function captureEditorSelectionForAction(editor) {
     structuredText: text,
     selectedFraction,
     editScope,
-    isFullDocument,
+    isFullDocument: false,
   }
 }
 
@@ -127,6 +113,9 @@ export function inferSectionMetaForSelection(editor, snapshot) {
         node.type.name === 'listItem'
       ) {
         sectionType = 'List'
+      } else if (node.type.name === 'tableCell' || node.type.name === 'tableHeader') {
+        sectionType = 'Table cell'
+        sectionName = 'Table cell'
       } else if (node.type.name === 'paragraph') {
         sectionType = 'Paragraph'
       }

@@ -1,8 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import { searchKnowledge, createLink } from '../../api/editorApi';
 import { X, Search, Link as LinkIcon, Loader2 } from 'lucide-react';
+import { useLanguage } from '../../context/LanguageContext';
 
 const LinkingModal = ({ isOpen, onClose, sourceId, sourceType = 'sop', onLinkCreated }) => {
+  const { friendlyError } = useLanguage();
   const [query, setQuery] = useState('');
   const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -54,7 +56,8 @@ const LinkingModal = ({ isOpen, onClose, sourceId, sourceType = 'sop', onLinkCre
       if (onLinkCreated) onLinkCreated();
       onClose();
     } catch (err) {
-      alert('Link creation failed');
+      console.error('Link creation failed:', err);
+      alert(friendlyError);
     } finally {
       setLinking(false);
     }

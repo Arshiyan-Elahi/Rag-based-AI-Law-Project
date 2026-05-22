@@ -5,6 +5,7 @@
 
 import { formatAiSuggestionForUi } from './aiOutputFormatter'
 import { sanitizeRenderedHtml } from './aiOutputFormatter'
+import { sanitizeTipTapDoc, tipTapDocHasEmptyTextNodes } from './editorUtils'
 
 export const stripHtmlToPlain = (value) =>
   String(value || '')
@@ -44,15 +45,32 @@ export function normalizeAiActionResult(action, apiResult) {
     suggestedPlain = stripHtmlToPlain(suggestedHtml)
   }
 
+  const suggestedContentJson =
+    apiResult?.suggested_content_json
+    || structured?.suggested_content_json
+    || null
+
   return {
     action: actionKey,
     structured,
     suggestedHtml,
     suggestedPlain,
+    suggestedContentJson,
     explanation: apiResult?.explanation || '',
     originalText: apiResult?.original_text || '',
     raw: apiResult,
   }
+}
+
+export function coerceTipTapDocForApply(docJson) {
+  if (!docJson || typeof docJson !== 'object' || docJson.type !== 'doc') {
+    return null
+  }
+  const hadInvalid = tipTapDocHasEmptyTextNodes(docJson)
+  return sanitizeTipTapDoc(docJson, {
+    source: hadInvalid ? 'coerceTipTapDocForApply' : '',
+    log: hadInvalid,
+  })
 }
 
 /**
@@ -61,15 +79,18 @@ export function normalizeAiActionResult(action, apiResult) {
 export function buildAcceptedInsertContent(aiResult, { selectedFraction = 0, isFullDoc = false } = {}) {
   const action = String(aiResult?.action || '').toLowerCase()
   const structured = aiResult?.structured_data || {}
-  const isPartialSelection = !isFullDoc && selectedFraction > 0 && selectedFraction < 0.85
-
-  if (isPartialSelection && (action === 'rewrite' || action === 'improve')) {
-    if (action === 'rewrite') {
-      return stripHtmlToPlain(structured.rewritten_text || aiResult?.suggested_text)
-    }
-    if (action === 'improve') {
-      return stripHtmlToPlain(structured.improved_text || structured.improved_version || aiResult?.suggested_text)
-    }
+  const tiptapDoc = coerceTipTapDocForApply(
+    aiResult?.suggested_content_json || structured?.suggested_content_json,
+  )
+  // Structure-preserving path: always apply patched TipTap JSON, never plain-text flatten.
+  if (tiptapDoc && (action === 'rewrite' || action === 'improve')) {
+    return tiptapDoc
+  }
+  if (
+    (aiResult?.suggested_content_json || structured?.suggested_content_json)
+    && (action === 'rewrite' || action === 'improve')
+  ) {
+    return null
   }
 
   const html = formatAiSuggestionForUi({

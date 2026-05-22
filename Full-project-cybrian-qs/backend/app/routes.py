@@ -668,9 +668,15 @@ def _normalize_sop_metadata(sop_number: str, title: str, department: str = None,
     title = strip_invalid_control_chars(title or "")
     department = strip_invalid_control_chars(department or "")
     
-    from .services.sop_metadata_extractor import resolve_status_from_metadata
+    from .services.sop_metadata_extractor import (
+        is_generated_import_sop_number,
+        resolve_status_from_metadata,
+    )
 
     resolved_sop_status = resolve_status_from_metadata(raw_meta)
+    display_document_id = sop_number or ""
+    if is_generated_import_sop_number(display_document_id):
+        display_document_id = ""
 
     # 1. Base Structure
     normalized = {
@@ -688,7 +694,7 @@ def _normalize_sop_metadata(sop_number: str, title: str, department: str = None,
             "reviewer": raw_meta.get("sopMetadata", {}).get("reviewer", ""),
             "riskLevel": raw_meta.get("sopMetadata", {}).get("riskLevel", "Low"),
             "department": department or "Quality",
-            "documentId": sop_number or "",
+            "documentId": display_document_id,
             "docType": raw_meta.get("sopMetadata", {}).get("docType", "SOP"),
             "category": raw_meta.get("sopMetadata", {}).get("category", ""),
             "sopVersion": raw_meta.get("sopMetadata", {}).get("sopVersion", ""),
@@ -712,6 +718,8 @@ def _normalize_sop_metadata(sop_number: str, title: str, department: str = None,
                 continue
             if k in ("title", "documentId"):
                 if v:
+                    if k == "documentId" and is_generated_import_sop_number(str(v)):
+                        continue
                     normalized["sopMetadata"][k] = v
             else:
                 normalized["sopMetadata"][k] = v
@@ -745,16 +753,87 @@ def _metadata_debug_sources(structured: dict) -> dict:
     }
 
 
-def _build_extract_response(text: str, blocks: list, structured: dict) -> dict:
+def _blocks_to_elements(blocks: list) -> list:
+    """
+    Convert the internal typed-blocks format into the unified sequential elements
+    format consumed by the frontend instant-loading path.
+
+    This is the fallback converter used when a file-type-specific sequential
+    extractor is unavailable (e.g. PDF served from Marker cache).
+
+    Output shapes:
+      {"type": "text",  "style": "heading"|"paragraph", "content": str}
+      {"type": "table", "content": [[row1col1, row1col2, ...], ...]}
+    """
+    elements: list = []
+    for block in blocks or []:
+        btype = str(block.get("type", "")).lower()
+        if btype in {"section_heading", "heading"}:
+            text = str(block.get("text", "")).strip()
+            if text:
+                elements.append({"type": "text", "style": "heading", "content": text})
+        elif btype in {"paragraph", "line", "note"}:
+            text = str(block.get("text", "")).strip()
+            if text:
+                elements.append({"type": "text", "style": "paragraph", "content": text})
+        elif btype == "two_column_row":
+            left = str(block.get("left", "")).strip()
+            right = str(block.get("right", "")).strip()
+            if left or right:
+                content = f"{left}: {right}" if left and right else (left or right)
+                elements.append({"type": "text", "style": "paragraph", "content": content})
+        elif btype in {"bullet_list", "numbered_list", "list", "ordered_list"}:
+            for item in block.get("items") or []:
+                text = str(item).strip()
+                if text:
+                    elements.append({"type": "text", "style": "paragraph", "content": text})
+        elif btype == "table":
+            rows = block.get("rows") or []
+            if rows:
+                elements.append({"type": "table", "content": rows})
+    return elements
+
+
+def _txt_to_elements(text: str) -> list:
+    """
+    Convert plain TXT content to unified sequential elements.
+    Each non-blank line becomes a text element; heading heuristics are applied.
+    """
+    from .services.pdf_extractor import _clean_line, _is_likely_heading
+
+    elements: list = []
+    for raw_line in (text or "").splitlines():
+        line = _clean_line(raw_line)
+        if not line:
+            continue
+        style = "heading" if _is_likely_heading(line) else "paragraph"
+        elements.append({"type": "text", "style": style, "content": line})
+    return elements
+
+
+def _build_extract_response(
+    text: str,
+    blocks: list,
+    structured: dict,
+    elements: list | None = None,
+) -> dict:
     from .services.document_structure import blocks_to_structured_document
     from .services.sop_metadata_extractor import to_frontend_sop_metadata
 
     sop_ui = to_frontend_sop_metadata(structured)
     public_meta = {k: v for k, v in structured.items() if not str(k).startswith("_")}
     structured_document = blocks_to_structured_document(blocks, public_meta)
+
+    # Prefer caller-supplied elements; fall back to converting existing blocks.
+    resolved_elements = elements if elements is not None else _blocks_to_elements(blocks)
+
     response = {
         "text": (text or "").strip(),
         "blocks": blocks,
+        # Unified sequential format — consumed by the frontend instant-load path.
+        # Shape: [{"type":"text","style":"heading"|"paragraph","content":str}, ...]
+        #        [{"type":"table","content":[[row1col1,...],...]}, ...]
+        "elements": resolved_elements,
         "structured_document": structured_document,
         "sop_metadata": public_meta,
         "sop_metadata_ui": sop_ui,
@@ -771,7 +850,12 @@ def _build_extract_response(text: str, blocks: list, structured: dict) -> dict:
     logger.info("[ocr-import] metadata sources: %s", response["metadata_sources"])
     logger.info(
         "[ocr-import] final response sent to frontend: %s",
-        {**response, "text": response["text"][:300], "blocks": f"{len(blocks)} blocks"},
+        {
+            **response,
+            "text": response["text"][:300],
+            "blocks": f"{len(blocks)} blocks",
+            "elements": f"{len(resolved_elements)} elements",
+        },
     )
     return response
 
@@ -946,12 +1030,17 @@ async def extract_text_from_upload(file: UploadFile = File(...)):
     """
     Extract plain text from PDF, DOCX, or TXT (editor import path).
 
-    PDF: disk cache only (Marker runs in background via import-async). DOCX: python-docx. TXT: UTF-8.
-    Includes structured SOP metadata inferred from content (rules + optional LLM fallback).
+    Returns structured JSON including a new ``elements`` array in strict reading
+    order for instant, zero-block frontend rendering.  Background tasks
+    (chunking, embedding, Qdrant indexing) are NOT triggered here — they run
+    inside the async import pipeline (import-async endpoint).
+
+    PDF : pdfplumber (digital) / PyMuPDF OCR (scanned) sequential elements (sync).
+    DOCX: pre-mapped OpenXML body walk (sync).
+    TXT : line-by-line sequential elements (sync).
     """
-    from .services.document_structure import enrich_metadata_text, structure_blocks_from_text
-    from .services.local_marker_extractor import try_extract_pdf_from_cache
-    from .services.pdf_extractor import extract_docx_bytes
+    from .services.document_structure import enrich_metadata_text
+    from .services.sequential_import import extract_sequential_upload
     from .services.sop_metadata_extractor import extract_sop_metadata_from_text
 
     name = (file.filename or "").lower()
@@ -966,51 +1055,16 @@ async def extract_text_from_upload(file: UploadFile = File(...)):
         return t if len(t) <= _meta_cap else t[:_meta_cap]
 
     try:
-        if name.endswith(".pdf"):
-            raw_pdf = await file.read()
-            cached = try_extract_pdf_from_cache(raw_pdf)
-            if not cached:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "PDF extraction runs in the background and is not available on this request. "
-                        "Use POST /api/editor/sops/import-async to import PDFs, or re-open after a "
-                        "previous import has cached the same file."
-                    ),
-                )
-            blocks, text, _marker = cached
-            text = strip_invalid_control_chars(text)
-            meta_text = enrich_metadata_text(text, blocks)
-            structured = extract_sop_metadata_from_text(
-                _clip_for_metadata(meta_text),
-                blocks,
-                use_llm_fallback=len(text) < 250000,
-            )
-            return _build_extract_response(text, blocks, structured)
-        elif name.endswith(".docx"):
-            raw_docx = await file.read()
-            blocks, text = extract_docx_bytes(raw_docx)
-            text = strip_invalid_control_chars(text)
-            meta_text = enrich_metadata_text(text, blocks)
-            structured = extract_sop_metadata_from_text(
-                _clip_for_metadata(meta_text),
-                blocks,
-                use_llm_fallback=len(text) < 250000,
-            )
-            return _build_extract_response(text, blocks, structured)
-        elif name.endswith(".txt"):
-            raw = await file.read()
-            text = strip_invalid_control_chars(raw.decode("utf-8", errors="replace"))
-            blocks = structure_blocks_from_text(text)
-            meta_text = enrich_metadata_text(text, blocks)
-            structured = extract_sop_metadata_from_text(
-                _clip_for_metadata(meta_text),
-                blocks,
-                use_llm_fallback=len(text) < 250000,
-            )
-            return _build_extract_response(text, blocks, structured)
-        else:
-            raise HTTPException(status_code=400, detail=SOP_IMPORT_UNSUPPORTED_DETAIL)
+        raw = await file.read()
+        elements, blocks, text, _scanned = extract_sequential_upload(raw, name)
+        text = strip_invalid_control_chars(text)
+        meta_text = enrich_metadata_text(text, blocks)
+        structured = extract_sop_metadata_from_text(
+            _clip_for_metadata(meta_text),
+            blocks,
+            use_llm_fallback=len(text) < 250000,
+        )
+        return _build_extract_response(text, blocks, structured, elements=elements)
     except HTTPException:
         raise
     except Exception as e:
@@ -1249,14 +1303,14 @@ async def import_sop_async(
         )
         if name.endswith(".pdf"):
             from .services.document_extraction import apply_extraction_fields
-            from .services.local_marker_extractor import EXTRACTION_ENGINE
+            from .services.sequential_import import EXTRACTION_ENGINE_SEQUENTIAL
             from .services.sop_import_worker import IMPORT_STATUS_QUEUED
 
             apply_extraction_fields(
                 initial_version,
                 job_id=job_id,
                 status=IMPORT_STATUS_QUEUED,
-                engine=EXTRACTION_ENGINE,
+                engine=EXTRACTION_ENGINE_SEQUENTIAL,
             )
         db.add(sop)
         db.add(initial_version)

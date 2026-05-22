@@ -5,6 +5,10 @@
  * Persists the user's selected language in `localStorage` so it survives reloads.
  */
 import { createContext, useContext, useEffect, useMemo, useState } from 'react'
+import {
+  getFriendlyErrorMessage,
+  getUnsupportedFileTypeMessage,
+} from '../utils/friendlyErrorMessage'
 import { translations } from '../utils/translations'
 
 const LanguageContext = createContext(null)
@@ -30,6 +34,8 @@ export function LanguageProvider({ children }) {
             language,
             setLanguage,
             t: translations[language] || translations.de,
+            friendlyError: getFriendlyErrorMessage(language),
+            unsupportedFileType: getUnsupportedFileTypeMessage(language),
         }
     }, [language])
 

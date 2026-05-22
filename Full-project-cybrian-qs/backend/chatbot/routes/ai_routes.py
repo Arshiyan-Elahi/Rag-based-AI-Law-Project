@@ -1183,6 +1183,9 @@ async def perform_ai_action(payload: AIActionRequest):
     return await _app_perform_ai_action(payload)
 
 
+
+
+
 @ai_router.post("/api/ai/classify-intent")
 async def classify_intent(payload: dict):
     from chatbot.assistant.intent_classifier import classify_assistant_intent
@@ -1208,10 +1211,6 @@ async def classify_intent(payload: dict):
     )
     return result.model_dump()
 
-
-@ai_router.get("/api/ai/llm-health")
-async def llm_health(chat_probe: bool = Query(False)):
-    return await asyncio.to_thread(check_local_llm_api_health, chat_probe=chat_probe)
 
 
 @ai_router.post("/api/ai/query")

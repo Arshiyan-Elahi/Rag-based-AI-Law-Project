@@ -3,7 +3,7 @@
  */
 
 const FULL_SOP_INTENT_RE =
-  /\b(?:rewrite|re-?write|improve|umschreiben|verbessern?)\b[\s\S]*\b(?:(?:this\s+)?full\s+sop|(?:entire|whole|complete|gesamte?|komplette?)\s+sop|sop\s+(?:komplett|vollständig|gesamt))\b|\b(?:(?:this\s+)?full\s+sop|(?:entire|whole|complete)\s+sop)\b[\s\S]*\b(?:rewrite|improve|umschreiben|verbessern?)\b/i
+  /\b(?:rewrite|re-?write|improve|umschreiben|verbessern?)\b[\s\S]*\b(?:(?:this\s+)?full\s+sop|(?:entire|whole|complete|gesamte?|komplette?)\s+(?:sop|document)|sop\s+(?:komplett|vollständig|gesamt)|(?:complete|entire|whole|full)\s+document)\b|\b(?:(?:this\s+)?full\s+sop|(?:entire|whole|complete)\s+(?:sop|document))\b[\s\S]*\b(?:rewrite|improve|umschreiben|verbessern?)\b|\b(?:rewrite|improve|umschreiben|verbessern?)\s+(?:the\s+)?(?:complete|entire|whole|full)\s+(?:sop|document)\b|\b(?:rewrite|improve)\s+(?:the\s+)?(?:complete|entire|whole|full)\s+document\b/i
 
 const LABEL_STOPWORDS = new Set([
   'full',
@@ -26,6 +26,15 @@ export function wantsFullSopIntent(promptText = '') {
   return FULL_SOP_INTENT_RE.test(String(promptText || '').trim())
 }
 
+/** True when the user explicitly asked for a full-SOP rewrite/improve. */
+export function isExplicitFullSopRequest({
+  instruction = '',
+  fullSopBackground = false,
+} = {}) {
+  if (fullSopBackground) return true
+  return wantsFullSopIntent(instruction)
+}
+
 const REGISTER_FIELD_LINE_RE =
   /^(?:Linked|Finding|Datum|Beschreibung|Ursache|Aktion|Verantwortlich|Verknüpfungen|Entscheidung|Risiko|Begründung|Status|Fällig|Schweregrad|Ergebnis)\s*:/i
 
@@ -38,7 +47,9 @@ export function getTraceabilitySectionKind(text = '') {
   const hasDec = /\bdecisions?\b|\bentscheidungen?\b/.test(t)
   const hasAud = /\baudit\s+findings?\b/.test(t) || (/\baudit\b/.test(t) && !hasCapa && !hasDev)
   if (hasCapa && !hasDev) return 'capas'
+  if (/\bcapa\b/.test(t) && !hasDev) return 'capas'
   if (hasDev && !hasCapa) return 'deviations'
+  if (/\bdeviation\b/.test(t) && !hasCapa) return 'deviations'
   if (hasDec) return 'decisions'
   if (hasAud) return 'audit'
   return null

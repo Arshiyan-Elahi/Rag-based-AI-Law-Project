@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback, useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Search, Plus, Download, Loader, AlertTriangle, ShieldCheck, ClipboardCheck, HelpCircle, RefreshCw, ExternalLink } from 'lucide-react'
 import { getDeviations, getCAPAs, getAuditFindings, getDecisions, getDeviationContext } from '../api/editorApi'
+import { useLanguage } from '../context/LanguageContext'
 import './EntitiesPage.css'
 
 const typeConfig = {
@@ -36,6 +37,7 @@ const typeConfig = {
 }
 
 export default function EntitiesPage({ type }) {
+  const { friendlyError } = useLanguage()
   const navigate = useNavigate()
   const config = typeConfig[type] || {
     title: 'Unbekannter Bereich',
@@ -62,7 +64,8 @@ export default function EntitiesPage({ type }) {
       const normalized = Array.isArray(data) ? data.filter((item) => item && typeof item === 'object') : []
       setItems(normalized)
     } catch (err) {
-      setError(`Fehler beim Laden von ${config.title}`)
+      console.error(`Failed to load ${config.title}:`, err)
+      setError(friendlyError)
     } finally {
       setLoading(false)
     }
@@ -184,10 +187,11 @@ export default function EntitiesPage({ type }) {
         data: ctx,
       })
     } catch (ctxErr) {
+      console.error('Deviation context load failed:', ctxErr)
       setSelectedContext({
         id: item.id,
         title: item.title || item.deviation_number || 'Abweichung',
-        error: 'Kontext konnte nicht geladen werden.',
+        error: friendlyError,
       })
     } finally {
       setContextLoadingId(null)

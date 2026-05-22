@@ -49,16 +49,21 @@ import {
 import {
   applySOPImportMetadata,
   buildSOPDisplayLabel,
+  resolveDisplayDocumentId,
   importStatusToModalMessage,
   normalizeSOPTitleForDisplay,
   prepareEditorSOPImport,
+  validateSOPImportFileTypes,
 } from '../utils/sopImportService'
 import { InlineAiSuggestion } from '../extensions/InlineAiSuggestion'
 import { notifySopEditorContextChanged } from '../utils/editorAiBridge'
 import {
   applyTipTapContentToEditor,
+  hashTipTapDoc,
+  isImportPlaceholderDoc,
   isEditorContentEmpty,
 } from '../utils/editorUtils'
+import { getAppLanguage, getFriendlyErrorMessage, resolveImportUiError } from '../utils/friendlyErrorMessage'
 import '../assets/styles/global.css'
 
 const PreviewModal = lazy(() => import('../components/Common/PreviewModal'))
@@ -80,7 +85,11 @@ class EditorSurfaceErrorBoundary extends React.Component {
 
   render() {
     if (this.state.hasError) {
-      return <div className="editor-loading">Editor failed to load. Please refresh.</div>
+      return (
+        <div className="editor-loading">
+          {getFriendlyErrorMessage(getAppLanguage())}
+        </div>
+      )
     }
     return this.props.children
   }
@@ -93,6 +102,30 @@ const EMPTY_DOC = {
 
 const STORAGE_KEY = 'current_document_id'
 const KL_EDITOR_CONTEXT_KEY = 'kl_assistant_editor_state_v2'
+
+/** Import phases where editor content_json is ready to hydrate (stop editor polling after apply). */
+const IMPORT_CONTENT_READY_STATUSES = new Set([
+  'rendering_ready',
+  'completed',
+  'semantic_processing',
+  'indexing',
+])
+
+const IMPORT_TERMINAL_STATUSES = new Set(['completed', 'failed'])
+
+function isImportJobContentReady(job) {
+  if (!job || typeof job !== 'object') return false
+  const status = String(job.status || '').toLowerCase()
+  return Boolean(job.doc_json_ready) || IMPORT_CONTENT_READY_STATUSES.has(status)
+}
+
+function shouldStopEditorImportPolling(job, editorContentStable) {
+  if (!job || typeof job !== 'object') return true
+  const status = String(job.status || '').toLowerCase()
+  if (IMPORT_TERMINAL_STATUSES.has(status)) return true
+  if (editorContentStable && isImportJobContentReady(job)) return true
+  return false
+}
 
 const EditorShortcuts = Extension.create({
   name: 'editorShortcuts',
@@ -264,7 +297,7 @@ const EditorPage = ({
   embedTabId = null,
   onImportMetadataApplied = null,
 }) => {
-  const { language, setLanguage, t } = useLanguage()
+  const { language, setLanguage, t, friendlyError } = useLanguage()
   const { id: urlDocId } = useParams()
   const [documentId, setDocumentId] = useState(initialDocId || urlDocId || null)
   const [versions, setVersions] = useState([])
@@ -300,7 +333,24 @@ const EditorPage = ({
   const pendingInitialHydrationRef = useRef(Boolean(initialDocId))
   const hydrateSeqRef = useRef(0)
   const saveInFlightRef = useRef(false)
+  const lastAppliedContentHashRef = useRef('')
+  const lastAppliedVersionIdRef = useRef(null)
+  const editorContentStableRef = useRef(false)
+  const lastImportNoticeRef = useRef('')
   const [isEditorMounted, setIsEditorMounted] = useState(false)
+
+  const setImportNoticeIfChanged = useCallback((message) => {
+    const next = String(message || '').trim()
+    if (next === lastImportNoticeRef.current) return
+    lastImportNoticeRef.current = next
+    setImportNotice(next)
+  }, [])
+
+  const clearImportNotice = useCallback(() => {
+    if (!lastImportNoticeRef.current) return
+    lastImportNoticeRef.current = ''
+    setImportNotice('')
+  }, [])
 
   useEffect(() => {
     if (initialDocId) {
@@ -309,6 +359,10 @@ const EditorPage = ({
     } else {
       pendingInitialHydrationRef.current = false
     }
+    lastAppliedContentHashRef.current = ''
+    lastAppliedVersionIdRef.current = null
+    editorContentStableRef.current = false
+    lastImportNoticeRef.current = ''
   }, [initialDocId])
 
   useEffect(() => {
@@ -397,25 +451,21 @@ const EditorPage = ({
   )
   const docRevision = (metadata?.sopVersion || '').trim()
   const headerParts = [
-    (metadata?.documentId || '').trim(),
+    resolveDisplayDocumentId(metadata),
     cleanMetadataTitle,
     docRevision ? `v${docRevision.replace(/^v/i, '')}` : '',
   ].filter(Boolean)
   const breadcrumbLabel = headerParts.length ? headerParts.join(' · ') : currentVersionLabel
 
-  const applyVersionState = useCallback((versionRecord, fallbackTitle = '', htmlFallback = '') => {
-    if (!editor || !versionRecord || !isEditorMounted || editor.isDestroyed) return
-
-    hydrationRef.current = true
+  const applyMetadataFromVersion = useCallback((versionRecord, fallbackTitle = '') => {
+    if (!versionRecord) return
     const normalized = {
       ...DEFAULT_SOP_VERSION_METADATA.sopMetadata,
       ...(versionRecord.metadata?.sopMetadata || {}),
     }
-
     if (!normalized.title && fallbackTitle) {
       normalized.title = fallbackTitle
     }
-
     setMetadata(normalizeEditorMetadataTitle(normalized))
     setSopStatus(
       resolveSOPDisplayStatus({
@@ -425,27 +475,93 @@ const EditorPage = ({
     )
     setAuditTrail(versionRecord.metadata?.auditTrail || [])
     setVersionNote(versionRecord.metadata?.versionNote || '')
+  }, [])
 
-    const incomingJson = versionRecord.json || EMPTY_DOC
-    const editorHasContent = !isEditorContentEmpty(editor.getJSON())
-    if (!isEditorContentEmpty(incomingJson) || !editorHasContent) {
-      applyTipTapContentToEditor(editor, {
-        docJson: incomingJson,
-        html: htmlFallback,
-      })
+  const applyEditorContentIfChanged = useCallback((
+    docJson,
+    htmlFallback = '',
+    versionId = null,
+  ) => {
+    if (!editor || !isEditorMounted || editor.isDestroyed) return false
+
+    const incomingJson = docJson || EMPTY_DOC
+    const incomingReady =
+      !isEditorContentEmpty(incomingJson) && !isImportPlaceholderDoc(incomingJson)
+    const editorIsPlaceholder = isImportPlaceholderDoc(editor.getJSON())
+    if (!incomingReady && !editorIsPlaceholder) return false
+
+    const incomingHash = hashTipTapDoc(incomingJson)
+    if (
+      incomingHash
+      && incomingHash === lastAppliedContentHashRef.current
+      && (!versionId || versionId === lastAppliedVersionIdRef.current)
+    ) {
+      if (incomingReady) editorContentStableRef.current = true
+      return false
     }
 
+    hydrationRef.current = true
+    const applied = applyTipTapContentToEditor(editor, {
+      docJson: incomingJson,
+      html: htmlFallback,
+      lastAppliedHashRef: lastAppliedContentHashRef,
+    })
+    if (applied && incomingReady) {
+      editorContentStableRef.current = true
+      if (versionId) lastAppliedVersionIdRef.current = versionId
+    }
     window.setTimeout(() => {
       hydrationRef.current = false
     }, 0)
+    return applied
   }, [editor, isEditorMounted])
 
-  const hydrateFromDocument = useCallback(async (docId) => {
+  const applyVersionState = useCallback((versionRecord, fallbackTitle = '', htmlFallback = '') => {
+    if (!versionRecord || !isEditorMounted) return
+    applyMetadataFromVersion(versionRecord, fallbackTitle)
+    applyEditorContentIfChanged(
+      versionRecord.json || EMPTY_DOC,
+      htmlFallback,
+      versionRecord.id || null,
+    )
+  }, [applyMetadataFromVersion, applyEditorContentIfChanged, isEditorMounted])
+
+  const applyMetadataFromDocument = useCallback((doc, refreshedMeta) => {
+    const metaSource = refreshedMeta || doc?.metadata_json
+    if (!metaSource || typeof metaSource !== 'object') return
+    const normalizedMeta = normalizeMeta(metaSource)
+    const hydratedMeta = {
+      ...DEFAULT_SOP_VERSION_METADATA.sopMetadata,
+      ...(normalizedMeta?.sopMetadata || {}),
+    }
+    if (!hydratedMeta.title && doc?.title) {
+      hydratedMeta.title = doc.title
+    }
+    setMetadata(normalizeEditorMetadataTitle(hydratedMeta))
+    setSopStatus(
+      resolveSOPDisplayStatus({
+        externalStatus: doc?.status,
+        metadataJson: metaSource,
+      }),
+    )
+    const tabLabel = buildSOPDisplayLabel(hydratedMeta)
+    if (tabLabel && typeof onImportMetadataApplied === 'function') {
+      onImportMetadataApplied({
+        tabId: embedTabId,
+        tabLabel,
+        documentId: doc?.id || documentId,
+      })
+    }
+  }, [documentId, embedTabId, onImportMetadataApplied])
+
+  const hydrateFromDocument = useCallback(async (docId, options = {}) => {
+    const { metadataOnly = false, showLoading } = options
     if (!docId || !editor || !isEditorMounted || editor.isDestroyed) return
 
     const seq = hydrateSeqRef.current + 1
     hydrateSeqRef.current = seq
-    setIsLoadingDocument(true)
+    const shouldShowLoading = showLoading !== false && !editorContentStableRef.current
+    if (shouldShowLoading) setIsLoadingDocument(true)
 
     try {
       const [doc, dbVersions] = await Promise.all([
@@ -494,7 +610,14 @@ const EditorPage = ({
       setLatestVersionId(normalizedCurrent.id)
       setCompareBaseVersionId(normalizedCurrent.id)
       setCompareTargetVersionId(normalizedCurrent.id)
-      applyVersionState(normalizedCurrent, doc.title || '')
+      applyMetadataFromVersion(normalizedCurrent, doc.title || '')
+      if (!metadataOnly) {
+        applyEditorContentIfChanged(
+          normalizedCurrent.json || EMPTY_DOC,
+          '',
+          normalizedCurrent.id || null,
+        )
+      }
 
       // CRITICAL: Always use the UUID from the backend for subsequent API calls (like Related Context)
       if (doc.id) {
@@ -504,15 +627,35 @@ const EditorPage = ({
       if (seq === hydrateSeqRef.current) {
         pendingInitialHydrationRef.current = false
       }
-      setIsLoadingDocument(false)
+      if (shouldShowLoading) setIsLoadingDocument(false)
     }
-  }, [editor, applyVersionState, isEditorMounted])
+  }, [
+    editor,
+    applyMetadataFromVersion,
+    applyEditorContentIfChanged,
+    isEditorMounted,
+  ])
 
   useEffect(() => {
     if (!editor || !isEditorMounted || editor.isDestroyed || !initialDocId) return
-    if (!initialDocJson || !pendingInitialHydrationRef.current) return
+    if (!initialDocJson || isImportPlaceholderDoc(initialDocJson)) return
+
+    const incomingHash = hashTipTapDoc(initialDocJson)
+    if (incomingHash && incomingHash === lastAppliedContentHashRef.current) {
+      editorContentStableRef.current = true
+      pendingInitialHydrationRef.current = false
+      return
+    }
+
     hydrationRef.current = true
-    applyTipTapContentToEditor(editor, { docJson: initialDocJson })
+    const applied = applyTipTapContentToEditor(editor, {
+      docJson: initialDocJson,
+      lastAppliedHashRef: lastAppliedContentHashRef,
+    })
+    if (applied) {
+      editorContentStableRef.current = true
+      pendingInitialHydrationRef.current = false
+    }
     window.setTimeout(() => {
       hydrationRef.current = false
     }, 0)
@@ -527,57 +670,50 @@ const EditorPage = ({
     const pollBackgroundImport = async () => {
       try {
         const doc = await getDocument(documentId)
+        if (cancelled) return
+
         const job = doc?.metadata_json?._import_job
         if (!job || typeof job !== 'object') return
 
         const status = String(job.status || '').toLowerCase()
-        const contentReady = Boolean(job.doc_json_ready)
-          || status === 'rendering_ready'
-          || status === 'semantic_processing'
-          || status === 'indexing'
-          || status === 'completed'
-        if (contentReady && status !== 'failed') {
-          if (!cancelled) {
-            pendingInitialHydrationRef.current = true
-            await hydrateFromDocument(documentId)
-            if (status === 'completed') {
-              setImportNotice('')
-              return
-            }
-          }
-        }
-        if (status === 'completed') {
-          return
-        }
+        const contentReady = isImportJobContentReady(job)
+
         if (status === 'failed') {
-          if (!cancelled) {
-            setImportNotice(job.error || job.message || 'Background import failed.')
-          }
+          setImportNoticeIfChanged(
+            resolveImportUiError(
+              { message: job.error || job.message },
+              language,
+            ),
+          )
           return
         }
 
-        if (!cancelled) {
-          setImportNotice(
-            importStatusToModalMessage(status, job.message) || 'Processing import…',
-          )
+        if (contentReady && status !== 'failed' && !editorContentStableRef.current) {
           pendingInitialHydrationRef.current = true
+          await hydrateFromDocument(documentId, {
+            metadataOnly: false,
+            showLoading: true,
+          })
+          if (cancelled) return
         }
-        if (!cancelled) {
-          if (job.job_id) {
-            try {
-              await getImportJobStatus(job.job_id, {
-                versionId: doc?.version_id,
-                sopId: doc?.sop_id,
-              })
-            } catch {
-              // fall back to document metadata polling
-            }
+
+        if (shouldStopEditorImportPolling(job, editorContentStableRef.current)) {
+          if (status === 'completed') {
+            applyMetadataFromDocument(doc, doc.metadata_json)
           }
-          timerId = window.setTimeout(pollBackgroundImport, 2000)
+          clearImportNotice()
+          pendingInitialHydrationRef.current = false
+          return
         }
+
+        setImportNoticeIfChanged(
+          importStatusToModalMessage(status, job.message) || 'Processing import…',
+        )
+        timerId = window.setTimeout(pollBackgroundImport, 2000)
       } catch (err) {
-        if (!cancelled) {
-          console.error('Import status poll failed:', err)
+        if (cancelled) return
+        console.error('Import status poll failed:', err)
+        if (!editorContentStableRef.current) {
           timerId = window.setTimeout(pollBackgroundImport, 3000)
         }
       }
@@ -588,7 +724,16 @@ const EditorPage = ({
       cancelled = true
       if (timerId) window.clearTimeout(timerId)
     }
-  }, [documentId, editor, isEditorMounted, hydrateFromDocument])
+  }, [
+    documentId,
+    editor,
+    isEditorMounted,
+    hydrateFromDocument,
+    applyMetadataFromDocument,
+    setImportNoticeIfChanged,
+    clearImportNotice,
+    language,
+  ])
 
   useEffect(() => {
     console.debug('[SOP Status Debug] final rendered status', {
@@ -610,9 +755,11 @@ const EditorPage = ({
 
   useEffect(() => {
     if (!initialDocId || !openRequestKey || !editor || !isEditorMounted || editor.isDestroyed) return
-    // Explicit re-hydration when user clicks Open/Open again for the same tab.
-    // This updates metadata for mounted editor tabs without affecting normal typing flow.
-    hydrateFromDocument(initialDocId).catch((error) => {
+    // Tab refresh from SOPs import: metadata-only when editor content is already stable.
+    hydrateFromDocument(initialDocId, {
+      metadataOnly: editorContentStableRef.current,
+      showLoading: !editorContentStableRef.current,
+    }).catch((error) => {
       console.error('Failed to refresh document on open request:', error)
     })
   }, [initialDocId, openRequestKey, editor, isEditorMounted, hydrateFromDocument])
@@ -762,13 +909,10 @@ const EditorPage = ({
       }
     } catch (error) {
       console.error('Save failed:', error)
-      setSaveNotice(error?.message || 'Save failed. Please try again.')
+      setSaveNotice(friendlyError)
       window.setTimeout(() => setSaveNotice(''), 2600)
       if (error?.status === 409) {
-        window.alert(
-          error.message ||
-            'This SOP ID already exists. Please create a new version or choose another SOP ID.',
-        )
+        window.alert(friendlyError)
       }
     } finally {
       saveInFlightRef.current = false
@@ -850,7 +994,7 @@ const EditorPage = ({
       debouncedSave.cancel()
       persistDocument({ showSavingIndicator: true }).catch((error) => {
         console.error('Ctrl+S save failed:', error)
-        setSaveNotice(error?.message || 'Save failed.')
+        setSaveNotice(friendlyError)
         window.setTimeout(() => setSaveNotice(''), 2400)
       })
     }
@@ -1017,6 +1161,14 @@ const EditorPage = ({
     const file = event.target.files?.[0]
     if (!file || !editor || !isEditorMounted || editor.isDestroyed) return
 
+    const typeError = validateSOPImportFileTypes([file], language)
+    if (typeError) {
+      setImportNotice(typeError)
+      window.setTimeout(() => setImportNotice(''), 4000)
+      event.target.value = ''
+      return
+    }
+
     const previousDoc = editor.getJSON()
     setIsImporting(true)
     setImportNotice('')
@@ -1030,7 +1182,11 @@ const EditorPage = ({
       applyTipTapContentToEditor(editor, {
         docJson: imported.docJson,
         html: imported.html,
+        lastAppliedHashRef: lastAppliedContentHashRef,
       })
+      editorContentStableRef.current = true
+      pendingInitialHydrationRef.current = false
+      clearImportNotice()
 
       const ui = imported.metadata || {}
       if (ui && typeof ui === 'object') {
@@ -1057,8 +1213,7 @@ const EditorPage = ({
       setImportNotice('SOP imported successfully')
       window.setTimeout(() => setImportNotice(''), 2600)
     } catch (error) {
-      console.error('Import failed:', error)
-      setImportNotice(`Import failed: ${error?.message || 'Unknown error'}`)
+      setImportNoticeIfChanged(resolveImportUiError(error, language))
       // Never leave editor in a broken visual state after failed import.
       // Restore previous content first; if that fails, fallback to empty doc.
       try {
@@ -1144,9 +1299,8 @@ const EditorPage = ({
       })
     } catch (error) {
       console.error('Failed to compare versions from assistant:', error)
-      const msg = error?.message || 'Versionsvergleich fehlgeschlagen.'
-      window.alert(msg)
-      throw error instanceof Error ? error : new Error(msg)
+      window.alert(friendlyError)
+      throw error instanceof Error ? error : new Error('compare_failed')
     }
   }, [documentId, versions])
 

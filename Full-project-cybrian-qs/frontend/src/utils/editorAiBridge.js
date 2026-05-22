@@ -1,3 +1,5 @@
+import { getAppLanguage, getFriendlyErrorMessage } from './friendlyErrorMessage'
+
 /**
  * Editor ↔ KL/KI Assistant bridge.
  *
@@ -232,13 +234,37 @@ export function makeEditorAiRequestId() {
  * @param {string} [opts.source]    Origin tag (e.g. 'kl_assistant', 'chat_page').
  * @returns {string} The request id that result events will echo back.
  */
-export function dispatchEditorAiActionRequest({ action, prompt = '', requestId, source = 'kl_assistant' } = {}) {
+export function dispatchEditorAiActionRequest({
+  action,
+  prompt = '',
+  userMessage = '',
+  requestId,
+  source = 'kl_assistant',
+  targetScope = '',
+  sectionHint = '',
+} = {}) {
   if (typeof window === 'undefined') return ''
   const id = requestId || makeEditorAiRequestId()
-  console.info('[kl-editor-bridge-dispatch]', { action, requestId: id, source, promptLen: String(prompt || '').length })
+  const resolvedUserMessage = String(userMessage || '').trim() || String(prompt || '').trim()
+  console.info('[kl-editor-bridge-dispatch]', {
+    action,
+    requestId: id,
+    source,
+    promptLen: String(prompt || '').length,
+    targetScope: String(targetScope || ''),
+    sectionHint: String(sectionHint || ''),
+  })
   window.dispatchEvent(
     new CustomEvent(EDITOR_AI_ACTION_REQUEST_EVENT, {
-      detail: { action, prompt, requestId: id, source },
+      detail: {
+        action,
+        prompt,
+        userMessage: resolvedUserMessage,
+        requestId: id,
+        source,
+        targetScope: String(targetScope || '').trim().toLowerCase(),
+        sectionHint: String(sectionHint || '').trim(),
+      },
     }),
   )
   return id
@@ -302,24 +328,62 @@ const STATUS_MESSAGES_DE = {
   error: 'Editor-Aktion fehlgeschlagen.',
 }
 
+function stripPreviewPlain(text = '') {
+  return String(text || '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
 /**
- * Build a short, user-facing chat status line for a bridge result. Returned
- * text is German to match the existing assistant UI strings; callers may
- * append additional details (e.g. error.message).
+ * Build a short, user-facing chat status line for a bridge result.
  */
-export function describeEditorAiResult(detail) {
-  if (!detail || typeof detail !== 'object') return STATUS_MESSAGES_DE.error
-  const { action, status, message } = detail
+export function describeEditorAiResult(detail, language) {
+  if (!detail || typeof detail !== 'object') {
+    return getFriendlyErrorMessage(language ?? getAppLanguage())
+  }
+  const { action, status } = detail
   if (status === EDITOR_AI_ACTION_STATUS.NOT_AVAILABLE) {
     return STATUS_MESSAGES_DE.not_available
   }
   if (status === EDITOR_AI_ACTION_STATUS.ERROR) {
-    return message ? `${STATUS_MESSAGES_DE.error} ${message}` : STATUS_MESSAGES_DE.error
+    return detail.message || getFriendlyErrorMessage(language ?? getAppLanguage())
+  }
+  if (status === EDITOR_AI_ACTION_STATUS.DISPLAYED) {
+    const preview = stripPreviewPlain(detail.preview_excerpt || detail.preview || '')
+    const section = detail.section_name ? ` (${detail.section_name})` : ''
+    const unchanged = Number(detail.unchanged_chunks || 0)
+    const unchangedNote =
+      unchanged > 0
+        ? `\n\nHinweis: ${unchanged} Textabschnitt(e) blieben unverändert (Modelllimit). Prüfe die Vorschau im Editor.`
+        : ''
+    if (preview) {
+      const verb =
+        action === EDITOR_AI_ACTIONS.REWRITE
+          ? 'Rewrite-Vorschau'
+          : action === EDITOR_AI_ACTIONS.IMPROVE
+            ? 'Verbesserungs-Vorschau'
+            : action === EDITOR_AI_ACTIONS.GAP_CHECK
+              ? 'Gap-Check-Ergebnis'
+              : action === EDITOR_AI_ACTIONS.SUMMARIZE
+                ? 'Zusammenfassung'
+                : 'Vorschau'
+      const reviewHint =
+        action === EDITOR_AI_ACTIONS.REWRITE || action === EDITOR_AI_ACTIONS.IMPROVE
+          ? 'Im Editor: Inline-Vorschau prüfen und Accept oder Reject wählen.'
+          : 'Öffne die Vorschau im Editor und wähle Übernehmen oder Verwerfen.'
+      return `${verb}${section}:\n\n${preview}\n\n${reviewHint}${unchangedNote}`
+    }
+    if (action === EDITOR_AI_ACTIONS.READ) return STATUS_MESSAGES_DE.read_displayed
+    if (action === EDITOR_AI_ACTIONS.COMPARE) return STATUS_MESSAGES_DE.compare_displayed
+    return 'Vorschau im Editor bereit. Bitte Übernehmen oder Verwerfen wählen.'
   }
   if (action === EDITOR_AI_ACTIONS.READ) return STATUS_MESSAGES_DE.read_displayed
   if (action === EDITOR_AI_ACTIONS.COMPARE && status === EDITOR_AI_ACTION_STATUS.DISPLAYED) {
     return STATUS_MESSAGES_DE.compare_displayed
   }
   const key = `${action}_${status === EDITOR_AI_ACTION_STATUS.APPLIED ? 'applied' : 'cancelled'}`
-  return STATUS_MESSAGES_DE[key] || STATUS_MESSAGES_DE.error
+  return STATUS_MESSAGES_DE[key] || getFriendlyErrorMessage(language ?? getAppLanguage())
 }

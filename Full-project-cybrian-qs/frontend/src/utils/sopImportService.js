@@ -3,6 +3,10 @@ import { mapBlocksToTipTapDoc } from './editorUtils'
 import { formatOCRText } from './formatOCRText'
 import { mapOCRBlocksToHTML } from './mapOCRBlocksToHTML'
 import { DEFAULT_SOP_VERSION_METADATA } from './sopConstants'
+import {
+  UNSUPPORTED_FILE_TYPE_CODE,
+  getUnsupportedFileTypeMessage,
+} from './friendlyErrorMessage'
 
 export const SOP_IMPORT_ACCEPT = '.pdf,.docx,.txt'
 
@@ -22,20 +26,33 @@ const SOP_IMPORT_BLOCKED_MIME_TYPES = new Set([
   'application/msword',
 ])
 
-export const SOP_IMPORT_UNSUPPORTED_MESSAGE =
-  'This file format is not supported. Please upload PDF, DOCX, or TXT.'
+/** @deprecated Use {@link getUnsupportedFileTypeMessage} — kept for legacy string checks */
+export const SOP_IMPORT_UNSUPPORTED_MESSAGE = UNSUPPORTED_FILE_TYPE_CODE
 
 /** @typedef {'uploading'|'extracting'|'ocr_processing'|'creating_sop'|'rendering_ready'|'semantic_processing'|'indexing'|'success'|'error'} SOPImportModalPhase */
 
+const GENERATED_IMPORT_SOP_NUMBER = /^IMPORT-[A-Z0-9-]{6,}$/i
+
+export function isGeneratedImportSopNumber(value = '') {
+  const token = String(value || '').trim().toUpperCase()
+  return GENERATED_IMPORT_SOP_NUMBER.test(token)
+}
+
+/** Document ID safe for tabs/headers (hides internal IMPORT-* placeholders). */
+export function resolveDisplayDocumentId(metadata = {}) {
+  const id = String(metadata?.documentId || '').trim()
+  return isGeneratedImportSopNumber(id) ? '' : id
+}
+
 export const SOP_IMPORT_STATUS_MESSAGES = {
   uploading: 'SOP is uploading...',
-  queued: 'Queued for local Marker PDF extraction…',
-  processing_marker: 'Running local Marker PDF extraction…',
-  converting_blocks: 'Converting Marker output to structured blocks…',
+  queued: 'Queued for document extraction…',
+  processing_marker: 'Extracting document structure…',
+  converting_blocks: 'Extracting document structure in reading order…',
   saving_editor_content: 'Saving structured content to the editor…',
-  processing: 'Running local Marker PDF extraction…',
-  extracting: 'Running local Marker PDF extraction…',
-  ocr_processing: 'Running local Marker PDF extraction…',
+  processing: 'Extracting document structure…',
+  extracting: 'Extracting document structure…',
+  ocr_processing: 'Extracting scanned document (OCR)…',
   creating_sop: 'Saving structured content to the editor…',
   rendering_ready: 'Opening document in the editor…',
   semantic_processing: 'Indexing and linking content in the background…',
@@ -106,7 +123,11 @@ export async function pollImportJobUntilDone(jobId, options = {}) {
       options.onContentReady?.(status)
     }
     // Editor content is ready after extraction/save; do not wait for semantic/RAG jobs.
-    if (phase === 'completed' || (contentReady && phase === 'rendering_ready')) {
+    if (
+      phase === 'completed'
+      || phase === 'rendering_ready'
+      || (contentReady && contentReadyNotified)
+    ) {
       return status
     }
     if (phase === 'failed') {
@@ -179,7 +200,7 @@ export async function prepareNewSOPImportAsync(file, options = {}) {
       reviewer: '',
     }),
     metadata,
-    tabLabel: buildSOPDisplayLabel(metadata) || doc.sop_number || resolvedTitle,
+    tabLabel: buildSOPDisplayLabel(metadata) || resolvedTitle,
     importStatus: finalStatus,
   }
 }
@@ -213,34 +234,51 @@ export function isSupportedSOPImportFile(file) {
   return true
 }
 
-/** @returns {string|null} Error message when any file is unsupported */
-export function validateSOPImportFileTypes(files) {
+/** @returns {string|null} Localized error when any file is not PDF, DOCX, or TXT */
+export function validateSOPImportFileTypes(files, language) {
   const list = Array.isArray(files) ? files : []
   const unsupported = list.filter((file) => !isSupportedSOPImportFile(file))
   if (!unsupported.length) return null
-  return SOP_IMPORT_UNSUPPORTED_MESSAGE
+  return getUnsupportedFileTypeMessage(language)
 }
 
-/** Throws with {@link SOP_IMPORT_UNSUPPORTED_MESSAGE} when the file is not PDF, DOCX, or TXT. */
+/** Throws when the file is not PDF, DOCX, or TXT (use {@link resolveImportUiError} in UI). */
 export function assertSOPImportFileAllowed(file) {
   if (!isSupportedSOPImportFile(file)) {
-    throw new Error(SOP_IMPORT_UNSUPPORTED_MESSAGE)
+    throw new Error(UNSUPPORTED_FILE_TYPE_CODE)
   }
 }
 
 export async function extractSOPImport(file) {
   assertSOPImportFileAllowed(file)
   const response = await extractText(file)
+
+  // New sequential elements format (preferred) — produced by the backend
+  // reading-order extractors (pdfplumber / fitz / docx sequential walker).
+  // Falls back to legacy typed blocks when the server predates this change.
+  const elements = Array.isArray(response?.elements) && response.elements.length
+    ? response.elements
+    : null
   const blocks = Array.isArray(response?.blocks) ? response.blocks : []
+
+  // contentSource drives both the TipTap doc and the HTML preview.
+  // mapBlocksToTipTapDoc / mapOCRBlocksToHTML both handle either format.
+  const contentSource = elements ?? blocks
+
   const text = response?.text || ''
   const metadata = normalizeSOPImportMetadata(response?.sop_metadata_ui)
 
   return {
     response,
-    blocks,
+    // contentSource is what downstream callers (prepareEditorSOPImport etc.)
+    // feed into mapBlocksToTipTapDoc and mapOCRBlocksToHTML.
+    blocks: contentSource,
+    // Raw originals preserved for callers that need them separately.
+    elements: elements ?? [],
+    rawBlocks: blocks,
     text,
     metadata,
-    hasContent: Boolean(text.trim() || blocks.length),
+    hasContent: Boolean(text.trim() || contentSource.length),
   }
 }
 
@@ -299,6 +337,10 @@ export function normalizeSOPImportMetadata(rawMetadata) {
     })
   }
 
+  if (isGeneratedImportSopNumber(normalized.documentId)) {
+    normalized.documentId = ''
+  }
+
   return normalized
 }
 
@@ -317,9 +359,10 @@ export function normalizeSOPTitleForDisplay(title = '', documentId = '') {
 }
 
 export function buildSOPDisplayLabel(metadata = {}, fallback = '') {
-  const cleanTitle = normalizeSOPTitleForDisplay(metadata.title, metadata.documentId)
+  const documentId = resolveDisplayDocumentId(metadata)
+  const cleanTitle = normalizeSOPTitleForDisplay(metadata.title, documentId)
   return [
-    metadata.documentId,
+    documentId,
     cleanTitle,
     (metadata.sopVersion || '').trim(),
   ].filter(Boolean).join(' — ') || fallback

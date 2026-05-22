@@ -7,6 +7,7 @@ import { classifyAssistantIntent } from '../api/editorApi'
 import { queryEditorHasNonEmptySelection } from './editorActionsBridge'
 import { getKLAssistantContext } from './assistantContext'
 import { EDITOR_AI_ACTIONS, hasActiveSopEditor } from './editorAiBridge'
+import { isExplicitFullSopRequest } from './sopActionIntent'
 
 const ACTION_MAP = {
   rewrite: EDITOR_AI_ACTIONS.REWRITE,
@@ -115,7 +116,14 @@ export function mapClassificationToEditorAction(classification) {
  */
 export function planEditorActionExecution(classification, opts = {}) {
   const intent = opts.explicitAction || mapClassificationToEditorAction(classification)
-  const scope = String(classification?.target_scope || '').toLowerCase()
+  const message = String(opts.message || '').trim()
+  const fromChat = Boolean(opts.fromChat)
+  let scope = String(classification?.target_scope || '').toLowerCase()
+  if (isExplicitFullSopRequest({ instruction: message })) {
+    scope = 'full_document'
+  } else if (scope === 'full_document') {
+    scope = classification?.section_hint ? 'section' : 'selection'
+  }
   const sectionHint = String(classification?.section_hint || '').trim()
   const snapshotOptions = {
     sectionHint,
@@ -134,10 +142,18 @@ export function planEditorActionExecution(classification, opts = {}) {
 
   const inlineAction = intent
 
+  const chatContentActions = new Set([
+    EDITOR_AI_ACTIONS.REWRITE,
+    EDITOR_AI_ACTIONS.IMPROVE,
+    EDITOR_AI_ACTIONS.GAP_CHECK,
+    EDITOR_AI_ACTIONS.SUMMARIZE,
+  ])
+
   const useBridge =
     intent === EDITOR_AI_ACTIONS.COMPARE
     || intent === EDITOR_AI_ACTIONS.READ
     || intent === EDITOR_AI_ACTIONS.ANALYZE
+    || (fromChat && chatContentActions.has(intent))
 
   const useInline = INLINE_CONTENT_ACTIONS.has(intent) && !useBridge
 
@@ -176,8 +192,8 @@ export function buildEnrichedActionPrompt(message, classification = {}) {
       'Apply to the complete section body under that heading (all paragraphs until the next section), not the heading line alone.',
     )
   }
-  if (classification.target_scope === 'full_document') {
-    hints.push('Apply to the entire SOP document.')
+  if (classification.target_scope === 'full_document' && wantsFullSopIntent(base)) {
+    hints.push('Apply to the entire SOP document (explicit full-SOP request).')
   }
   if (classification.target_scope === 'selection') {
     hints.push('Apply only to the current editor selection.')

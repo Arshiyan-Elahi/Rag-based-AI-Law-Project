@@ -115,6 +115,27 @@ const renderBlock = (block = {}, isContract = false) => {
     if (!block || typeof block !== 'object') return '';
 
     const type = String(block.type || 'paragraph').toLowerCase();
+
+    // ── NEW UNIFIED ELEMENTS FORMAT ───────────────────────────────────────────
+    // Emitted by the backend sequential extractors (pdfplumber / fitz / docx).
+    // type="text"  → style drives heading vs paragraph rendering
+    // type="table" → content is a 2-D array of string rows
+    if (type === 'text') {
+        const text = cleanText(block.content || block.text || '');
+        if (!text) return '';
+        const style = String(block.style || 'paragraph').toLowerCase();
+        if (style === 'heading') {
+            return `<h2 class="ocr-section-heading">${escapeHtml(text)}</h2>`;
+        }
+        return renderParagraphs(text);
+    }
+
+    if (type === 'table' && Array.isArray(block.content) && !Array.isArray(block.rows)) {
+        // New format: block.content is [[row1col1, row1col2], ...] (2-D array)
+        return renderTable({ rows: block.content });
+    }
+    // ── END NEW FORMAT ────────────────────────────────────────────────────────
+
     const text = cleanText(block.text || '');
 
     switch (type) {

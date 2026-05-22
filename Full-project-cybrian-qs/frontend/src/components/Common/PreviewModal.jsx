@@ -13,6 +13,7 @@ import { resolveTextWithVariables } from '../../utils/resolveVariables';
 import { printDocument } from '../../utils/printHelpers';
 
 import { useLanguage } from '../../context/LanguageContext';
+import { getFriendlyErrorMessage } from '../../utils/friendlyErrorMessage';
 
 /**
  * Preview and Export Modal Component.
@@ -31,7 +32,7 @@ const PreviewModal = ({
     contractVariables = {},
 }) => {
     const previewRef = useRef(null);
-    const { t } = useLanguage();
+    const { t, language } = useLanguage();
     const [scale, setScale] = useState(1);
     const [orientation, setOrientation] = useState('portrait');
 
@@ -265,7 +266,7 @@ const PreviewModal = ({
             pdf.save(`Document-${versionId}.pdf`);
         } catch (error) {
             console.error('PDF export failed:', error);
-            alert('PDF export failed. Check console for details.');
+            alert(getFriendlyErrorMessage(language));
         } finally {
             document.body.removeChild(exportWrapper);
         }

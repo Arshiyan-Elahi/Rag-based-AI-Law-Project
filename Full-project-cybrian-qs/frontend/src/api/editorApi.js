@@ -1,4 +1,6 @@
 import { getCybrainAccessToken } from '../utils/authSession'
+import { runAIAction, fetchChatQueryWithRetry } from '../utils/aiActionClient'
+import { getAppLanguage, getFriendlyErrorMessage } from '../utils/friendlyErrorMessage'
 
 const API_BASE = import.meta.env.VITE_API_BASE || ''
 const SIDEBAR_COUNTS_REFRESH_EVENT = 'sidebar-counts-refresh'
@@ -414,27 +416,7 @@ export async function queryAI(question, options = {}) {
     payload.assistant_mode = options.assistant_mode
   }
 
-  const controller = new AbortController()
-  const timeoutMs = 70000
-  const timer = setTimeout(() => controller.abort(), timeoutMs)
-  let res
-  try {
-    res = await fetch(`${API_BASE}/api/ai/query`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...buildOptionalAuthHeaders() },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    })
-  } catch (err) {
-    if (err?.name === 'AbortError') {
-      throw new Error('AI query timed out. Please try again.')
-    }
-    throw err
-  } finally {
-    clearTimeout(timer)
-  }
-  if (!res.ok) await throwApiError(res, 'AI query failed')
-  return res.json()
+  return fetchChatQueryWithRetry(payload)
 }
 
 export async function createLink(payload) {
@@ -461,43 +443,23 @@ export async function getRelatedContext(sopId) {
   return res.json()
 }
 
+/**
+ * Editor AI actions: synchronous POST /api/ai/action (rewrite/improve/gap_check included).
+ * Errors surface as the global friendly message only.
+ * @param {object} payload
+ */
 export async function performAIAction(payload) {
-  // Single timeout for the full round-trip. The backend has no /sop/improve-style routes;
-  // calling /api/ai/action directly avoids a wasted request and a bug where the abort
-  // timer was cleared after the first fetch, leaving the follow-up with no time limit.
-  const controller = new AbortController()
-  const timeoutMs = 120000
-  const normalizedAction = String(payload?.action || '').trim().toLowerCase().replace(/-/g, '_')
-  const requestTimeoutMs = normalizedAction === 'rewrite' ? 300000 : timeoutMs
-  const actionTimer = setTimeout(() => controller.abort(), requestTimeoutMs)
-
   try {
-    const res = await fetch(`${API_BASE}/api/ai/action`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: normalizedAction,
-        text: payload?.text || '',
-        sop_title: payload?.sop_title || null,
-        section_name: payload?.section_name || payload?.section_title || null,
-        section_type: payload?.section_type || null,
-        edit_scope: payload?.edit_scope || null,
-        client_structured_json: payload?.client_structured_json || null,
-        sop_entity_id: payload?.sop_entity_id || null,
-        triggered_by: payload?.triggered_by || null,
-        assistant_instruction: payload?.assistant_instruction || null,
-      }),
-      signal: controller.signal,
-    })
-    if (!res.ok) await throwApiError(res, 'AI action failed')
-    return res.json()
+    return await runAIAction(payload)
   } catch (err) {
-    if (err?.name === 'AbortError') {
-      throw new Error('AI action timed out. The model or network may be slow; try a shorter selection.')
+    if (err?.isDuplicate) {
+      return null
     }
-    throw err
-  } finally {
-    clearTimeout(actionTimer)
+    if (err?.isFriendlyError) {
+      throw err
+    }
+    console.error('[performAIAction]', err)
+    throw new Error(getFriendlyErrorMessage(getAppLanguage()))
   }
 }
 
