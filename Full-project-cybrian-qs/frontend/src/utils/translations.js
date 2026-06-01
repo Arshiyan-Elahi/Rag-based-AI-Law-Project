@@ -158,6 +158,11 @@ export const translations = {
         system: 'System',
         createdNewRevision: 'Created new revision',
 
+        // Source PDF (scanned import)
+        originalPdfPreview: 'Original PDF (import)',
+        originalPdfPreviewHint:
+          'Editable SOP content is in the editor below. This panel shows the uploaded PDF unchanged.',
+
         // PreviewModal
         printPreviewExport: 'Print Preview & Export',
         orientation: 'Orientation:',
@@ -352,6 +357,11 @@ export const translations = {
         author: 'Autor',
         system: 'System',
         createdNewRevision: 'Neue Version erstellt',
+
+        // Source PDF (scanned import)
+        originalPdfPreview: 'Original-PDF (Import)',
+        originalPdfPreviewHint:
+          'Bearbeitbarer SOP-Inhalt steht im Editor unten. Dieses Panel zeigt das hochgeladene PDF unverändert.',
 
         // PreviewModal
         printPreviewExport: 'Druckvorschau & Export',

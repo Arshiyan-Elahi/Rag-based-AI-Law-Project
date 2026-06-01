@@ -446,6 +446,18 @@ export async function prepareEditorSOPImport(file) {
     ? mapOCRBlocksToHTML(importResult.blocks, 'sop')
     : formatOCRText(importResult.text)
 
+  if (import.meta?.env?.DEV) {
+    const isScanned = Boolean(importResult.response?.scanned_pdf)
+    console.debug('[SOP Import] structured content', {
+      scanned: isScanned,
+      elements: importResult.elements?.length || 0,
+      blocks: importResult.blocks?.length || 0,
+      tiptapNodes: docJson?.content?.length || 0,
+      tiptapNodeTypes: (docJson?.content || []).map((n) => n.type),
+      docJson,
+    })
+  }
+
   if (!html || !String(html).trim()) {
     throw new Error('No structured content extracted from file.')
   }

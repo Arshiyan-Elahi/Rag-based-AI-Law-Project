@@ -551,3 +551,9 @@ export async function extractText(file, options = {}) {
     clearTimeout(timer)
   }
 }
+
+/** URL for archived source PDF preview (scanned imports only). */
+export function getSourcePdfUrl(versionId) {
+  if (!versionId) return ''
+  return `${API_BASE}/api/editor/versions/${encodeURIComponent(versionId)}/source-pdf`
+}

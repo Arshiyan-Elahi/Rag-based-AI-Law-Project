@@ -534,11 +534,21 @@ def extract_docx_bytes(docx_bytes: bytes) -> Tuple[List[Dict[str, Any]], str]:
 #           or: {"type": "table", "content": [[row1col1, row1col2, ...], ...]}
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _extract_elements_fitz_ocr(file_bytes: bytes) -> List[Dict[str, Any]]:
+_last_scanned_extraction_engine: str | None = None
+
+
+def get_last_scanned_extraction_engine() -> str | None:
+    """Engine used for the most recent scanned PDF extraction (paddle or legacy)."""
+    return _last_scanned_extraction_engine
+
+
+def _extract_elements_legacy_ocr(file_bytes: bytes) -> List[Dict[str, Any]]:
     """
-    Scanned PDF path: fitz (PyMuPDF) get_textpage_ocr with whitespace preservation.
+    Legacy scanned PDF path: fitz (PyMuPDF) get_textpage_ocr with whitespace preservation.
     Falls back to pytesseract if fitz is unavailable.
     """
+    from .paddleocr_scanned_extractor import ocr_text_to_elements
+
     elements: List[Dict[str, Any]] = []
     try:
         import fitz  # type: ignore  # PyMuPDF
@@ -557,13 +567,24 @@ def _extract_elements_fitz_ocr(file_bytes: bytes) -> List[Dict[str, Any]]:
             if not raw_text.strip():
                 continue
 
-            # Split on blank lines → candidate paragraphs
-            for raw_para in re.split(r"\n\s*\n", raw_text):
-                para = _clean_line(raw_para.strip())
-                if not para:
-                    continue
-                style = "heading" if _is_likely_heading(para) else "paragraph"
-                elements.append({"type": "text", "style": style, "content": para})
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[legacy-ocr] page %s raw OCR text (%s chars):\n%s",
+                    page_idx,
+                    len(raw_text),
+                    raw_text[:2000],
+                )
+
+            # Structure-aware: preserve every OCR line as its own element,
+            # detect headings + DEV/CAPA/AUD/DEC items. NEVER collapse the page
+            # into one paragraph (the previous _clean_line(\n→space) bug).
+            page_elements = ocr_text_to_elements(raw_text)
+            logger.info(
+                "[legacy-ocr] page %s produced %s elements",
+                page_idx,
+                len(page_elements),
+            )
+            elements.extend(page_elements)
 
         doc.close()
 
@@ -572,16 +593,78 @@ def _extract_elements_fitz_ocr(file_bytes: bytes) -> List[Dict[str, Any]]:
             "fitz (PyMuPDF) not installed; falling back to pytesseract for scanned PDF."
         )
         if HAS_OCR_DEPS:
-            # Best-effort: run OCR on page 1 only (fast preview)
+            # Best-effort: run OCR on page 1 only (fast preview). Join lines with
+            # newlines so the shared structurer keeps them as separate elements.
             ocr_lines = _run_ocr_lines_on_page(file_bytes, 1)
-            for line in ocr_lines:
-                clean = _clean_line(line)
-                if clean:
-                    style = "heading" if _is_likely_heading(clean) else "paragraph"
-                    elements.append({"type": "text", "style": style, "content": clean})
+            elements.extend(ocr_text_to_elements("\n".join(ocr_lines)))
     except Exception as exc:
         logger.exception("[sequential-extract] fitz OCR extraction failed: %s", exc)
 
+    return elements
+
+
+def _extract_elements_scanned_pdf(file_bytes: bytes) -> List[Dict[str, Any]]:
+    """
+    Scanned PDF extraction.
+
+    Primary engine : Docling OCR + table structure (engine="docling_scanned").
+    Fallback engine: fitz (PyMuPDF) get_textpage_ocr + Tesseract
+                     (engine="fitz_tesseract_fallback").
+
+    PaddleOCR is intentionally NOT used for scanned PDFs (removed to avoid a
+    silent third fallback path). DOCX and native-PDF flows are unaffected.
+    """
+    global _last_scanned_extraction_engine  # noqa: PLW0603
+
+    docling_enabled = False
+    try:
+        from .docling_extractor import is_docling_scanned_enabled
+
+        docling_enabled = is_docling_scanned_enabled()
+    except Exception as exc:
+        logger.warning(
+            "[sequential-extract] Docling unavailable (import failed): %s", exc
+        )
+
+    if docling_enabled:
+        try:
+            from .docling_extractor import (
+                EXTRACTION_ENGINE_DOCLING_SCANNED,
+                extract_scanned_pdf_docling_elements,
+            )
+
+            elements = extract_scanned_pdf_docling_elements(file_bytes)
+            if elements:
+                _last_scanned_extraction_engine = EXTRACTION_ENGINE_DOCLING_SCANNED
+                logger.info(
+                    "[sequential-extract] scanned PDF via Docling engine=%s elements=%s",
+                    EXTRACTION_ENGINE_DOCLING_SCANNED,
+                    len(elements),
+                )
+                return elements
+            logger.warning(
+                "[sequential-extract] Docling produced no elements; "
+                "falling back to fitz+Tesseract."
+            )
+        except Exception as exc:
+            logger.warning(
+                "[sequential-extract] Docling scanned extraction failed, "
+                "falling back to fitz+Tesseract: %s",
+                exc,
+            )
+    else:
+        logger.info(
+            "[sequential-extract] Docling scanned engine disabled "
+            "(SOP_DOCLING_SCANNED_ENABLED=false); using fitz+Tesseract."
+        )
+
+    elements = _extract_elements_legacy_ocr(file_bytes)
+    _last_scanned_extraction_engine = "fitz_tesseract_fallback"
+    logger.info(
+        "[sequential-extract] scanned PDF via fitz+Tesseract fallback "
+        "engine=fitz_tesseract_fallback elements=%s",
+        len(elements),
+    )
     return elements
 
 
@@ -726,9 +809,12 @@ def extract_sequential_elements(file_bytes: bytes) -> List[Dict[str, Any]]:
       {"type": "text",  "style": "heading"|"paragraph", "content": "<str>"}
       {"type": "table", "content": [["Header1","Header2"], ["Row1C1","Row1C2"]]}
     """
+    global _last_scanned_extraction_engine
+
     if not file_bytes:
         return []
 
     if _pdf_is_scanned(file_bytes):
-        return _extract_elements_fitz_ocr(file_bytes)
+        return _extract_elements_scanned_pdf(file_bytes)
+    _last_scanned_extraction_engine = None
     return _extract_elements_pdfplumber(file_bytes)

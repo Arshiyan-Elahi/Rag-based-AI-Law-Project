@@ -296,7 +296,7 @@ def _extract_file(
     db: Session | None = None,
 ) -> Tuple[list, list, str, bool]:
     """
-    Fast reading-order extraction (pdfplumber / fitz OCR / DOCX XML walk / TXT).
+    Fast reading-order extraction (pdfplumber / PaddleOCR PPStructure or fitz OCR / DOCX / TXT).
     Returns (blocks, elements, text, scanned_pdf). No chunking or semantic work here.
     """
     from .document_extraction import apply_extraction_fields
@@ -451,6 +451,9 @@ def _save_extracted_sop_content(
             "effectiveDate": sop_ui.get("effectiveDate") or sm.get("effectiveDate") or "",
             "reviewDate": sop_ui.get("reviewDate") or sm.get("reviewDate") or "",
             "riskLevel": sop_ui.get("riskLevel") or sm.get("riskLevel") or "Low",
+            "riskRating": sop_ui.get("riskRating") or sm.get("riskRating") or "",
+            "riskAssessment": sop_ui.get("riskAssessment") or sm.get("riskAssessment") or "",
+            "riskCategory": sop_ui.get("riskCategory") or sm.get("riskCategory") or "",
             "regulatoryReferences": sop_ui.get("regulatoryReferences")
             or sm.get("regulatoryReferences")
             or [],
@@ -476,6 +479,11 @@ def _save_extracted_sop_content(
     meta["sopMetadata"] = sm
     if elements:
         meta["_import_elements"] = elements
+    if scanned_pdf:
+        from .pdf_extractor import get_last_scanned_extraction_engine
+
+        ocr_engine = get_last_scanned_extraction_engine() or "fitz_tesseract_fallback"
+        meta["_scanned_pdf_ocr_engine"] = ocr_engine
 
     version.content_json = doc_json
     version.metadata_json = meta
@@ -535,6 +543,18 @@ def _run_import_job(
         db.expire_all()
         sop, version = _load_import_entities(db, sop_id, version_id)
 
+        if (filename or "").lower().endswith(".pdf"):
+            from .pdf_extractor import _pdf_is_scanned
+
+            if _pdf_is_scanned(raw):
+                on_stage(
+                    IMPORT_STATUS_OCR,
+                    SOP_IMPORT_STATUS_MESSAGES.get(
+                        IMPORT_STATUS_OCR,
+                        "Extracting scanned document (OCR)…",
+                    ),
+                )
+
         blocks, elements, text, scanned_pdf = _extract_file(
             raw,
             filename,
@@ -567,11 +587,34 @@ def _run_import_job(
             sop_ui.get("documentId") or "(none)",
             (sop_ui.get("title") or "")[:120],
         )
+        logger.info(
+            "[sop-import] metadata dates/risk job_id=%s effectiveDate=%s reviewDate=%s "
+            "riskLevel=%s riskRating=%s riskAssessment=%s riskCategory=%s",
+            job_id,
+            sop_ui.get("effectiveDate") or "(none)",
+            sop_ui.get("reviewDate") or "(none)",
+            sop_ui.get("riskLevel") or "(none)",
+            sop_ui.get("riskRating") or "(none)",
+            sop_ui.get("riskAssessment") or "(none)",
+            sop_ui.get("riskCategory") or "(none)",
+        )
 
         db.expire_all()
         sop, version = _load_import_entities(db, sop_id, version_id)
         if not sop or not version:
             raise RuntimeError("SOP shell disappeared during background import.")
+
+        if scanned_pdf and (filename or "").lower().endswith(".pdf"):
+            from .source_pdf_store import archive_source_pdf
+
+            try:
+                archive_source_pdf(version_id, raw)
+            except Exception as exc:
+                logger.warning(
+                    "[sop-import] source PDF archive failed job_id=%s: %s",
+                    job_id,
+                    exc,
+                )
 
         _save_extracted_sop_content(
             db,
@@ -585,6 +628,25 @@ def _run_import_job(
             scanned_pdf=scanned_pdf,
             sop_ui=sop_ui,
         )
+
+        if scanned_pdf and (filename or "").lower().endswith(".pdf"):
+            from .source_pdf_store import source_pdf_exists
+
+            db.expire_all()
+            sop, version = _load_import_entities(db, sop_id, version_id)
+            if version and source_pdf_exists(version_id):
+                meta = (
+                    version.metadata_json
+                    if isinstance(version.metadata_json, dict)
+                    else {}
+                )
+                meta["_source_pdf"] = {
+                    "available": True,
+                    "version_id": str(version_id),
+                }
+                version.metadata_json = meta
+                db.add(version)
+                db.commit()
 
         on_stage(
             IMPORT_STATUS_RENDERING_READY,

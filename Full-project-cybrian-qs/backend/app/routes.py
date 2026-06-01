@@ -1,5 +1,6 @@
 import io
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, UploadFile, File
+from fastapi.responses import FileResponse
 from typing import List ,Any
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_, asc
@@ -1002,14 +1003,18 @@ router = APIRouter()
 @router.get("/api/health")
 def health():
     from .services.local_marker_extractor import check_local_marker_setup
+    from .services.paddleocr_scanned_extractor import check_paddle_ocr_setup
     from .services.pdf_extractor import check_ocr_setup
 
     ocr = check_ocr_setup()
     marker = check_local_marker_setup()
+    paddle = check_paddle_ocr_setup()
     return {
         "status": "ok",
         "ocr": ocr,
         "ocr_ready": bool(ocr.get("tesseract_binary") and ocr.get("poppler_binaries")),
+        "paddle_ocr": paddle,
+        "paddle_ocr_ready": bool(paddle.get("enabled") and paddle.get("available")),
         "local_marker": marker,
         "local_marker_ready": bool(marker.get("enabled") and marker.get("available")),
     }
@@ -1035,7 +1040,7 @@ async def extract_text_from_upload(file: UploadFile = File(...)):
     (chunking, embedding, Qdrant indexing) are NOT triggered here — they run
     inside the async import pipeline (import-async endpoint).
 
-    PDF : pdfplumber (digital) / PyMuPDF OCR (scanned) sequential elements (sync).
+    PDF : pdfplumber (digital) / PaddleOCR PPStructure (scanned, fitz render) sequential elements (sync).
     DOCX: pre-mapped OpenXML body walk (sync).
     TXT : line-by-line sequential elements (sync).
     """
@@ -1459,6 +1464,38 @@ def get_document(doc_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Current version not found in sop_versions")
 
     return _build_editor_doc_response(sop, current_version)
+
+
+@router.get("/api/editor/versions/{version_id}/source-pdf")
+def get_version_source_pdf(version_id: str, db: Session = Depends(get_db)):
+    """
+    Return the archived original PDF for a scanned import (preview only).
+    Editable content lives in TipTap JSON; this endpoint serves the upload unchanged.
+    """
+    from .services.source_pdf_store import source_pdf_path, source_pdf_exists
+
+    try:
+        vid = uuid.UUID(str(version_id))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid version_id")
+
+    version = db.query(SOPVersion).filter(SOPVersion.id == vid).first()
+    if not version:
+        raise HTTPException(status_code=404, detail="Version not found")
+
+    meta = version.metadata_json if isinstance(version.metadata_json, dict) else {}
+    if not meta.get("_source_pdf", {}).get("available") and not source_pdf_exists(vid):
+        raise HTTPException(status_code=404, detail="Source PDF not available for this version")
+
+    path = source_pdf_path(vid)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Source PDF file missing on disk")
+
+    return FileResponse(
+        path,
+        media_type="application/pdf",
+        filename=f"source-{vid}.pdf",
+    )
 
 
 @router.put("/api/editor/docs/{doc_id}", response_model=EditorDocResponse)

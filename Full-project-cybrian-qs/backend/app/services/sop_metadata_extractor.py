@@ -5,9 +5,12 @@ Supports German and English; does not rely on fixed line indices.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 _INVALID_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
 
@@ -170,6 +173,75 @@ _GENERIC_DATE = re.compile(
     r"\b(\d{1,2}[./-]\d{1,2}[./-]\d{4}|\d{4}-\d{2}-\d{2})\b"
 )
 
+# Month names (English + German, incl. common abbreviations) for textual dates
+# like "20-May-2026", "May 20, 2026", "20. Mai 2026".
+_MONTHS = {
+    "jan": 1, "january": 1, "januar": 1,
+    "feb": 2, "february": 2, "februar": 2,
+    "mar": 3, "march": 3, "mrz": 3, "maer": 3, "maerz": 3, "mär": 3, "märz": 3,
+    "apr": 4, "april": 4,
+    "may": 5, "mai": 5,
+    "jun": 6, "june": 6, "juni": 6,
+    "jul": 7, "july": 7, "juli": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10, "okt": 10, "oktober": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12, "dez": 12, "dezember": 12,
+}
+# DD-Mon-YYYY  (e.g. 20-May-2026, 20 May 2026, 20.Mai.2026, 20. Mai 2026)
+_DMY_MONTH_NAME = re.compile(
+    r"\b(\d{1,2})[.\s/-]+([A-Za-zäöüÄÖÜ]{3,9})\.?[.\s/-]+(\d{2,4})\b"
+)
+# Mon-DD-YYYY  (e.g. May 20, 2026 / May 20 2026)
+_MDY_MONTH_NAME = re.compile(
+    r"\b([A-Za-zäöüÄÖÜ]{3,9})\.?[.\s/-]+(\d{1,2})(?:st|nd|rd|th)?,?[.\s/-]+(\d{2,4})\b"
+)
+
+
+def _expand_two_digit_year(y: int) -> int:
+    if y >= 100:
+        return y
+    return 2000 + y if y < 70 else 1900 + y
+
+# ── OCR-robust label matching ───────────────────────────────────────────────
+# Docling/Tesseract OCR frequently drops spaces inside multi-word labels
+# ("Effective Date" → "EffectiveDate", "Review Date" → "ReviewDate",
+#  "Risk Level" → "RiskLevel"). Build patterns where any space in the label is
+# optional so these still match.
+
+# Label cell regexes used to read values out of two_column_row / table rows.
+_EFF_DATE_LABEL_RE = re.compile(
+    r"(?i)effective\s*date|valid\s*from|g(?:ü|ue)ltig\s*ab|freigabedatum|inkrafttreten"
+)
+_REVIEW_DATE_LABEL_RE = re.compile(
+    r"(?i)review\s*date|next\s*review|n(?:ä|ae)chste\s*pr(?:ü|ue)fung|"
+    r"pr(?:ü|ue)fdatum|(?:ü|ue)berpr(?:ü|ue)fung|wiedervorlage"
+)
+
+# Risk: value → canonical level. Order matters (most severe first).
+_RISK_VALUE_PATTERNS = [
+    (re.compile(r"(?i)\b(critical|kritisch|sehr\s*hoch)\b"), "Critical"),
+    (re.compile(r"(?i)\b(high|hoch|hohes?|hohe)\b"), "High"),
+    (re.compile(r"(?i)\b(medium|moderate|mittel|mittleres?|mittlere|mäßig|maessig)\b"), "Medium"),
+    (re.compile(r"(?i)\b(low|niedrig|niedriges?|niedrige|gering(?:es|e)?)\b"), "Low"),
+]
+_RISK_LEVEL_LABELS = [
+    "Risk Level", "Risk Rating", "Risk Classification", "Risk Class",
+    "Risikostufe", "Risikobewertung", "Risikoeinstufung", "Risikolevel",
+]
+_RISK_RATING_LABELS = ["Risk Rating", "Risikobewertung", "Risk Score", "Risikoscore"]
+_RISK_ASSESSMENT_LABELS = [
+    "Risk Assessment", "Risikobeurteilung", "Risikoanalyse", "Risikoabschätzung",
+]
+_RISK_CATEGORY_LABELS = [
+    "Risk Category", "Risikokategorie", "Risikoklasse", "Risk Type", "Risikoart",
+]
+_RISK_LABEL_BLOCK_RE = re.compile(
+    r"(?i)risk\s*(?:level|rating|classification|class|category|type|assessment|score)|"
+    r"risiko(?:stufe|bewertung|einstufung|level|kategorie|klasse|art|beurteilung|analyse|score)?"
+)
+
 _CATEGORY_KEYWORDS = [
     (re.compile(r"(?i)\b(notfall|notfallzugriff|emergency|break[-\s]?glass)\b"), "Emergency / Notfall"),
     (re.compile(r"(?i)\b(firewall|network|netzwerk)\b"), "Network Security"),
@@ -261,6 +333,22 @@ def _normalize_date(raw: str) -> str:
         d, mo, y2 = int(m.group(1)), int(m.group(2)), int(m.group(3))
         y = 2000 + y2 if y2 < 70 else 1900 + y2
         return f"{y:04d}-{mo:02d}-{d:02d}"
+    # Month-name formats: 20-May-2026, 20 May 2026, 20. Mai 2026
+    m = _DMY_MONTH_NAME.match(s)
+    if m:
+        mon = _MONTHS.get(m.group(2).strip(".").lower())
+        if mon:
+            d, y = int(m.group(1)), _expand_two_digit_year(int(m.group(3)))
+            if 1 <= d <= 31:
+                return f"{y:04d}-{mon:02d}-{d:02d}"
+    # Month-name formats: May 20, 2026
+    m = _MDY_MONTH_NAME.match(s)
+    if m:
+        mon = _MONTHS.get(m.group(1).strip(".").lower())
+        if mon:
+            d, y = int(m.group(2)), _expand_two_digit_year(int(m.group(3)))
+            if 1 <= d <= 31:
+                return f"{y:04d}-{mon:02d}-{d:02d}"
     return ""
 
 
@@ -441,6 +529,68 @@ def _extract_labeled_value(
     raw = tail[: m_stop.start()] if m_stop else tail
     raw = raw.splitlines()[0] if "\n" in raw else raw
     return re.sub(r"\s+", " ", raw).strip()
+
+
+def _flex_label_alternation(labels: List[str]) -> str:
+    """Build a regex alternation where spaces inside labels are optional
+    (OCR-robust: matches 'Review Date' AND 'ReviewDate')."""
+    parts = []
+    for lbl in labels:
+        parts.append(re.escape(lbl).replace(r"\ ", r"\s*"))
+    return "|".join(parts)
+
+
+def _extract_flex_labeled_value(
+    text: str,
+    labels: List[str],
+    *,
+    stop_labels: Optional[List[str]] = None,
+) -> str:
+    """Like _extract_labeled_value but tolerant of OCR-dropped spaces in labels."""
+    if not text:
+        return ""
+    label_pat = _flex_label_alternation(labels)
+    # Tolerate OCR/table separators ":", "#", "|", "-" (and runs of them).
+    m = re.search(rf"(?is)\b(?:{label_pat})\s*[:#|\-]\s*", text)
+    if not m:
+        return ""
+    tail = text[m.end() :]
+    stop_re = _label_stop_pattern(stop_labels)
+    m_stop = stop_re.search(tail)
+    raw = tail[: m_stop.start()] if m_stop else tail
+    raw = raw.splitlines()[0] if "\n" in raw else raw
+    return re.sub(r"\s+", " ", raw).strip()
+
+
+def _labeled_value_from_blocks(
+    blocks: Optional[List[Dict[str, Any]]],
+    label_regex: re.Pattern,
+) -> str:
+    """Read a value whose label cell matches label_regex from structured blocks.
+
+    Handles both two_column_row blocks (left=label, right=value) and row-label
+    key/value tables (first cell is the label, a later cell holds the value).
+    """
+    if not blocks:
+        return ""
+    for block in blocks:
+        btype = str(block.get("type", "")).lower()
+        if btype == "two_column_row":
+            left = str(block.get("left", "")).strip()
+            right = str(block.get("right", "")).strip()
+            if right and label_regex.search(left):
+                return right
+        elif btype == "table":
+            for row in block.get("rows") or []:
+                if not row:
+                    continue
+                first = str(row[0] or "").strip()
+                if label_regex.search(first):
+                    for cell in row[1:]:
+                        val = str(cell or "").strip()
+                        if val:
+                            return val
+    return ""
 
 
 def _invalid_title(title: str, sop_id: str) -> bool:
@@ -931,37 +1081,136 @@ def _dates_from_tables(blocks: Optional[List[Dict[str, Any]]]) -> tuple[str, str
     return eff, rev
 
 
+def _date_from_value(raw: str) -> str:
+    """Normalize a date out of an arbitrary value/cell string."""
+    if not raw:
+        return ""
+    norm = _normalize_date(raw.strip())
+    if norm:
+        return norm
+    m = _GENERIC_DATE.search(raw)
+    if m:
+        d = _normalize_date(m.group(1))
+        if d:
+            return d
+    # Textual month dates embedded in a longer value ("Date: 20-May-2026")
+    m = _DMY_MONTH_NAME.search(raw)
+    if m:
+        d = _normalize_date(m.group(0))
+        if d:
+            return d
+    m = _MDY_MONTH_NAME.search(raw)
+    if m:
+        d = _normalize_date(m.group(0))
+        if d:
+            return d
+    return ""
+
+
+_EFFECTIVE_DATE_LABELS = [
+    "Effective Date", "Gültig ab", "Gueltig ab", "Freigabedatum",
+    "Inkrafttreten", "Valid From", "Issue Date", "Ausstellungsdatum",
+]
+_REVIEW_DATE_LABELS = [
+    "Review Date", "Nächste Prüfung", "Naechste Pruefung", "Prüfdatum",
+    "Pruefdatum", "Überprüfung", "Ueberpruefung", "Next Review", "Wiedervorlage",
+]
+
+
 def _find_dates(text: str, blocks: Optional[List[Dict[str, Any]]]) -> tuple[str, str]:
     effective = ""
-    exp_effective = _extract_labeled_value(text, ["Effective Date", "Gültig ab", "Gueltig ab", "Freigabedatum"])
+    # 1) OCR-robust labeled value (tolerates "EffectiveDate:" with no space)
+    exp_effective = _extract_flex_labeled_value(text, _EFFECTIVE_DATE_LABELS)
     if exp_effective:
-        effective = _normalize_date(exp_effective)
-    m = _DATE_LABEL.search(text)
-    if m and not effective:
-        effective = _normalize_date(m.group(1))
-    review = ""
-    exp_review = _extract_labeled_value(text, ["Review Date", "Nächste Prüfung", "Prüfdatum", "Überprüfung"])
-    if exp_review:
-        review = _normalize_date(exp_review)
-    m = _REVIEW_DATE_LABEL.search(text)
-    if m and not review:
-        review = _normalize_date(m.group(1))
+        effective = _date_from_value(exp_effective)
+    # 2) generic compiled date-label regex
+    if not effective:
+        m = _DATE_LABEL.search(text)
+        if m:
+            effective = _normalize_date(m.group(1))
 
+    review = ""
+    exp_review = _extract_flex_labeled_value(text, _REVIEW_DATE_LABELS)
+    if exp_review:
+        review = _date_from_value(exp_review)
+    if not review:
+        m = _REVIEW_DATE_LABEL.search(text)
+        if m:
+            review = _normalize_date(m.group(1))
+
+    # 3) structured blocks: column-header tables (existing)
     teff, trev = _dates_from_tables(blocks)
     if not effective and teff:
         effective = teff
     if not review and trev:
         review = trev
 
+    # 4) structured blocks: row-label key/value tables + two_column_row
+    if not effective:
+        effective = _date_from_value(_labeled_value_from_blocks(blocks, _EFF_DATE_LABEL_RE))
+    if not review:
+        review = _date_from_value(_labeled_value_from_blocks(blocks, _REVIEW_DATE_LABEL_RE))
+
+    # 5) last-resort positional fallback (unchanged behavior)
     if not effective:
         dates = _GENERIC_DATE.findall(text)
         if dates:
             effective = _normalize_date(dates[0])
-    if not review and len(_GENERIC_DATE.findall(text)) > 1:
+    if not review:
         second = _GENERIC_DATE.findall(text)
         if len(second) > 1:
             review = _normalize_date(second[1])
     return effective, review
+
+
+def _normalize_risk_level(value: str) -> str:
+    """Map a raw risk value/phrase to canonical Critical/High/Medium/Low."""
+    if not value:
+        return ""
+    for rx, label in _RISK_VALUE_PATTERNS:
+        if rx.search(value):
+            return label
+    return ""
+
+
+def _find_risk(text: str, blocks: Optional[List[Dict[str, Any]]]) -> Dict[str, str]:
+    """Detect risk metadata (level + rating/assessment/category raw values).
+
+    Reads explicit labels from text (OCR-robust) and from structured blocks
+    (two_column_row + row-label tables). riskLevel is normalized; the other
+    fields keep their raw extracted value.
+    """
+    text = text or ""
+
+    def _value(labels: List[str], block_re: re.Pattern) -> str:
+        return (
+            _extract_flex_labeled_value(text, labels)
+            or _labeled_value_from_blocks(blocks, block_re)
+        ).strip()
+
+    rating = _value(_RISK_RATING_LABELS, re.compile(r"(?i)risk\s*rating|risikobewertung|risk\s*score"))
+    assessment = _value(
+        _RISK_ASSESSMENT_LABELS,
+        re.compile(r"(?i)risk\s*assessment|risikobeurteilung|risikoanalyse|risikoabsch(?:ä|ae)tzung"),
+    )
+    category = _value(
+        _RISK_CATEGORY_LABELS,
+        re.compile(r"(?i)risk\s*category|risikokategorie|risikoklasse|risk\s*type|risikoart"),
+    )
+
+    level_raw = _value(_RISK_LEVEL_LABELS, _RISK_LABEL_BLOCK_RE)
+    level = (
+        _normalize_risk_level(level_raw)
+        or _normalize_risk_level(rating)
+        or _normalize_risk_level(category)
+    )
+
+    return {
+        "risk_level": level,
+        "risk_rating": rating,
+        "risk_assessment": assessment,
+        "risk_category": category,
+    }
 
 
 def _department_from_sop_id(sop_id: str) -> str:
@@ -1108,6 +1357,7 @@ def _rules_extract(text: str, blocks: Optional[List[Dict[str, Any]]]) -> Dict[st
     status = _find_status(text)
     department = _find_department(text, sop_id)
     category = _find_category(text, title)
+    risk = _find_risk(text, blocks)
 
     if not department:
         department = _find_department(text[:6000], sop_id)
@@ -1125,6 +1375,10 @@ def _rules_extract(text: str, blocks: Optional[List[Dict[str, Any]]]) -> Dict[st
         "status": status,
         "_effective_date": effective,
         "_review_date": review,
+        "_risk_level": risk.get("risk_level", ""),
+        "_risk_rating": risk.get("risk_rating", ""),
+        "_risk_assessment": risk.get("risk_assessment", ""),
+        "_risk_category": risk.get("risk_category", ""),
     }
 
 
@@ -1224,6 +1478,22 @@ def extract_sop_metadata_from_text(
     eff_iso = eff or merged.get("date") or ""
     rev_iso = rev or ""
 
+    risk_level = rule.get("_risk_level") or ""
+    risk_rating = rule.get("_risk_rating") or ""
+    risk_assessment = rule.get("_risk_assessment") or ""
+    risk_category = rule.get("_risk_category") or ""
+
+    logger.info(
+        "[sop-metadata] dates effective=%s review=%s | risk level=%s rating=%s "
+        "assessment=%s category=%s",
+        eff_iso or "(none)",
+        rev_iso or "(none)",
+        risk_level or "(none)",
+        risk_rating or "(none)",
+        risk_assessment or "(none)",
+        risk_category or "(none)",
+    )
+
     return {
         "sop_id": merged.get("sop_id") or "",
         "title": merged.get("title") or "",
@@ -1235,6 +1505,10 @@ def extract_sop_metadata_from_text(
         "status": _normalize_status(merged.get("status") or rule.get("status") or ""),
         "effective_date": eff_iso,
         "review_date": rev_iso,
+        "risk_level": risk_level,
+        "risk_rating": risk_rating,
+        "risk_assessment": risk_assessment,
+        "risk_category": risk_category,
     }
 
 
@@ -1245,7 +1519,7 @@ def to_frontend_sop_metadata(structured: Dict[str, Any]) -> Dict[str, Any]:
     sop_id = normalize_sop_id_token(structured.get("sop_id") or "")
     title = strip_sop_id_from_title(str(structured.get("title") or "").strip(), sop_id)
     status = _normalize_status(structured.get("status") or "")
-    return {
+    out = {
         "documentId": sop_id,
         "title": title,
         "department": structured.get("department") or "",
@@ -1257,6 +1531,21 @@ def to_frontend_sop_metadata(structured: Dict[str, Any]) -> Dict[str, Any]:
         "effectiveDate": eff,
         "reviewDate": rev_d,
     }
+    # Risk metadata (only included when detected, so unset fields fall back to
+    # existing defaults downstream rather than overwriting with blanks).
+    risk_level = (structured.get("risk_level") or "").strip()
+    risk_rating = (structured.get("risk_rating") or "").strip()
+    risk_assessment = (structured.get("risk_assessment") or "").strip()
+    risk_category = (structured.get("risk_category") or "").strip()
+    if risk_level:
+        out["riskLevel"] = risk_level
+    if risk_rating:
+        out["riskRating"] = risk_rating
+    if risk_assessment:
+        out["riskAssessment"] = risk_assessment
+    if risk_category:
+        out["riskCategory"] = risk_category
+    return out
 
 
 def resolve_status_from_metadata(raw_meta: dict | None) -> str:

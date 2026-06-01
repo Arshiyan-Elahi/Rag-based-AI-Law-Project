@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from io import BytesIO
 from typing import Any, Dict, List, Tuple
@@ -36,9 +37,24 @@ _MIN_TEXT_CHARS = int(os.getenv("SOP_DOCLING_MIN_TEXT_CHARS", "24"))
 _MIN_TYPED_BLOCKS = int(os.getenv("SOP_DOCLING_MIN_TYPED_BLOCKS", "1"))
 _DEFAULT_TIMEOUT_SEC = float(os.getenv("DOCLING_PDF_TIMEOUT_SEC", "180"))
 
+# Engine identifier surfaced in import metadata/logs for the scanned PDF path.
+EXTRACTION_ENGINE_DOCLING_SCANNED = "docling_scanned"
+_NUMBERED_PREFIX_RE = re.compile(r"^\(?\d+\)?[.)]\s+")
+_BULLET_PREFIX_RE = re.compile(r"^[-*•]\s+")
+
 
 def _docling_enabled() -> bool:
     return os.getenv("SOP_DOCLING_PDF_ENABLED", "true").lower() != "false"
+
+
+def is_docling_scanned_enabled() -> bool:
+    """Feature flag for routing scanned PDFs through Docling (primary engine)."""
+    return os.getenv("SOP_DOCLING_SCANNED_ENABLED", "true").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 def _pdf_has_native_text_layer(pdf_bytes: bytes, min_chars: int = 40) -> bool:
@@ -257,3 +273,165 @@ def extract_pdf_bytes_docling(pdf_bytes: bytes) -> Tuple[List[Dict[str, Any]], s
         status,
     )
     return blocks, text
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Scanned PDF → unified sequential ELEMENTS (primary scanned engine)
+# Element shapes (same schema the sequential pipeline + frontend already consume):
+#   {"type": "text",  "style": "heading"|"paragraph", "content": str}
+#   {"type": "table", "content": [[c, c, ...], ...]}   ← native editor table
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _docling_table_rows(table: TableItem) -> List[List[str]]:
+    """Extract a 2-D string grid from a Docling TableItem (no header metadata)."""
+    rows: List[List[str]] = []
+    try:
+        grid = table.data.grid
+    except Exception:
+        return []
+    for row in grid:
+        cells = [_clean_line(getattr(cell, "text", "") or "") for cell in row]
+        if any(cells):
+            rows.append(cells)
+    return rows
+
+
+def _flush_list_elements(
+    buffer: List[Dict[str, Any]],
+    elements: List[Dict[str, Any]],
+) -> None:
+    """Group consecutive Docling list items into one paragraph element with
+    marker-prefixed lines so the frontend renders a single bullet/ordered list."""
+    if not buffer:
+        return
+    numbered = sum(1 for x in buffer if x.get("enumerated"))
+    is_numbered = numbered >= len(buffer) / 2
+    lines: List[str] = []
+    for idx, entry in enumerate(buffer, start=1):
+        text = _clean_line(entry.get("text", ""))
+        if not text:
+            continue
+        if is_numbered:
+            lines.append(text if _NUMBERED_PREFIX_RE.match(text) else f"{idx}. {text}")
+        else:
+            lines.append(text if _BULLET_PREFIX_RE.match(text) else f"- {text}")
+    if lines:
+        elements.append(
+            {"type": "text", "style": "paragraph", "content": "\n".join(lines)}
+        )
+    buffer.clear()
+
+
+def _docling_document_to_elements(doc: Any) -> List[Dict[str, Any]]:
+    """Walk Docling document in reading order → unified sequential elements."""
+    elements: List[Dict[str, Any]] = []
+    list_buffer: List[Dict[str, Any]] = []
+
+    for item, level in doc.iterate_items():
+        if isinstance(item, TableItem):
+            _flush_list_elements(list_buffer, elements)
+            rows = _docling_table_rows(item)
+            if rows:
+                elements.append({"type": "table", "content": rows})
+            continue
+
+        if isinstance(item, ListItem):
+            text = _text_from_item(item)
+            if text:
+                list_buffer.append(
+                    {"text": text, "enumerated": bool(getattr(item, "enumerated", False))}
+                )
+            continue
+
+        _flush_list_elements(list_buffer, elements)
+
+        if isinstance(item, (TitleItem, SectionHeaderItem)):
+            text = _text_from_item(item)
+            if text:
+                elements.append({"type": "text", "style": "heading", "content": text})
+            continue
+
+        label = getattr(item, "label", None)
+        if label in {
+            DocItemLabel.PAGE_HEADER,
+            DocItemLabel.PAGE_FOOTER,
+            DocItemLabel.PICTURE,
+            DocItemLabel.FORMULA,
+        }:
+            continue
+
+        if isinstance(item, TextItem) or label in {
+            DocItemLabel.PARAGRAPH,
+            DocItemLabel.TEXT,
+            DocItemLabel.CAPTION,
+            DocItemLabel.FOOTNOTE,
+            DocItemLabel.CODE,
+        }:
+            text = _text_from_item(item)
+            if text:
+                elements.append({"type": "text", "style": "paragraph", "content": text})
+
+    _flush_list_elements(list_buffer, elements)
+    return elements
+
+
+def extract_scanned_pdf_docling_elements(pdf_bytes: bytes) -> List[Dict[str, Any]]:
+    """
+    Primary scanned PDF path: Docling OCR (do_ocr) + table structure → unified
+    sequential elements (headings, paragraphs, grouped lists, tables) in reading
+    order. Raises on hard failures/timeouts so the caller can fall back to
+    fitz + Tesseract.
+    """
+    if not _docling_enabled():
+        raise RuntimeError("Docling PDF extraction is disabled (SOP_DOCLING_PDF_ENABLED=false)")
+
+    logger.info("[docling] scanned PDF conversion starting bytes=%s", len(pdf_bytes))
+    converter = _get_converter(scanned=True)
+    stream = DocumentStream(name="scanned_upload.pdf", stream=BytesIO(pdf_bytes))
+
+    def _run_convert():
+        return converter.convert(stream)
+
+    if _DEFAULT_TIMEOUT_SEC > 0:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_run_convert)
+            try:
+                result = future.result(timeout=_DEFAULT_TIMEOUT_SEC + 30)
+            except FuturesTimeoutError as exc:
+                raise TimeoutError(
+                    f"Docling scanned PDF conversion exceeded {_DEFAULT_TIMEOUT_SEC}s"
+                ) from exc
+    else:
+        result = _run_convert()
+
+    status = getattr(result, "status", None)
+    if status in {ConversionStatus.FAILURE}:
+        raise RuntimeError(f"Docling scanned conversion failed with status={status}")
+
+    doc = getattr(result, "document", None)
+    if doc is None:
+        raise RuntimeError("Docling returned no document for scanned PDF")
+
+    elements = _docling_document_to_elements(doc)
+    if not elements:
+        raise RuntimeError("Docling scanned conversion produced no elements")
+
+    text_chars = sum(
+        len(str(e.get("content", "")))
+        for e in elements
+        if e.get("type") == "text"
+    )
+    table_count = sum(1 for e in elements if e.get("type") == "table")
+    heading_count = sum(
+        1 for e in elements if e.get("type") == "text" and e.get("style") == "heading"
+    )
+    logger.info(
+        "[docling] scanned PDF ok elements=%s headings=%s tables=%s chars=%s status=%s",
+        len(elements),
+        heading_count,
+        table_count,
+        text_chars,
+        status,
+    )
+    return elements

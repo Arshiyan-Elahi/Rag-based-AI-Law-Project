@@ -26,6 +26,7 @@ import LinkingModal from '../components/Common/LinkingModal'
 import EditorToolbarSection from '../components/Editor/EditorToolbarSection'
 import EditorDocStatsBar from '../components/Editor/EditorDocStatsBar'
 import EditorTypingSurface from '../components/Editor/EditorTypingSurface'
+import SourcePdfPanel from '../components/Editor/SourcePdfPanel'
 import AIWidget from '../components/Dashboard/AIWidget'
 import FloatingAskAIButton from '../components/Common/FloatingAskAIButton'
 import { useLanguage } from '../context/LanguageContext'
@@ -337,6 +338,10 @@ const EditorPage = ({
   const lastAppliedVersionIdRef = useRef(null)
   const editorContentStableRef = useRef(false)
   const lastImportNoticeRef = useRef('')
+  // Holds the latest handlers/values used by the background-import poller so the
+  // poll effect can depend ONLY on [documentId, editor, isEditorMounted] and not
+  // restart its fetch loop on every unrelated re-render.
+  const pollHandlersRef = useRef({})
   const [isEditorMounted, setIsEditorMounted] = useState(false)
 
   const setImportNoticeIfChanged = useCallback((message) => {
@@ -661,6 +666,16 @@ const EditorPage = ({
     }, 0)
   }, [editor, isEditorMounted, initialDocId, initialDocJson])
 
+  // Keep the latest handlers/values reachable from the poll effect without
+  // making them effect dependencies (prevents the fetch loop from restarting).
+  pollHandlersRef.current = {
+    hydrateFromDocument,
+    applyMetadataFromDocument,
+    setImportNoticeIfChanged,
+    clearImportNotice,
+    language,
+  }
+
   useEffect(() => {
     if (!documentId || !editor || !isEditorMounted || editor.isDestroyed) return undefined
 
@@ -668,21 +683,31 @@ const EditorPage = ({
     let timerId = null
 
     const pollBackgroundImport = async () => {
+      const {
+        hydrateFromDocument: hydrate,
+        applyMetadataFromDocument: applyMeta,
+        setImportNoticeIfChanged: setNotice,
+        clearImportNotice: clearNotice,
+        language: lang,
+      } = pollHandlersRef.current
+
       try {
         const doc = await getDocument(documentId)
         if (cancelled) return
 
         const job = doc?.metadata_json?._import_job
+        // No background import for this document → fetch once and stop. Never
+        // schedule a follow-up poll for plain (non-import) SOPs.
         if (!job || typeof job !== 'object') return
 
         const status = String(job.status || '').toLowerCase()
         const contentReady = isImportJobContentReady(job)
 
         if (status === 'failed') {
-          setImportNoticeIfChanged(
+          setNotice(
             resolveImportUiError(
               { message: job.error || job.message },
-              language,
+              lang,
             ),
           )
           return
@@ -690,23 +715,24 @@ const EditorPage = ({
 
         if (contentReady && status !== 'failed' && !editorContentStableRef.current) {
           pendingInitialHydrationRef.current = true
-          await hydrateFromDocument(documentId, {
+          await hydrate(documentId, {
             metadataOnly: false,
             showLoading: true,
           })
           if (cancelled) return
         }
 
+        // Terminal (completed/failed) or content already stable → stop polling.
         if (shouldStopEditorImportPolling(job, editorContentStableRef.current)) {
           if (status === 'completed') {
-            applyMetadataFromDocument(doc, doc.metadata_json)
+            applyMeta(doc, doc.metadata_json)
           }
-          clearImportNotice()
+          clearNotice()
           pendingInitialHydrationRef.current = false
           return
         }
 
-        setImportNoticeIfChanged(
+        setNotice(
           importStatusToModalMessage(status, job.message) || 'Processing import…',
         )
         timerId = window.setTimeout(pollBackgroundImport, 2000)
@@ -724,16 +750,7 @@ const EditorPage = ({
       cancelled = true
       if (timerId) window.clearTimeout(timerId)
     }
-  }, [
-    documentId,
-    editor,
-    isEditorMounted,
-    hydrateFromDocument,
-    applyMetadataFromDocument,
-    setImportNoticeIfChanged,
-    clearImportNotice,
-    language,
-  ])
+  }, [documentId, editor, isEditorMounted])
 
   useEffect(() => {
     console.debug('[SOP Status Debug] final rendered status', {
@@ -1373,6 +1390,11 @@ const EditorPage = ({
                   <span>{saveNotice}</span>
                 </section>
               ) : null}
+              <SourcePdfPanel
+                versionId={currentVersionId}
+                metadata={metadata}
+                t={t}
+              />
               <section className="figma-editor-canvas">
                 {isHistoricalView ? <span className="editor-stage-hint">{t.historicalVersionLoaded}</span> : null}
                 {isLoadingDocument ? <span className="editor-stage-hint">{t.loading}</span> : null}

@@ -1605,6 +1605,40 @@ select {
   to { transform: rotate(360deg); }
 }
 
+.source-pdf-panel {
+  margin: 0 0 12px;
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  border-radius: 12px;
+  background: #f8fafc;
+  overflow: hidden;
+}
+
+.source-pdf-panel__header {
+  padding: 10px 14px;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+}
+
+.source-pdf-panel__title {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #111827;
+}
+
+.source-pdf-panel__hint {
+  margin: 4px 0 0;
+  font-size: 0.8rem;
+  color: #6b7280;
+}
+
+.source-pdf-panel__frame {
+  display: block;
+  width: 100%;
+  height: min(420px, 45vh);
+  border: 0;
+  background: #fff;
+}
+
 .figma-editor-canvas {
   flex: 1;
   min-height: 0;

@@ -99,8 +99,33 @@ def extract_sequential_upload(
         from .document_structure import refine_blocks
 
         text = sanitize_extracted_text(elements_to_plain_text(elements))
-        blocks = refine_blocks(blocks, text)
-        return elements, blocks, strip_invalid_control_chars(text), scanned
+        refined = refine_blocks(blocks, text)
+        if scanned:
+            logger.info(
+                "[sequential-extract] scanned PDF mapping: elements=%s blocks(pre-refine)=%s blocks(post-refine)=%s",
+                len(elements),
+                len(blocks),
+                len(refined),
+            )
+            if logger.isEnabledFor(logging.DEBUG):
+                for i, el in enumerate(elements[:60]):
+                    logger.debug(
+                        "[sequential-extract] el[%s] %s/%s %r",
+                        i,
+                        el.get("type"),
+                        el.get("style"),
+                        str(el.get("content"))[:120],
+                    )
+                for i, blk in enumerate(refined[:60]):
+                    logger.debug(
+                        "[sequential-extract] block[%s] %s %r",
+                        i,
+                        blk.get("type"),
+                        (blk.get("text") or blk.get("left") or blk.get("rows"))
+                        if isinstance(blk, dict)
+                        else blk,
+                    )
+        return elements, refined, strip_invalid_control_chars(text), scanned
 
     if name.endswith(".docx"):
         from .docx_extractor import extract_docx_elements
