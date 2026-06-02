@@ -29,6 +29,7 @@ from .ai_routes import ai_router, CHATBOT_USE_LOCAL_DB, _get_smart_rag_chain
 from .auth_routes import router as auth_router
 from .chat_history_routes import router as chat_history_router
 from .profile_routes import router as profile_router
+from .client_profile_routes import router as client_profile_router
 from .webhook_routes import webhook_router
 from .services.semantic_pipeline import SemanticPipelineService
 from .services.webhook_config import validate_webhook_configuration
@@ -61,6 +62,8 @@ PERFORMANCE_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_ai_link_suggestions_target_status ON ai_link_suggestions (target_entity_type, target_entity_id, status)",
     "CREATE INDEX IF NOT EXISTS ix_profile_detections_sop_version_active ON profile_detections (sop_id, sop_version_id, is_active)",
     "CREATE INDEX IF NOT EXISTS ix_profile_detections_source_hash ON profile_detections (source_hash)",
+    # Legacy schema compatibility: some existing deployments miss this column.
+    "ALTER TABLE sop_detected_parameters ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP",
 )
 
 
@@ -221,6 +224,7 @@ app.include_router(ai_router)
 app.include_router(chat_history_router)
 app.include_router(auth_router)
 app.include_router(profile_router)
+app.include_router(client_profile_router)
 app.include_router(webhook_router)
 
 

@@ -1,13 +1,14 @@
 """Prompt builders for SOP editor actions.
-Language priority: German (de). All other languages are fully supported.
-The AI always detects the language of the input text and responds in the same language.
+Language follows the active SOP/profile context first, not the user's short chat command.
+German (de) and English (en) are the primary supported editorial output languages.
 
 **Canonical source** for `/api/ai/action` prompt text: this module only.
 ``action/prompts.py`` re-exports these symbols; do not duplicate prompt strings elsewhere.
 """
 
+import json
 import re
-from typing import Literal
+from typing import Any, Dict, Literal
 
 from schemas.sop_actions import ActionRequest, JustifyRequest
 
@@ -22,7 +23,7 @@ IMPROVE_REWRITE_NO_RAG_CONTEXT = (
     "(No RAG.) Use only metadata + quoted text below."
 )
 
-_LANGUAGE_RULE = """LANGUAGE: Match the input language (German if input is German). Do not mix languages. Keep identifiers, codes, and abbreviations unchanged."""
+_LANGUAGE_RULE = """LANGUAGE: Follow the dominant document language visible in the provided text and metadata. Do not mix languages. Keep identifiers, codes, and abbreviations unchanged."""
 
 _SPEED_FIRST = """OUTPUT: Return exactly one valid JSON object. No markdown, no code fences, no explanation, no sources. Be concise."""
 
@@ -36,63 +37,65 @@ _PRESERVE_CORE = """PRESERVE (never alter):
 - Named vendors, tools, systems, ports, protocols, values exactly — never convert to examples"""
 
 _THREE_C_IMPROVE_STANDARD = """3C SOP IMPROVEMENT STANDARD:
-- Clarity: Correct grammar, sentence flow, vague terms, unclear abbreviations, and unclear responsibility without changing meaning.
+- Clarity: Correct grammar, sentence flow, vague terms, unclear abbreviations, and unclear responsibility; align operational wording to ACTIVE PROFILE RULES when present.
 - Consistency: Keep the original structure, numbering, field labels, formatting, terminology, paragraph boundaries, and compact register style.
-- Compliance: Preserve audit-relevant facts and improve GMP/QA wording without adding new requirements, controls, dates, systems, owners, approvals, or regulatory claims.
-- Voice: Prefer tight procedural phrasing over explanatory prose; do not inflate terse lines into narrative.
-- Final self-check: Confirm the output preserves the same meaning, scope, records, IDs, and required fields as TEXT."""
+- Compliance: Preserve audit-relevant facts (IDs, dates, systems, thresholds) and improve GMP/QA control language per profile without inventing new records or approvals.
+- Final self-check: Confirm IDs, record inventory, and required fields match TEXT; procedural content should reflect the active profile, not only synonym edits."""
 
 _THREE_C_REWRITE_STANDARD = """3C SOP REWRITE STANDARD:
-- Clarity: Rewrite vague, passive, or informal wording into clear, role-based, action-oriented SOP language.
-- Consistency: Keep the same section order, numbering, terminology, register format, IDs, record structure, and document tone unless EDIT_SCOPE is FULL_DOCUMENT and TEXT is missing required SOP backbone sections.
-- Compliance: Strengthen GMP/QA control language only when supported by TEXT, metadata, or a visible risk in the provided content. Do not invent approvals, limits, systems, owners, dates, forms, thresholds, or regulatory references.
-- Voice: Default to concise auditable instructions; avoid generic AI essay tone, redundant qualifiers, and meta-commentary about the document.
-- Final self-check: Verify the rewritten SOP is clear, consistent, compliant, and that no original ID, record, section, or required field was removed."""
+- Clarity: Rewrite vague, passive, or informal wording into clear, role-based, action-oriented SOP language per ACTIVE PROFILE RULES.
+- Consistency: Keep the same section order, numbering, register format, IDs, record structure unless EDIT_SCOPE is FULL_DOCUMENT and TEXT lacks required backbone sections.
+- Compliance: Strengthen GMP/QA control language per profile and TEXT; reshape procedures and sensitive content to profile standards without inventing new IDs, dates, systems, or approvals.
+- Final self-check: Verify IDs, records, and sections are preserved; procedural substance must reflect the profile, not only tone."""
 
 _META_USAGE = """METADATA: Use NLP_STRUCTURE_AND_PARAMETERS and database metadata for style, terminology, and structure alignment only. If metadata conflicts with TEXT, preserve TEXT meaning."""
 
-_USER_EDIT_INTENT_SEMANTICS = """USER_EDIT_INTENT_SEMANTICS (applies when USER_EDIT_INTENT block is present):
-- Treat USER_EDIT_INTENT as the author's operational brief — infer task shape, desired density, tone, and output shape from meaning (including domain jargon and negations), not from isolated cue words.
-- Resolve brevity vs completeness by keeping every obligation, control, record, identifier, threshold, and sequence step that exists in TEXT; remove only redundancy, filler, and non-audit narrative wrapping.
-- When the brief leans toward a shorter deliverable, increase procedural density: shorter clauses, decisive modals/imperatives, fewer transitions, no preamble or recap, no commentary about "this SOP" or "the above".
-- If USER_EDIT_INTENT conflicts with a stylistic default in this prompt, follow USER_EDIT_INTENT while still obeying PRESERVE rules and EDIT_SCOPE."""
 
-_PROCEDURAL_SOP_VOICE = """PROCEDURAL SOP VOICE (baseline unless USER_EDIT_INTENT clearly asks for training-style or explanatory depth):
-- Write as auditable work instructions: who acts, on what, when, with which record — not as a tutorial, essay, or marketing text.
-- Prefer direct imperatives and named roles over framing ("In order to ensure quality…", "It is important to note…").
-- Avoid stacked synonyms, repeated hedges, and boilerplate intensifiers that do not change the requirement.
-- Do not describe your own edits; output only the revised SOP content inside the JSON string."""
+def _build_profile_application_block(
+    profile_md: str = "",
+    profile_json: dict | None = None,
+    *,
+    action: str = "rewrite",
+) -> str:
+    """When an active profile is loaded, apply it to substance and style — not tone-only polish."""
+    has_profile = bool((profile_md or "").strip()) or bool(profile_json)
+    if not has_profile:
+        return _META_USAGE
 
-_PROCEDURAL_ANALYSIS_VOICE = """FINDINGS VOICE (this task is analysis, not an SOP rewrite):
-- Use tight audit-oriented phrasing; avoid narrative filler, rhetorical padding, and generic reviewer monologue.
-- Cite themes visible in TEXT; do not paste or wholesale rewrite the SOP body.
-- Put all analysis content in the single JSON string value; no markdown or prose outside JSON."""
+    rewrite_rules: list[str] = []
+    if isinstance(profile_json, dict):
+        raw_rules = profile_json.get("rewrite_rules")
+        if isinstance(raw_rules, list):
+            rewrite_rules = [str(r).strip() for r in raw_rules if str(r).strip()]
 
+    rules_hint = ""
+    if rewrite_rules:
+        rules_hint = "\n- Profile rewrite_rules to apply:\n" + "\n".join(f"  • {r}" for r in rewrite_rules[:12])
 
-def _user_edit_intent_block(request: ActionRequest) -> str:
-    raw = getattr(request, "assistant_instruction", None)
-    if raw is None:
-        return ""
-    text = str(raw).strip()
-    if not text:
-        return ""
-    if len(text) > 3500:
-        text = text[:3497].rstrip() + "..."
-    return (
-        "\nUSER_EDIT_INTENT (author request — interpret semantically; "
-        "not part of the SOP body to paste verbatim):\n"
-        f"\"\"\"{text}\"\"\"\n"
+    action_line = (
+        "IMPROVE: strengthen clarity, compliance tone, and profile-aligned operational wording; "
+        "do not invent new records, IDs, or approval steps."
+        if action == "improve"
+        else "REWRITE: perform a full profile-driven editorial pass on procedures, controls, and narrative — "
+        "not a synonym swap."
     )
 
-
-def _intent_optimization_layers(request: ActionRequest, *, output_kind: str = "sop_edit") -> str:
-    """User brief + response shaping; keeps token cost low when no brief is present."""
-    block = _user_edit_intent_block(request)
-    voice = _PROCEDURAL_ANALYSIS_VOICE if output_kind == "analysis" else _PROCEDURAL_SOP_VOICE
-    if block.strip():
-        return f"{block}\n{_USER_EDIT_INTENT_SEMANTICS}\n{voice}".strip()
-    return voice.strip()
-
+    return f"""PROFILE APPLICATION (active profile.md / JSON — mandatory):
+- {action_line}
+- Apply rewrite_rules, workflow_patterns, terminology_preferences, RACI patterns, modal verbs, section flow, "
+  "and rewrite_improve_parameters from ACTIVE PROFILE RULES to **both** style and **substance** of TEXT.
+- Reshape sensitive operational content (access, break-glass, approvals, logging, escalation, data handling) "
+  "so it reads like an SOP written under this profile — while keeping the same underlying process intent.
+- **Preserve hard anchors**: all IDs (SOP-*, DEV-*, CAPA-*, AUD-*, DEC-*), register entry count/order, field labels "
+  "(Datum:, Beschreibung:, …), dates, system names, ports, thresholds, and version metadata unless the profile "
+  "explicitly mandates a label rename.
+- **Forbidden**: output that only tweaks tone/syntax but leaves procedures, controls, and responsibilities "
+  "substantively identical when the profile defines different patterns.
+- If USER_INSTRUCTION names another profile or says \"using profile …\", ACTIVE PROFILE RULES override default "
+  "SOP habits from TEXT for editorial shape (not for inventing new facts).{rules_hint}
+- If USER_INSTRUCTION says editorial_profile_on_open_sop or names another SOP profile: "
+  "ACTIVE PROFILE RULES are the **editorial** contract; TEXT is the **content** to rewrite (open document). "
+  "Never paste body text from the editorial profile's source SOP — only apply its rewrite_rules and patterns."""
 
 _RECORD_ID_RE = re.compile(r"\b(?:DEV|CAPA|AUD|DEC)-[A-Z0-9]+-\d+\b", re.IGNORECASE)
 TRACEABILITY_SECTION_HEADER_RE = re.compile(
@@ -255,6 +258,23 @@ def _scope_directive(request: ActionRequest, action: str) -> str:
 - Preserve every ID (SOP-*, DEV-*, CAPA-*, AUD-*, DEC-*), register line, deviation/CAPA/audit/decision block, and trailing traceability content.
 - Output can be longer than input only when required to add missing backbone sections for FULL_DOCUMENT scope."""
 
+    from chatbot.assistant.context_intelligence import extract_format_constraints
+
+    line_cap = int(
+        extract_format_constraints(getattr(request, "instruction", "") or "").get("line_count") or 0
+    )
+    length_clause = (
+        f"- HARD USER LIMIT: output exactly {line_cap} newline-separated lines; ignore 70–130% length rules."
+        if line_cap
+        else "- Output length must stay close to input (about 80–130% of character count)."
+    )
+    section_length_clause = (
+        f"- HARD USER LIMIT: output exactly {line_cap} newline-separated lines; ignore 70–130% length rules."
+        if line_cap
+        else "- Keep the same structural units as TEXT (headings, lists, tables, register lines). "
+        "Keep output length within 70–130% of input unless grammar repair requires minor variance."
+    )
+
     register_note = ""
     section_title = (request.section_title or "").strip()
     if is_traceability_register_block(request.section_text or "") or TRACEABILITY_SECTION_HEADER_RE.search(
@@ -269,7 +289,7 @@ TRACEABILITY_SECTION_MODE (named block: "{section_title}"):
 - NEVER output SOP title, Version, Status, Purpose, Scope, Responsibilities, Procedure, or Documentation from other sections.
 - NEVER stop after the heading — include all CAPA/DEV/AUD/DEC items until the section ends in TEXT.
 - Keep the exact record count and order; improve grammar and clarity inside each entry only.
-- Output length must stay close to input (about 80–130% of character count)."""
+{length_clause}"""
 
     return f"""EDIT_SCOPE: SECTION_ONLY
 - Target section/selection: "{section}" (type: {request.section_type})
@@ -277,9 +297,33 @@ TRACEABILITY_SECTION_MODE (named block: "{section_title}"):
 - FORBIDDEN: adding Purpose, Scope, Responsibilities, Procedure, Documentation, Review, or other headings not already inside TEXT.
 - FORBIDDEN: rewriting or inventing content for other sections (e.g. if TEXT is DEVIATIONS only, do not add Procedure or Scope).
 - FORBIDDEN: outputting "SOP-IT-001", Version, Status, Abteilung, or numbered backbone sections 1–5 unless they are already in TEXT.
-- Keep the same structural units as TEXT (headings, lists, tables, register lines). Keep output length within 70–130% of input unless grammar repair requires minor variance.
-- Use NLP_STRUCTURE_AND_PARAMETERS only to align tone, terminology, and micro-structure of THIS block — not to expand into a complete SOP.
+{section_length_clause}
+- Use NLP_STRUCTURE_AND_PARAMETERS and ACTIVE PROFILE RULES to align tone, terminology, control language, and procedural wording of THIS block.
+- When a profile is active: apply profile rewrite_rules and rewrite_improve_parameters to sensitive operational content in TEXT, not only surface style.
+- Do not expand into a complete SOP unless EDIT_SCOPE is FULL_DOCUMENT.
 - Return only the improved/rewritten block that replaces TEXT in the editor.{register_note}"""
+
+
+def _user_instruction_blocks(request: ActionRequest) -> str:
+    """User chat instruction + hard line/word limits (overrides default length rules)."""
+    from chatbot.assistant.context_intelligence import extract_format_constraints
+
+    instr = str(getattr(request, "instruction", "") or "").strip()
+    if not instr:
+        return ""
+    fc = extract_format_constraints(instr)
+    parts = [f"USER_INSTRUCTION (mandatory — follow exactly):\n{instr}"]
+    line_n = int(fc.get("line_count") or 0)
+    if line_n:
+        parts.append(
+            f"HARD FORMAT LIMIT: rewritten_text / improved_text MUST be exactly {line_n} "
+            f"newline-separated lines (one sentence or bullet per line). "
+            f"Do NOT exceed {line_n} lines. Ignore default 70–130% input length rules."
+        )
+    word_n = int(fc.get("word_count") or 0)
+    if word_n:
+        parts.append(f"HARD FORMAT LIMIT: about {word_n} words maximum in the model output.")
+    return "\n".join(parts) + "\n\n"
 
 
 def _doc_block(request: ActionRequest, context: str) -> str:
@@ -299,26 +343,253 @@ def _nlp_section(nlp_block: str) -> str:
     return f"\nNLP_STRUCTURE_AND_PARAMETERS:\n{nb}\n"
 
 
-def build_improve_prompt(request: ActionRequest, context: str, nlp_block: str = "") -> str:
-    return f"""You are a senior GMP/QA SOP editor. TASK: light editorial polish — not a full-document rewrite.
+def _normalize_language_code(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    normalized = re.sub(r"[^a-z/-]+", " ", raw).strip()
+    if normalized in {"de", "de de", "german", "deutsch"}:
+        return "de"
+    if normalized in {"en", "en us", "en gb", "english"}:
+        return "en"
+    if normalized.startswith(("german", "deutsch", "de ")):
+        return "de"
+    if normalized.startswith(("english", "en ")):
+        return "en"
+    has_de = bool(re.search(r"\b(german|deutsch|de)\b", normalized))
+    has_en = bool(re.search(r"\b(english|en)\b", normalized))
+    if has_de and has_en:
+        return ""
+    if has_de:
+        return "de"
+    if has_en:
+        return "en"
+    return ""
+
+
+def _detect_text_language(text: str) -> str:
+    sample = str(text or "")[:3000]
+    if not sample.strip():
+        return ""
+    de_domain_hits = len(
+        re.findall(
+            r"\b(zweck|schutz|produktionsnetz|bÃ¼ronetzwerk|büronetzwerk|zugriff|zugriffe|notfall|verantwortlich|datum|beschreibung|ursache|aktion|fÃ¤llig|fällig)\b",
+            sample,
+            re.I,
+        )
+    )
+    de_hits = len(
+        re.findall(
+            r"\b(und|die|der|das|ist|ein|eine|mit|von|bei|auf|werden|durch|oder|soll|sollen|muss|müssen|darf|dürfen)\b",
+            sample,
+            re.I,
+        )
+    )
+    en_hits = len(
+        re.findall(
+            r"\b(the|and|for|with|from|this|that|shall|must|will|which|when|where|should|may|can)\b",
+            sample,
+            re.I,
+        )
+    )
+    de_hits += de_domain_hits
+    if de_hits == en_hits == 0:
+        return ""
+    return "de" if de_hits >= en_hits else "en"
+
+
+def _extract_explicit_output_language(instruction: str | None) -> str:
+    text = str(instruction or "").strip()
+    if not text:
+        return ""
+    explicit_patterns = [
+        r"\b(?:write|rewrite|respond|answer|output|translate)\s+(?:it\s+)?(?:in|to)\s+(german|deutsch|english|englisch|en|de)\b",
+        r"\b(?:in|to)\s+(german|deutsch|english|englisch)\b",
+        r"\b(?:in|to)\s+(german|deutsch|english|englisch)\s+(?:language|sprache)\b",
+        r"\boutput\s+language\s*:\s*(german|deutsch|english|englisch|en|de)\b",
+        r"\bsprache\s*:\s*(german|deutsch|english|englisch|en|de)\b",
+    ]
+    for pattern in explicit_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return _normalize_language_code(match.group(1))
+    return ""
+
+
+def _extract_detected_language(detected_nlp: dict | None) -> str:
+    if not isinstance(detected_nlp, dict):
+        return ""
+    direct = _normalize_language_code(
+        detected_nlp.get("language")
+        or detected_nlp.get("lang_code")
+        or detected_nlp.get("primary_language")
+        or detected_nlp.get("iso_code")
+    )
+    if direct:
+        return direct
+    for nested_key in ("language_detection", "language_profile"):
+        nested = detected_nlp.get(nested_key)
+        if isinstance(nested, dict):
+            direct = _normalize_language_code(
+                nested.get("language")
+                or nested.get("lang_code")
+                or nested.get("primary_language")
+                or nested.get("iso_code")
+            )
+            if direct:
+                return direct
+    return ""
+
+
+def _infer_output_language(
+    request: ActionRequest,
+    profile_json: dict | None = None,
+    detected_nlp: dict | None = None,
+    style_profile: dict | None = None,
+    profile_md: str = "",
+    context: str = "",
+) -> str:
+    instruction_lang = _extract_explicit_output_language(getattr(request, "instruction", "") or "")
+    if instruction_lang:
+        return instruction_lang
+
+    text_lang = _detect_text_language(
+        "\n".join(
+            part
+            for part in [
+                getattr(request, "section_title", "") or "",
+                getattr(request, "section_type", "") or "",
+                request.section_text or "",
+            ]
+            if part
+        )
+    )
+    if text_lang:
+        return text_lang
+
+    detected_lang = _extract_detected_language(detected_nlp)
+    if detected_lang:
+        return detected_lang
+
+    style_lang = _normalize_language_code((style_profile or {}).get("language"))
+    if style_lang:
+        return style_lang
+
+    profile_lang = _normalize_language_code((profile_json or {}).get("language"))
+    if profile_lang:
+        return profile_lang
+
+    md_lang = _normalize_language_code(profile_md)
+    if md_lang:
+        return md_lang
+
+    ctx_lang = _detect_text_language(context)
+    if ctx_lang:
+        return ctx_lang
+
+    return "en"
+
+
+def _build_language_rule(
+    request: ActionRequest,
+    profile_json: dict | None = None,
+    detected_nlp: dict | None = None,
+    style_profile: dict | None = None,
+    profile_md: str = "",
+    context: str = "",
+) -> str:
+    language = _infer_output_language(
+        request,
+        profile_json=profile_json,
+        detected_nlp=detected_nlp,
+        style_profile=style_profile,
+        profile_md=profile_md,
+        context=context,
+    )
+    if language == "de":
+        return (
+            "OUTPUT LANGUAGE: German (de). Write the full response, headings, SOP prose, gap findings, "
+            "and suggested edits in German. Follow the active SOP/profile/NLP language even if the user's "
+            "chat command is in English. Do not mix languages in narrative text. Keep identifiers, codes, "
+            "product names, abbreviations, and record IDs unchanged."
+        )
+    return (
+        "OUTPUT LANGUAGE: English (en). Write the full response, headings, SOP prose, gap findings, "
+        "and suggested edits in English. Follow the active SOP/profile/NLP language even if the user's "
+        "chat command is in German. Do not mix languages in narrative text. Keep identifiers, codes, "
+        "product names, abbreviations, and record IDs unchanged."
+    )
+
+
+def _format_nlp_profile_context(
+    profile_md: str = "",
+    profile_json: dict | None = None,
+    detected_nlp: dict | None = None,
+) -> str:
+    blocks = []
+    if profile_md and profile_md.strip():
+        blocks.append(f"### ACTIVE PROFILE RULES (profile.md):\n{profile_md.strip()}")
+    if profile_json:
+        blocks.append(f"### ACTIVE PROFILE CONFIGURATION (JSON):\n{json.dumps(profile_json, ensure_ascii=False, indent=2)}")
+    if detected_nlp:
+        lines = []
+        for key, val in detected_nlp.items():
+            if val:
+                lines.append(f"- {key}: {json.dumps(val, ensure_ascii=False)}")
+        if lines:
+            blocks.append("### CURRENT SOP DETECTED NLP PARAMETERS:\n" + "\n".join(lines))
+    if not blocks:
+        return ""
+    return "\n\n" + "\n\n".join(blocks) + "\n"
+
+
+def build_improve_prompt(
+    request: ActionRequest,
+    context: str,
+    nlp_block: str = "",
+    profile_md: str = "",
+    profile_json: dict | None = None,
+    detected_nlp: dict | None = None,
+    style_profile: dict | None = None,
+) -> str:
+    context_extra = _format_nlp_profile_context(profile_md, profile_json, detected_nlp)
+    profile_usage = _build_profile_application_block(profile_md, profile_json, action="improve")
+    has_profile = bool((profile_md or "").strip()) or bool(profile_json)
+    task_line = (
+        "profile-aligned improvement of clarity, compliance language, responsibilities, and operational wording"
+        if has_profile
+        else "light editorial polish — not a full-document rewrite"
+    )
+    language_rule = _build_language_rule(
+        request,
+        profile_json=profile_json,
+        detected_nlp=detected_nlp,
+        style_profile=style_profile,
+        profile_md=profile_md,
+        context=context,
+    )
+    return f"""You are a senior GMP/QA SOP editor. TASK: {task_line}.
 {_SPEED_FIRST}
 {_JSON_ESCAPING_RULE}
-{_LANGUAGE_RULE}
+{language_rule}
+{_user_instruction_blocks(request)}
 {_doc_block(request, context)}
 {_scope_directive(request, "improve")}
-{_intent_optimization_layers(request)}
 {_nlp_section(nlp_block)}
-{_META_USAGE}
+{context_extra}
+{profile_usage}
 {_PRESERVE_CORE}
 {_THREE_C_IMPROVE_STANDARD}
 
 IMPROVE RULES:
-- Fix only grammar, missing articles, unclear abbreviations, passive ownership, vague responsibility, and non-GMP wording.
-- Keep the original sentence shape, list/table style, numbering, blank-line rhythm, and paragraph boundaries unless the original structure is broken.
-- Never introduce bullets, numbering, labels, or headings not present in the original.
-- Never add steps, approvals, systems, requirements, or compliance claims.
+- Fix grammar, unclear abbreviations, passive ownership, vague responsibility, and non-GMP wording.
+- When ACTIVE PROFILE RULES are present: rephrase procedures, controls, and sensitive operational statements to match "
+  "profile terminology, modal patterns, and workflow style — not only tone.
+- When no profile is present: keep the original sentence shape and make minimal edits.
+- Keep list/table style, numbering, blank-line rhythm, and paragraph boundaries unless structure is broken or profile requires clearer steps.
+- Never introduce bullets, numbering, labels, or headings not present in the original unless profile rewrite_rules require clearer step labels inside existing lists.
+- Do not invent new record IDs, dates, systems, or approval chains; strengthen existing content per profile.
 - Keep compact register statements compact — do not inflate into narrative prose.
-- When USER_EDIT_INTENT or the TASK wording favors less verbiage, shorten at the clause level while keeping each obligation and record field explicit.
 - When EDIT_SCOPE is SECTION_ONLY: output must replace only the targeted block; never return a full SOP skeleton.
 - Before returning: compare output against TEXT and restore any missing section, record, field, or ID present in TEXT.
 
@@ -328,20 +599,34 @@ Return only:
 {{"improved_text":"..."}}"""
 
 
-def build_summarize_prompt(request: ActionRequest, context: str, nlp_block: str = "") -> str:
-    return f"""You are a senior GMP/QA communications lead. TASK: produce a concise summary of the SOP text (not a full rewrite) suitable for stakeholders who must grasp controls quickly.
+def build_summarize_prompt(
+    request: ActionRequest,
+    context: str,
+    nlp_block: str = "",
+    profile_md: str = "",
+    profile_json: dict | None = None,
+    detected_nlp: dict | None = None,
+    style_profile: dict | None = None,
+) -> str:
+    language_rule = _build_language_rule(
+        request,
+        profile_json=profile_json,
+        detected_nlp=detected_nlp,
+        style_profile=style_profile,
+        profile_md=profile_md,
+        context=context,
+    )
+    return f"""You are a senior GMP/QA communications lead. TASK: produce a concise executive summary of the SOP text (no full rewrite).
 {_SPEED_FIRST}
 {_JSON_ESCAPING_RULE}
-{_LANGUAGE_RULE}
+{language_rule}
 {_doc_block(request, context)}
-{_intent_optimization_layers(request)}
 {_nlp_section(nlp_block)}
 {_META_USAGE}
 {_PRESERVE_CORE}
 
 SUMMARY RULES:
-- Default: 6–12 short bullets or 2 tight paragraphs maximum. If USER_EDIT_INTENT specifies a different cap (lines, words, bullets), follow it while still obeying PRESERVE rules.
-- Use operational phrasing (actions, owners, records, triggers) — not generic AI narrative or essay transitions.
+- 6–12 short bullets or 2 tight paragraphs maximum.
 - Cover: purpose, scope, critical controls, key roles, records, and review cadence when present in the text.
 - Do not invent facts, dates, systems, or approvals that are not present in TEXT.
 - Keep identifiers and codes exactly as written.
@@ -352,13 +637,28 @@ Return only:
 {{"improved_text":"..."}}"""
 
 
-def build_analyze_prompt(request: ActionRequest, context: str, nlp_block: str = "") -> str:
+def build_analyze_prompt(
+    request: ActionRequest,
+    context: str,
+    nlp_block: str = "",
+    profile_md: str = "",
+    profile_json: dict | None = None,
+    detected_nlp: dict | None = None,
+    style_profile: dict | None = None,
+) -> str:
+    language_rule = _build_language_rule(
+        request,
+        profile_json=profile_json,
+        detected_nlp=detected_nlp,
+        style_profile=style_profile,
+        profile_md=profile_md,
+        context=context,
+    )
     return f"""You are a senior GMP/QA compliance reviewer. TASK: structured compliance analysis of the SOP excerpt (not a rewrite).
 {_SPEED_FIRST}
 {_JSON_ESCAPING_RULE}
-{_LANGUAGE_RULE}
+{language_rule}
 {_doc_block(request, context)}
-{_intent_optimization_layers(request, output_kind="analysis")}
 {_nlp_section(nlp_block)}
 {_META_USAGE}
 {_PRESERVE_CORE}
@@ -374,34 +674,58 @@ Return only:
 {{"improved_text":"..."}}"""
 
 
-def build_rewrite_prompt(request: ActionRequest, context: str, nlp_block: str = "") -> str:
+def build_rewrite_prompt(
+    request: ActionRequest,
+    context: str,
+    nlp_block: str = "",
+    profile_md: str = "",
+    profile_json: dict | None = None,
+    detected_nlp: dict | None = None,
+    style_profile: dict | None = None,
+) -> str:
     scope = resolve_edit_scope(request)
+    language_rule = _build_language_rule(
+        request,
+        profile_json=profile_json,
+        detected_nlp=detected_nlp,
+        style_profile=style_profile,
+        profile_md=profile_md,
+        context=context,
+    )
     full_backbone = ""
     if scope == "full_document":
         full_backbone = """
-FULL SOP BACKBONE (add when missing from TEXT, in input language):
+FULL SOP BACKBONE (add when missing from TEXT, in the active SOP/profile language):
   Purpose/Zweck · Scope/Geltungsbereich · Responsibilities/Verantwortlichkeiten · Procedure/Verfahren ·
   Acceptance Criteria · Documentation/Records · Review/Approval/Lifecycle ·
   Training (if relevant) · Appendices/Traceability (if records present)
 """
+    context_extra = _format_nlp_profile_context(profile_md, profile_json, detected_nlp)
+    profile_usage = _build_profile_application_block(profile_md, profile_json, action="rewrite")
     return f"""You are a senior GMP/QA SOP architect. TASK: structural rewrite into industry-ready SOP language for the scope in EDIT_SCOPE.
 {_SPEED_FIRST}
 {_JSON_ESCAPING_RULE}
-{_LANGUAGE_RULE}
+{language_rule}
+{_user_instruction_blocks(request)}
 {_doc_block(request, context)}
 {_scope_directive(request, "rewrite")}
-{_intent_optimization_layers(request)}
 {_nlp_section(nlp_block)}
-{_META_USAGE}
+{context_extra}
+{profile_usage}
 {_PRESERVE_CORE}
 {_THREE_C_REWRITE_STANDARD}
 {full_backbone}
 REWRITE RULES:
+- STRICT STRUCTURE LOCK: preserve the current SOP structure exactly as it appears in TEXT. Do not add, remove, rename, merge, split, or reorder headings, subheadings, numbered items, lists, tables, register blocks, or appendices.
+- FACT ANCHOR LOCK: preserve record IDs, dates, system names, thresholds, and register line inventory. You MAY change how requirements, controls, responsibilities, and sensitive procedures are expressed when ACTIVE PROFILE RULES require it.
 - Follow EDIT_SCOPE strictly: SECTION_ONLY → never emit a full SOP; FULL_DOCUMENT → rewrite from the first line of TEXT through the end in document order.
+- Follow Active Profile JSON, profile.md, and detected NLP parameters for terminology, RACI, workflow flow, control language, and rewrite_improve_parameters on **substance and style**.
+- When the active profile is German_Pharma_SOP_Profile or describes German pharmaceutical SOPs: formal controlled register, traceable section wording, modal verbs (muss/sollte/darf nicht) per profile — reshape procedural content accordingly.
 - Single section/heading (e.g. CAPAs, DEVIATIONS, Procedure): rewrite only lines in TEXT; never swap CAPAs for DEVIATIONS or vice versa.
-- Use bracketed placeholders only for missing controls clearly implied by TEXT inside that section.
-- Apply rewrite_improve_parameters from NLP_STRUCTURE_AND_PARAMETERS only for tone, formality, numbering, and domain vocabulary; never use them to change facts.
-- When a stronger compression preference is evident from USER_EDIT_INTENT, DOCUMENT fields, or the TASK wording, prioritize shorter sentences and fewer function words while keeping each control and record explicit.
+- Use bracketed placeholders only for missing controls clearly implied by TEXT or profile rewrite_rules inside that section.
+- Apply rewrite_improve_parameters for tone, formality, numbering, domain vocabulary, **and** procedural/control patterns defined in the profile.
+- FULL_DOCUMENT default behavior: keep the same section set and same order as TEXT. Do not add standard SOP backbone sections unless the user explicitly asks to restructure the SOP.
+- Self-check: if output reads like TEXT with minor synonym changes, deepen the rewrite per profile until procedures and controls match the profile's SOP standard.
 
 LANGUAGE & STYLE:
 - Active voice, named accountable roles, precise verbs, consistent controlled vocabulary.
@@ -431,7 +755,7 @@ def build_section_only_rewrite_retry_prompt(request: ActionRequest, context: str
     return f"""CRITICAL RETRY — previous answer was wrong (full SOP or heading-only).
 {_SPEED_FIRST}
 {_JSON_ESCAPING_RULE}
-{_LANGUAGE_RULE}
+{_build_language_rule(request, context=context)}
 {_doc_block(request, context)}
 EDIT_SCOPE: SECTION_ONLY — STRICT
 - Section: "{section}"
@@ -466,29 +790,46 @@ def _gap_scope_directive(request: ActionRequest) -> str:
 - Cite evidence from TEXT only; do not invent gaps for parts of the SOP not included in TEXT."""
 
 
-def build_gap_check_prompt(request: ActionRequest, context: str, nlp_block: str = "") -> str:
+def build_gap_check_prompt(
+    request: ActionRequest,
+    context: str,
+    nlp_block: str = "",
+    profile_md: str = "",
+    profile_json: dict | None = None,
+    detected_nlp: dict | None = None,
+    style_profile: dict | None = None,
+) -> str:
+    context_extra = _format_nlp_profile_context(profile_md, profile_json, detected_nlp)
+    language_rule = _build_language_rule(
+        request,
+        profile_json=profile_json,
+        detected_nlp=detected_nlp,
+        style_profile=style_profile,
+        profile_md=profile_md,
+        context=context,
+    )
     return f"""You are a senior GMP/QA compliance auditor. TASK: audit-grade gap check of the selected SOP text.
 {_SPEED_FIRST}
 {_JSON_ESCAPING_RULE}
-{_LANGUAGE_RULE}
+{language_rule}
 SOP: "{request.sop_title}" | Section: "{request.section_title}" ({request.section_type})
 edit_scope: {resolve_edit_scope(request)}
-{_user_edit_intent_block(request)}
 
 {_gap_scope_directive(request)}
 
 HYBRID_RAG_REFERENCE_CONTEXT:
 {context}
 {_nlp_section(nlp_block)}
+{context_extra}
 CONTEXT USAGE:
 - TEXT is the primary audit evidence.
 - RAG context: compare against expected controls, related SOP language, and compliance patterns.
-- NLP_STRUCTURE_AND_PARAMETERS: use detected sections, roles, risks, metadata, and lifecycle signals as audit signals.
-- Report a gap only when supported by TEXT, NLP metadata, or RAG context — not generic GMP knowledge alone.
+- Active Profile JSON & Markdown, and SOP Detected NLP parameters: check if the text violates the style, tone, RACI, workflow, compliance requirements, or terminology specified in the profile or detected parameters.
+- Report a gap only when supported by TEXT, NLP metadata, profile rules, or RAG context — not generic GMP knowledge alone.
 - If RAG is absent or unrelated, state: "Gap check based on TEXT and NLP metadata only."
 
 AUDIT METHOD:
-1. Identify expected SOP structure from TEXT, metadata, and NLP sections.
+1. Identify expected SOP structure from TEXT, metadata, NLP sections, and Active Profile.
 2. Check each required element for presence, specificity, and actionability.
 3. Compare deviations/CAPAs/audits/decisions/controls/dates/statuses for internal consistency.
 4. Cite exact evidence (section name or record ID: SOP-*, DEV-*, CAPA-*, AUD-*, DEC-*) for every gap.
@@ -509,7 +850,7 @@ OUTPUT RULES:
 - Prioritize compliance gaps over style/grammar observations.
 - If no material gaps found, state clearly and list residual assumptions.
 - Do not propose a new SOP version, new status, or relocate DEV/CAPA/AUDIT logs unless TEXT already uses appendix structure.
-- Localize headings to input language. German → "Zusammenfassung", "RAG/NLP-Grundlage", "Festgestellte Lücken", "Empfohlene Korrekturen", "Vorgeschlagener SOP-Ergänzungstext", "Verbleibende Annahmen".
+- Localize headings to the active SOP/profile language. German → "Zusammenfassung", "RAG/NLP-Grundlage", "Festgestellte Lücken", "Empfohlene Korrekturen", "Vorgeschlagener SOP-Ergänzungstext", "Verbleibende Annahmen".
 
 TEXT:
 \"\"\"{request.section_text}\"\"\"

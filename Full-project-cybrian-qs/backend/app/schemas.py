@@ -1,5 +1,5 @@
-from pydantic import BaseModel, ConfigDict
-from typing import Any, Dict, Optional, List
+from pydantic import BaseModel, ConfigDict, Field
+from typing import Any, Optional, List
 from uuid import UUID
 from datetime import datetime
 
@@ -23,6 +23,7 @@ class CreateVersionRequest(BaseModel):
     change_summary: Optional[str] = None
     change_justification: Optional[str] = None # Enforced in later logic
     metadata_json: Optional[Any] = None
+    suggestion_id: Optional[UUID] = None
 
 class LinkRequest(BaseModel):
     source_id: UUID
@@ -34,23 +35,6 @@ class LinkRequest(BaseModel):
 class UpdateVersionStatusRequest(BaseModel):
     status: str
     metadata_json: Optional[Any] = None
-
-
-class SOPImportJobStatusResponse(BaseModel):
-    job_id: str
-    sop_id: str
-    version_id: str
-    status: str
-    message: Optional[str] = None
-    filename: Optional[str] = None
-    scanned_pdf: bool = False
-    error: Optional[str] = None
-    semantic_error: Optional[str] = None
-    updated_at: Optional[str] = None
-    sop_number: Optional[str] = None
-    title: Optional[str] = None
-    doc_json_ready: bool = False
-    extraction: Optional[Dict[str, Any]] = None
 
 
 # ==========================================
@@ -76,6 +60,7 @@ class EditorVersionResponse(BaseModel):
     review_date: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
+    profile_error: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -96,14 +81,9 @@ class EditorDocResponse(BaseModel):
     status: Optional[str]           # maps from current version.external_status
     created_at: datetime
     updated_at: datetime
+    profile_error: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
-
-
-class AsyncSOPImportResponse(BaseModel):
-    job_id: str
-    import_status: SOPImportJobStatusResponse
-    document: EditorDocResponse
 
 
 # Older alias kept for any internal usage (not used in new routes)
@@ -329,22 +309,18 @@ class AIActionRequest(BaseModel):
     sop_title: Optional[str] = None
     section_name: Optional[str] = None
     section_type: Optional[str] = None
-    # Free-text author goal (e.g. KL assistant message + structured hints). Optional.
-    assistant_instruction: Optional[str] = None
     # section_only | full_document — drives prompt scope (partial vs whole SOP)
     edit_scope: Optional[str] = None
     # When the client already holds a validated structured result (e.g. re-apply), skip LLM.
     client_structured_json: Optional[dict] = None
-    # TipTap doc JSON from the editor — enables structure-preserving rewrite/improve.
-    content_json: Optional[dict] = None
-    # Stable t1..tn ids to patch (section/block scope). Omit for explicit full-document jobs.
-    patch_node_ids: Optional[list[str]] = None
-    # When true with edit_scope=full_document, run as background job with full internal chunking.
-    full_sop_background: Optional[bool] = None
     # UUID of the SOP row for precise DB + ProfileDetection context (editor bubble / KL assistant).
     sop_entity_id: Optional[str] = None
     # Who invoked the action: ``editor_bubble`` | ``kl_assistant`` (for logs only).
     triggered_by: Optional[str] = None
+    # Original user instruction/prompt so explicit style references can reach the LLM layer.
+    instruction: Optional[str] = None
+    # When true, accepting the suggestion should also save learned style back into the linked company profile.
+    learn_to_profile: Optional[bool] = False
 
 class AIActionResponse(BaseModel):
     action: str
@@ -358,18 +334,18 @@ class AIActionResponse(BaseModel):
 class AIActionJobStartResponse(BaseModel):
     job_id: str
     action: str
-    status: str = "queued"
-    message: str = ""
+    status: str
+    message: str
 
 
 class AIActionJobStatusResponse(BaseModel):
     job_id: str
     action: Optional[str] = None
     status: str
-    message: str = ""
+    message: Optional[str] = None
     error: Optional[str] = None
-    progress: dict = {}
-    result: Optional[dict] = None
+    progress: dict[str, Any] = Field(default_factory=dict)
+    result: Optional[dict[str, Any]] = None
     updated_at: Optional[str] = None
 
 
@@ -459,6 +435,8 @@ class ClientProfileResponse(BaseModel):
     description: Optional[str] = None
     domain: Optional[str] = None
     current_version_id: Optional[UUID] = None
+    active_profile_json: Optional[Any] = None
+    active_profile_md: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -481,4 +459,3 @@ class ProfileSuggestionResponse(BaseModel):
 class AcceptRejectSuggestionRequest(BaseModel):
     status: str # 'accepted' or 'rejected'
     rejection_reason: Optional[str] = None
-

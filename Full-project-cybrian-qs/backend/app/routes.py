@@ -1,18 +1,21 @@
 import io
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, UploadFile, File
-from fastapi.responses import FileResponse
-from typing import List ,Any
+from typing import List, Any
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy import func, or_, asc
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from qdrant_client.http import models as qmodels
 import hashlib
 from .database import get_db, SessionLocal
 from .models import (
-    SOP, SOPVersion, Deviation, Capa, AuditFinding, Decision,
+    SOP, SOPVersion, Deviation, Capa, AuditFinding, Decision, ClientProfile,
     SopDeviationLink, DeviationCapaLink, CapaAuditLink, AuditDecisionLink, DecisionSopLink,
     AILinkSuggestion,
+    AISuggestion,
     EmbeddingJob,
+    SOPDetectedParameters,
+    ProfileDetection,
 )
 from .schemas import (
     # Editor compat request bodies
@@ -41,8 +44,6 @@ from .schemas import (
     SemanticReindexRequest,
     LinkSuggestionResponse,
     SemanticStatusResponse,
-    SOPImportJobStatusResponse,
-    AsyncSOPImportResponse,
 )
 from .services.semantic_pipeline import (
     SemanticPipelineService,
@@ -65,6 +66,18 @@ from .services.sop_metadata_extractor import strip_invalid_control_chars
 from .services.semantic_jobs import schedule_semantic_reindex
 from .services.webhook_service import entities_for_link
 from .utils.tiptap_text import extract_plain_text_from_tiptap
+from .services.sop_profile_storage_service import analyze_and_store_sop_profile
+from .client_profile_routes import save_profile_version_from_accepted_suggestion
+from .services.sop_import_worker import (
+    IMPORT_STATUS_QUEUED,
+    SOP_IMPORT_STATUS_MESSAGES,
+    build_import_job_payload,
+    enqueue_sop_import_job,
+    get_import_job_status,
+    merge_import_job_metadata,
+    processing_placeholder_doc,
+)
+from .services.sop_import_job_registry import register_import_job
 
 # ==========================================
 # CONSTANTS
@@ -268,6 +281,19 @@ def _create_new_version_for_existing_sop(
 
     _upsert_import_context_entities(db, existing, new_version, background_tasks)
     _schedule_semantic_job(background_tasks, "sop", existing.id, new_version.id)
+
+    try:
+        plain_text = _extract_plain_text_from_tiptap(new_version.content_json)
+        analyze_and_store_sop_profile(
+            db=db,
+            sop_id=existing.id,
+            sop_version_id=new_version.id,
+            text=plain_text,
+            client_name="Client",
+            source_filename=existing.title
+        )
+    except Exception as e:
+        logger.error(f"SOP profile analysis failed for {existing.id}: {e}")
 
     return _build_editor_doc_response(existing, new_version)
 
@@ -635,12 +661,8 @@ def _upsert_import_context_entities(
                 created["links"] += 1
 
     db.commit()
-    # Refresh metadata before writing hash so _import_job and other internal keys are not wiped.
-    db.refresh(version)
-    fresh_meta = version.metadata_json if isinstance(version.metadata_json, dict) else {}
-    fresh_meta = dict(fresh_meta)
-    fresh_meta["_import_context_hash"] = context_hash
-    version.metadata_json = fresh_meta
+    version_meta["_import_context_hash"] = context_hash
+    version.metadata_json = version_meta
     db.commit()
     t_end = datetime.utcnow()
     print(
@@ -656,6 +678,40 @@ def _upsert_import_context_entities(
     return created
 
 
+def _deduplicate_audit_trail(entries: list) -> list:
+    """
+    Return a deduplicated copy of an audit trail list.
+
+    Deduplication key: (action, version, note).  On collision the *last*
+    occurrence is kept so that the entry carrying the most-recent ``createdAt``
+    timestamp wins.  Entries that are not dicts are silently dropped.
+
+    The returned list preserves the original insertion order of the *first*
+    appearance of each unique key (i.e. we do a stable, last-wins dedup by
+    rebuilding the index in a single pass and then reordering).
+    """
+    if not entries:
+        return []
+
+    # Two-pass: collect canonical keys first so we can emit entries in their
+    # original first-seen order while still keeping the *last* value for each key.
+    seen: dict = {}  # key -> last entry with that key
+    order: list = []  # tracks first-seen insertion order of each key
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        key = (
+            str(entry.get("action", "")),
+            str(entry.get("version", "")),
+            str(entry.get("note", "")),
+        )
+        if key not in seen:
+            order.append(key)
+        seen[key] = entry  # always overwrite so last occurrence wins
+
+    return [seen[k] for k in order]
+
+
 def _normalize_sop_metadata(sop_number: str, title: str, department: str = None, raw_meta: dict = None) -> dict:
     """
     Ensures metadata is in the full 'thick shell' shape the frontend expects.
@@ -669,22 +725,14 @@ def _normalize_sop_metadata(sop_number: str, title: str, department: str = None,
     title = strip_invalid_control_chars(title or "")
     department = strip_invalid_control_chars(department or "")
     
-    from .services.sop_metadata_extractor import (
-        is_generated_import_sop_number,
-        resolve_status_from_metadata,
-    )
-
-    resolved_sop_status = resolve_status_from_metadata(raw_meta)
-    display_document_id = sop_number or ""
-    if is_generated_import_sop_number(display_document_id):
-        display_document_id = ""
-
     # 1. Base Structure
     normalized = {
-        "sopStatus": resolved_sop_status or "draft",
+        "sopStatus": raw_meta.get("sopStatus", "draft"),
         "variables": raw_meta.get("variables", {}),
         "approvedBy": raw_meta.get("approvedBy", ""),
-        "auditTrail": raw_meta.get("auditTrail") if isinstance(raw_meta.get("auditTrail"), list) else [],
+        "auditTrail": _deduplicate_audit_trail(
+            raw_meta.get("auditTrail") if isinstance(raw_meta.get("auditTrail"), list) else []
+        ),
         "versionNote": raw_meta.get("versionNote", ""),
         "obsoleteReason": raw_meta.get("obsoleteReason", ""),
         "approvalSignature": raw_meta.get("approvalSignature", ""),
@@ -695,20 +743,17 @@ def _normalize_sop_metadata(sop_number: str, title: str, department: str = None,
             "reviewer": raw_meta.get("sopMetadata", {}).get("reviewer", ""),
             "riskLevel": raw_meta.get("sopMetadata", {}).get("riskLevel", "Low"),
             "department": department or "Quality",
-            "documentId": display_document_id,
+            "documentId": sop_number or "",
             "docType": raw_meta.get("sopMetadata", {}).get("docType", "SOP"),
             "category": raw_meta.get("sopMetadata", {}).get("category", ""),
             "sopVersion": raw_meta.get("sopMetadata", {}).get("sopVersion", ""),
             "references": raw_meta.get("sopMetadata", {}).get("references", []),
             "reviewDate": raw_meta.get("sopMetadata", {}).get("reviewDate", ""),
             "effectiveDate": raw_meta.get("sopMetadata", {}).get("effectiveDate", ""),
-            "regulatoryReferences": raw_meta.get("sopMetadata", {}).get("regulatoryReferences", []),
+            "regulatoryReferences": raw_meta.get("sopMetadata", {}).get("regulatoryReferences", [])
         }
     }
-    if resolved_sop_status:
-        normalized["sopMetadata"]["sopStatus"] = resolved_sop_status
-        normalized["sopMetadata"]["status"] = resolved_sop_status
-
+    
     # Merge nested sopMetadata: client may send documentId/title; incoming values win when non-empty
     input_sop_meta = raw_meta.get("sopMetadata", {})
     if isinstance(input_sop_meta, dict):
@@ -719,8 +764,6 @@ def _normalize_sop_metadata(sop_number: str, title: str, department: str = None,
                 continue
             if k in ("title", "documentId"):
                 if v:
-                    if k == "documentId" and is_generated_import_sop_number(str(v)):
-                        continue
                     normalized["sopMetadata"][k] = v
             else:
                 normalized["sopMetadata"][k] = v
@@ -754,87 +797,16 @@ def _metadata_debug_sources(structured: dict) -> dict:
     }
 
 
-def _blocks_to_elements(blocks: list) -> list:
-    """
-    Convert the internal typed-blocks format into the unified sequential elements
-    format consumed by the frontend instant-loading path.
-
-    This is the fallback converter used when a file-type-specific sequential
-    extractor is unavailable (e.g. PDF served from Marker cache).
-
-    Output shapes:
-      {"type": "text",  "style": "heading"|"paragraph", "content": str}
-      {"type": "table", "content": [[row1col1, row1col2, ...], ...]}
-    """
-    elements: list = []
-    for block in blocks or []:
-        btype = str(block.get("type", "")).lower()
-        if btype in {"section_heading", "heading"}:
-            text = str(block.get("text", "")).strip()
-            if text:
-                elements.append({"type": "text", "style": "heading", "content": text})
-        elif btype in {"paragraph", "line", "note"}:
-            text = str(block.get("text", "")).strip()
-            if text:
-                elements.append({"type": "text", "style": "paragraph", "content": text})
-        elif btype == "two_column_row":
-            left = str(block.get("left", "")).strip()
-            right = str(block.get("right", "")).strip()
-            if left or right:
-                content = f"{left}: {right}" if left and right else (left or right)
-                elements.append({"type": "text", "style": "paragraph", "content": content})
-        elif btype in {"bullet_list", "numbered_list", "list", "ordered_list"}:
-            for item in block.get("items") or []:
-                text = str(item).strip()
-                if text:
-                    elements.append({"type": "text", "style": "paragraph", "content": text})
-        elif btype == "table":
-            rows = block.get("rows") or []
-            if rows:
-                elements.append({"type": "table", "content": rows})
-    return elements
-
-
-def _txt_to_elements(text: str) -> list:
-    """
-    Convert plain TXT content to unified sequential elements.
-    Each non-blank line becomes a text element; heading heuristics are applied.
-    """
-    from .services.pdf_extractor import _clean_line, _is_likely_heading
-
-    elements: list = []
-    for raw_line in (text or "").splitlines():
-        line = _clean_line(raw_line)
-        if not line:
-            continue
-        style = "heading" if _is_likely_heading(line) else "paragraph"
-        elements.append({"type": "text", "style": style, "content": line})
-    return elements
-
-
-def _build_extract_response(
-    text: str,
-    blocks: list,
-    structured: dict,
-    elements: list | None = None,
-) -> dict:
+def _build_extract_response(text: str, blocks: list, structured: dict) -> dict:
     from .services.document_structure import blocks_to_structured_document
     from .services.sop_metadata_extractor import to_frontend_sop_metadata
 
     sop_ui = to_frontend_sop_metadata(structured)
     public_meta = {k: v for k, v in structured.items() if not str(k).startswith("_")}
     structured_document = blocks_to_structured_document(blocks, public_meta)
-
-    # Prefer caller-supplied elements; fall back to converting existing blocks.
-    resolved_elements = elements if elements is not None else _blocks_to_elements(blocks)
-
     response = {
         "text": (text or "").strip(),
         "blocks": blocks,
-        # Unified sequential format — consumed by the frontend instant-load path.
-        # Shape: [{"type":"text","style":"heading"|"paragraph","content":str}, ...]
-        #        [{"type":"table","content":[[row1col1,...],...]}, ...]
-        "elements": resolved_elements,
         "structured_document": structured_document,
         "sop_metadata": public_meta,
         "sop_metadata_ui": sop_ui,
@@ -851,49 +823,38 @@ def _build_extract_response(
     logger.info("[ocr-import] metadata sources: %s", response["metadata_sources"])
     logger.info(
         "[ocr-import] final response sent to frontend: %s",
-        {
-            **response,
-            "text": response["text"][:300],
-            "blocks": f"{len(blocks)} blocks",
-            "elements": f"{len(resolved_elements)} elements",
-        },
+        {**response, "text": response["text"][:300], "blocks": f"{len(blocks)} blocks"},
     )
     return response
 
 
 def _normalize_external_status(value: str) -> str:
-    from .services.sop_metadata_extractor import normalize_document_status
-
-    normalized = normalize_document_status(value)
-    if normalized:
-        return normalized
-    compact = re.sub(r"[\s-]+", "_", str(value or "").strip().lower())
-    if compact in {"accepted", "rejected", "changes_requested"}:
-        return compact
-    return ""
+    v = str(value or "").strip()
+    if not v:
+        return ""
+    compact = re.sub(r"[\s-]+", "_", v.lower())
+    alias_map = {
+        "in_review": "under_review",
+        "underreview": "under_review",
+        "freigegeben": "effective",
+        "entwurf": "draft",
+        "prufung": "under_review",
+        "pruefung": "under_review",
+    }
+    normalized = alias_map.get(compact, compact)
+    return normalized if normalized in {"draft", "under_review", "effective", "obsolete", "approved", "accepted", "rejected", "changes_requested"} else ""
 
 
 def _resolve_external_status_from_payload(raw_meta: dict | None, fallback: str = "draft") -> str:
-    from .services.sop_metadata_extractor import resolve_status_from_metadata
-
     if not isinstance(raw_meta, dict):
         return fallback
-    return resolve_status_from_metadata(raw_meta) or fallback
-
-
-def _resolve_version_status(version) -> str:
-    """
-    Version status for API/UI: prefer extracted document status in metadata when the
-    DB column is still the import shell default (draft).
-    """
-    meta_status = _resolve_external_status_from_payload(
-        version.metadata_json if isinstance(version.metadata_json, dict) else None,
-        fallback="",
+    candidate = (
+        raw_meta.get("sopStatus")
+        or raw_meta.get("status")
+        or (raw_meta.get("sopMetadata", {}) or {}).get("sopStatus")
+        or (raw_meta.get("sopMetadata", {}) or {}).get("status")
     )
-    col_status = _normalize_external_status(version.external_status or "")
-    if meta_status and (not col_status or (col_status == "draft" and meta_status != "draft")):
-        return meta_status
-    return col_status or meta_status or "draft"
+    return _normalize_external_status(candidate) or fallback
 
 
 def _build_editor_doc_response(sop: SOP, version: SOPVersion) -> dict:
@@ -916,7 +877,7 @@ def _build_editor_doc_response(sop: SOP, version: SOPVersion) -> dict:
         "metadata_json": normalized_meta,
         "current_version_id": str(sop.current_version_id) if sop.current_version_id else None,
         "version_number": version.version_number,
-        "status": _resolve_version_status(version),
+        "status": version.external_status or "draft",
         "created_at": sop.created_at,
         "updated_at": sop.updated_at,
     }
@@ -939,7 +900,7 @@ def _build_editor_version_response(version: SOPVersion) -> dict:
         "id": str(version.id),
         "doc_id": str(version.sop_id),
         "version_number": version.version_number,
-        "status": _resolve_version_status(version),
+        "status": version.external_status or "draft",
         "doc_json": version.content_json,
         "metadata_json": normalized_meta,
         "effective_date": version.effective_date,
@@ -1002,74 +963,64 @@ router = APIRouter()
 
 @router.get("/api/health")
 def health():
-    from .services.local_marker_extractor import check_local_marker_setup
-    from .services.paddleocr_scanned_extractor import check_paddle_ocr_setup
     from .services.pdf_extractor import check_ocr_setup
 
     ocr = check_ocr_setup()
-    marker = check_local_marker_setup()
-    paddle = check_paddle_ocr_setup()
     return {
         "status": "ok",
         "ocr": ocr,
         "ocr_ready": bool(ocr.get("tesseract_binary") and ocr.get("poppler_binaries")),
-        "paddle_ocr": paddle,
-        "paddle_ocr_ready": bool(paddle.get("enabled") and paddle.get("available")),
-        "local_marker": marker,
-        "local_marker_ready": bool(marker.get("enabled") and marker.get("available")),
     }
-
-
-SOP_IMPORT_UNSUPPORTED_DETAIL = (
-    "This file format is not supported. Please upload PDF, DOCX, or TXT."
-)
-
-
-def _is_allowed_sop_upload_filename(filename: str | None) -> bool:
-    name = (filename or "").lower().strip()
-    return name.endswith((".pdf", ".docx", ".txt"))
 
 
 @router.post("/api/extract-text")
 async def extract_text_from_upload(file: UploadFile = File(...)):
     """
-    Extract plain text from PDF, DOCX, or TXT (editor import path).
-
-    Returns structured JSON including a new ``elements`` array in strict reading
-    order for instant, zero-block frontend rendering.  Background tasks
-    (chunking, embedding, Qdrant indexing) are NOT triggered here — they run
-    inside the async import pipeline (import-async endpoint).
-
-    PDF : pdfplumber (digital) / PaddleOCR PPStructure (scanned, fitz render) sequential elements (sync).
-    DOCX: pre-mapped OpenXML body walk (sync).
-    TXT : line-by-line sequential elements (sync).
+    Extract plain text from a small text file or PDF (editor import / OCR path).
+    Includes structured SOP metadata inferred from content (rules + optional LLM fallback).
     """
-    from .services.document_structure import enrich_metadata_text
-    from .services.sequential_import import extract_sequential_upload
+    from .services.document_structure import enrich_metadata_text, refine_blocks, structure_blocks_from_text
+    from .services.pdf_extractor import extract_docx_bytes, extract_pdf_bytes_robust
     from .services.sop_metadata_extractor import extract_sop_metadata_from_text
 
     name = (file.filename or "").lower()
-    if not _is_allowed_sop_upload_filename(name):
-        raise HTTPException(status_code=400, detail=SOP_IMPORT_UNSUPPORTED_DETAIL)
-
-    # Metadata heuristics only need the beginning of the document; cap keeps very large imports responsive.
-    _meta_cap = int(os.getenv("SOP_IMPORT_METADATA_TEXT_CAP", "120000"))
-
-    def _clip_for_metadata(src: str) -> str:
-        t = (src or "").strip()
-        return t if len(t) <= _meta_cap else t[:_meta_cap]
-
     try:
-        raw = await file.read()
-        elements, blocks, text, _scanned = extract_sequential_upload(raw, name)
-        text = strip_invalid_control_chars(text)
-        meta_text = enrich_metadata_text(text, blocks)
-        structured = extract_sop_metadata_from_text(
-            _clip_for_metadata(meta_text),
-            blocks,
-            use_llm_fallback=len(text) < 250000,
-        )
-        return _build_extract_response(text, blocks, structured, elements=elements)
+        if name.endswith(".pdf"):
+            raw_pdf = await file.read()
+            blocks, text = extract_pdf_bytes_robust(raw_pdf)
+            text = strip_invalid_control_chars(text)
+            meta_text = enrich_metadata_text(text, blocks)
+            structured = extract_sop_metadata_from_text(meta_text, blocks)
+            return _build_extract_response(text, blocks, structured)
+        elif name.endswith(".docx"):
+            raw_docx = await file.read()
+            blocks, text = extract_docx_bytes(raw_docx)
+            text = strip_invalid_control_chars(text)
+            meta_text = enrich_metadata_text(text, blocks)
+            structured = extract_sop_metadata_from_text(meta_text, blocks)
+            return _build_extract_response(text, blocks, structured)
+        elif name.endswith((".txt", ".md", ".csv", ".json")):
+            raw = await file.read()
+            text = strip_invalid_control_chars(raw.decode("utf-8", errors="replace"))
+            blocks = structure_blocks_from_text(text)
+            meta_text = enrich_metadata_text(text, blocks)
+            structured = extract_sop_metadata_from_text(meta_text, blocks)
+            return _build_extract_response(text, blocks, structured)
+        else:
+            # Best-effort UTF-8 for unknown extensions
+            raw = await file.read()
+            try:
+                text = raw.decode("utf-8")
+                text = strip_invalid_control_chars(text)
+            except Exception:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Unsupported or binary file; use .pdf, .docx, or .txt",
+                ) from None
+            blocks = structure_blocks_from_text(text)
+            meta_text = enrich_metadata_text(text, blocks)
+            structured = extract_sop_metadata_from_text(meta_text, blocks)
+            return _build_extract_response(text, blocks, structured)
     except HTTPException:
         raise
     except Exception as e:
@@ -1078,6 +1029,111 @@ async def extract_text_from_upload(file: UploadFile = File(...)):
             status_code=500,
             detail=f"Extraction failed ({type(e).__name__}): {e!s}",
         ) from e
+
+
+@router.post("/api/editor/sops/import-async")
+async def import_sop_async(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    _=Depends(check_mock_mode),
+):
+    filename = str(file.filename or "").strip() or "upload.bin"
+    ext = os.path.splitext(filename.lower())[1]
+    if ext not in {".pdf", ".docx", ".txt"}:
+        raise HTTPException(status_code=400, detail="Unsupported file type. Use .pdf, .docx, or .txt")
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    sop_id = uuid.uuid4()
+    version_id = uuid.uuid4()
+    job_id = str(uuid.uuid4())
+
+    fallback_title = os.path.splitext(filename)[0].strip() or "Imported SOP"
+    title = _truncate_field(fallback_title, 255) or "Imported SOP"
+    sop_number = f"IMPORT-{uuid.uuid4().hex[:8].upper()}"
+    department = "Quality"
+
+    import_status = IMPORT_STATUS_QUEUED
+    import_message = SOP_IMPORT_STATUS_MESSAGES.get(import_status, "Queued for document extraction.")
+    import_payload = build_import_job_payload(
+        job_id=job_id,
+        status=import_status,
+        message=import_message,
+        filename=filename,
+        scanned_pdf=False,
+    )
+    metadata_json = merge_import_job_metadata(
+        _normalize_sop_metadata(
+            sop_number=sop_number,
+            title=title,
+            department=department,
+            raw_meta={"sourceFilename": filename},
+        ),
+        import_payload,
+    )
+
+    sop = SOP(
+        id=sop_id,
+        tenant_id=FIXED_TENANT_ID,
+        title=title,
+        sop_number=sop_number,
+        department=department,
+        source_system="pdf_text_import",
+        is_active=True,
+        current_version_id=version_id,
+    )
+    version = SOPVersion(
+        id=version_id,
+        sop_id=sop_id,
+        version_number="1",
+        content_json=processing_placeholder_doc(),
+        metadata_json=metadata_json,
+        external_status="draft",
+    )
+    db.add(sop)
+    db.add(version)
+    db.commit()
+    db.refresh(sop)
+    db.refresh(version)
+
+    register_import_job(
+        job_id=job_id,
+        sop_id=sop_id,
+        version_id=version_id,
+        status=import_status,
+        message=import_message,
+        filename=filename,
+        scanned_pdf=False,
+    )
+    enqueue_sop_import_job(
+        job_id=job_id,
+        sop_id=sop_id,
+        version_id=version_id,
+        file_bytes=file_bytes,
+        filename=filename,
+    )
+
+    status_row = get_import_job_status(db, job_id, version_id=version_id, sop_id=sop_id)
+    return {
+        "job_id": job_id,
+        "document": _build_editor_doc_response(sop, version),
+        "import_status": status_row or import_payload,
+    }
+
+
+@router.get("/api/editor/import-jobs/{job_id}")
+def get_editor_import_job_status_route(
+    job_id: str,
+    version_id: UUID | None = Query(default=None),
+    sop_id: UUID | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    row = get_import_job_status(db, job_id, version_id=version_id, sop_id=sop_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Import job not found")
+    return row
 
 
 # ==========================================
@@ -1130,9 +1186,15 @@ def create_document(
         .first()
     )
     if existing:
-        return _create_new_version_for_existing_sop(
-            db, existing, payload, resolved_title, department, sop_number, background_tasks
-        )
+        has_params = db.query(SOPDetectedParameters).filter(SOPDetectedParameters.sop_id == existing.id).first()
+        if has_params:
+            logger.info("SOP %s already uploaded and analyzed, returning existing document without duplication.", sop_number)
+            current_version = _resolve_current_version(db, existing)
+            return _build_editor_doc_response(existing, current_version)
+        else:
+            return _create_new_version_for_existing_sop(
+                db, existing, payload, resolved_title, department, sop_number, background_tasks
+            )
 
     dept_final = _truncate_field(department, 100) or "Quality"
     title_final = _truncate_field(resolved_title, 255) or "Untitled SOP"
@@ -1212,234 +1274,23 @@ def create_document(
     db.refresh(initial_version)
     logger.info("[sop-editor] upload saved sop_id=%s version_id=%s", sop.id, initial_version.id)
 
-    from .services.sop_import_worker import import_job_pending
-
-    if not import_job_pending(initial_version.metadata_json):
-        _upsert_import_context_entities(db, sop, initial_version, background_tasks)
-        _schedule_semantic_job(background_tasks, "sop", sop.id, initial_version.id)
-
-    return _build_editor_doc_response(sop, initial_version)
-
-
-@router.post("/api/editor/sops/import-async", response_model=AsyncSOPImportResponse)
-async def import_sop_async(
-    file: UploadFile = File(...),
-    db: Session = Depends(get_db),
-    _=Depends(check_mock_mode),
-):
-    """
-    Fast SOP upload: create record immediately, extract/OCR/index in background.
-    Poll GET /api/editor/import-jobs/{job_id} for status until completed.
-    """
-    from pathlib import Path
-
-    from .services.sop_import_worker import (
-        IMPORT_STATUS_UPLOADING,
-        build_import_job_payload,
-        build_import_job_status_dict,
-        enqueue_sop_import_job,
-        get_import_job_status,
-        merge_import_job_metadata,
-        processing_placeholder_doc,
-    )
-
-    name = (file.filename or "").lower()
-    if not _is_allowed_sop_upload_filename(name):
-        raise HTTPException(status_code=400, detail=SOP_IMPORT_UNSUPPORTED_DETAIL)
-
-    max_bytes = int(os.getenv("SOP_IMPORT_MAX_BYTES", str(80 * 1024 * 1024)))
-    raw = await file.read()
-    if len(raw) > max_bytes:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large ({len(raw)} bytes). Maximum is {max_bytes} bytes.",
-        )
-
-    job_id = str(uuid.uuid4())
-    new_sop_id = uuid.uuid4()
-    new_ver_id = uuid.uuid4()
-    # Temporary unique placeholder until extraction assigns the real SOP number from the file.
-    sop_number = f"IMPORT-{job_id.replace('-', '')[:12].upper()}"
-    fallback_title = (Path(name).stem or "Imported SOP")[:255]
-    upload_filename = file.filename or "upload"
+    _upsert_import_context_entities(db, sop, initial_version, background_tasks)
+    _schedule_semantic_job(background_tasks, "sop", sop.id, initial_version.id)
 
     try:
-        job_payload = build_import_job_payload(
-            job_id=job_id,
-            status=IMPORT_STATUS_UPLOADING,
-            message="Upload received. Processing in background…",
-            filename=upload_filename,
-        )
-        normalized_meta = _normalize_sop_metadata(
-            sop_number="",
-            title=fallback_title,
-            department="Quality",
-            raw_meta=merge_import_job_metadata(
-                {
-                    "sopStatus": "draft",
-                    "sopMetadata": {
-                        "title": fallback_title,
-                        "author": "System (Import)",
-                        "reviewer": "",
-                    },
-                },
-                job_payload,
-            ),
-        )
-
-        sop = SOP(
-            id=new_sop_id,
-            tenant_id=FIXED_TENANT_ID,
-            title=fallback_title,
-            sop_number=sop_number,
-            department="Quality",
-            is_active=True,
-            current_version_id=new_ver_id,
-        )
-        initial_version = SOPVersion(
-            id=new_ver_id,
-            sop_id=new_sop_id,
-            version_number=normalized_meta.get("sopMetadata", {}).get("sopVersion") or "1",
-            content_json=processing_placeholder_doc(),
-            metadata_json=normalized_meta,
-            effective_date=_metadata_date(normalized_meta.get("sopMetadata", {}).get("effectiveDate")),
-            review_date=_metadata_date(normalized_meta.get("sopMetadata", {}).get("reviewDate")),
-            external_status="draft",
-        )
-        if name.endswith(".pdf"):
-            from .services.document_extraction import apply_extraction_fields
-            from .services.sequential_import import EXTRACTION_ENGINE_SEQUENTIAL
-            from .services.sop_import_worker import IMPORT_STATUS_QUEUED
-
-            apply_extraction_fields(
-                initial_version,
-                job_id=job_id,
-                status=IMPORT_STATUS_QUEUED,
-                engine=EXTRACTION_ENGINE_SEQUENTIAL,
-            )
-        db.add(sop)
-        db.add(initial_version)
-        try:
-            db.commit()
-        except SQLAlchemyError as exc:
-            db.rollback()
-            logger.exception("[sop-import] async shell commit failed sop_number=%s", sop_number)
-            raise HTTPException(
-                status_code=400,
-                detail=f"Failed to create import shell: {str(exc)[:500]}",
-            ) from None
-
-        db.refresh(sop)
-        db.refresh(initial_version)
-
-        from .services.sop_import_job_registry import register_import_job
-
-        register_import_job(
-            job_id=job_id,
+        plain_text = _extract_plain_text_from_tiptap(initial_version.content_json)
+        analyze_and_store_sop_profile(
+            db=db,
             sop_id=sop.id,
-            version_id=initial_version.id,
-            status=IMPORT_STATUS_UPLOADING,
-            message="Upload received. Processing in background…",
-            filename=upload_filename,
+            sop_version_id=initial_version.id,
+            text=plain_text,
+            client_name="Client",
+            source_filename=sop.title
         )
+    except Exception as e:
+        logger.error(f"SOP profile analysis failed for {sop.id}: {e}")
 
-        if not isinstance(initial_version.metadata_json, dict) or not initial_version.metadata_json.get("_import_job"):
-            logger.error(
-                "[sop-import] _import_job missing after commit sop_id=%s version_id=%s meta_keys=%s",
-                sop.id,
-                initial_version.id,
-                list((initial_version.metadata_json or {}).keys()),
-            )
-            raise HTTPException(
-                status_code=500,
-                detail="Import job metadata was not persisted. Check database JSONB support.",
-            )
-
-        try:
-            enqueue_sop_import_job(
-                job_id=job_id,
-                sop_id=sop.id,
-                version_id=initial_version.id,
-                file_bytes=raw,
-                filename=upload_filename,
-            )
-        except Exception as exc:
-            logger.exception("[sop-import] failed to enqueue background worker job_id=%s", job_id)
-            raise HTTPException(
-                status_code=500,
-                detail=f"Import worker could not be started: {type(exc).__name__}: {str(exc)[:300]}",
-            ) from None
-
-        status_row = build_import_job_status_dict(
-            job_id=job_id,
-            sop=sop,
-            version=initial_version,
-        ) or get_import_job_status(
-            db,
-            job_id,
-            version_id=initial_version.id,
-            sop_id=sop.id,
-        )
-        if not status_row:
-            logger.error(
-                "[sop-import] status payload missing after init job_id=%s sop_id=%s version_id=%s",
-                job_id,
-                sop.id,
-                initial_version.id,
-            )
-            raise HTTPException(
-                status_code=500,
-                detail="Import job could not be initialized (status payload missing).",
-            )
-
-        logger.info(
-            "[sop-import] async shell created sop_id=%s version_id=%s job_id=%s filename=%s bytes=%s",
-            sop.id,
-            initial_version.id,
-            job_id,
-            upload_filename,
-            len(raw),
-        )
-        return AsyncSOPImportResponse(
-            job_id=job_id,
-            import_status=SOPImportJobStatusResponse(**status_row),
-            document=_build_editor_doc_response(sop, initial_version),
-        )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.exception("[sop-import] async init failed filename=%s", upload_filename)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Import initialization failed: {type(exc).__name__}: {str(exc)[:400]}",
-        ) from None
-
-
-@router.get("/api/editor/import-jobs/{job_id}", response_model=SOPImportJobStatusResponse)
-def get_sop_import_job_status(
-    job_id: str,
-    version_id: str | None = None,
-    sop_id: str | None = None,
-    db: Session = Depends(get_db),
-):
-    from .services.sop_import_worker import get_import_job_status
-
-    vid = sid = None
-    if version_id:
-        try:
-            vid = uuid.UUID(str(version_id))
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid version_id")
-    if sop_id:
-        try:
-            sid = uuid.UUID(str(sop_id))
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid sop_id")
-
-    row = get_import_job_status(db, job_id, version_id=vid, sop_id=sid)
-    if not row:
-        raise HTTPException(status_code=404, detail=f"Import job not found: {job_id}")
-    return SOPImportJobStatusResponse(**row)
+    return _build_editor_doc_response(sop, initial_version)
 
 
 @router.get("/api/editor/docs/{doc_id}", response_model=EditorDocResponse)
@@ -1464,38 +1315,6 @@ def get_document(doc_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Current version not found in sop_versions")
 
     return _build_editor_doc_response(sop, current_version)
-
-
-@router.get("/api/editor/versions/{version_id}/source-pdf")
-def get_version_source_pdf(version_id: str, db: Session = Depends(get_db)):
-    """
-    Return the archived original PDF for a scanned import (preview only).
-    Editable content lives in TipTap JSON; this endpoint serves the upload unchanged.
-    """
-    from .services.source_pdf_store import source_pdf_path, source_pdf_exists
-
-    try:
-        vid = uuid.UUID(str(version_id))
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid version_id")
-
-    version = db.query(SOPVersion).filter(SOPVersion.id == vid).first()
-    if not version:
-        raise HTTPException(status_code=404, detail="Version not found")
-
-    meta = version.metadata_json if isinstance(version.metadata_json, dict) else {}
-    if not meta.get("_source_pdf", {}).get("available") and not source_pdf_exists(vid):
-        raise HTTPException(status_code=404, detail="Source PDF not available for this version")
-
-    path = source_pdf_path(vid)
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="Source PDF file missing on disk")
-
-    return FileResponse(
-        path,
-        media_type="application/pdf",
-        filename=f"source-{vid}.pdf",
-    )
 
 
 @router.put("/api/editor/docs/{doc_id}", response_model=EditorDocResponse)
@@ -1558,9 +1377,6 @@ def update_document(
         current_version.metadata_json = normalized_meta
         current_version.effective_date = _metadata_date(normalized_meta.get("sopMetadata", {}).get("effectiveDate"))
         current_version.review_date = _metadata_date(normalized_meta.get("sopMetadata", {}).get("reviewDate"))
-        resolved_status = _resolve_external_status_from_payload(normalized_meta, fallback="")
-        if resolved_status:
-            current_version.external_status = resolved_status
 
     db.commit()
     db.refresh(sop)
@@ -1569,6 +1385,19 @@ def update_document(
 
     _upsert_import_context_entities(db, sop, current_version, background_tasks)
     _schedule_semantic_job(background_tasks, "sop", sop.id, current_version.id)
+
+    try:
+        plain_text = _extract_plain_text_from_tiptap(current_version.content_json)
+        analyze_and_store_sop_profile(
+            db=db,
+            sop_id=sop.id,
+            sop_version_id=current_version.id,
+            text=plain_text,
+            client_name="Client",
+            source_filename=sop.title
+        )
+    except Exception as e:
+        logger.error(f"SOP profile analysis failed for {sop.id}: {e}")
 
     return _build_editor_doc_response(sop, current_version)
 
@@ -1709,13 +1538,13 @@ def list_versions(doc_id: str, db: Session = Depends(get_db)):
     doc_id     <- sop_id
     status     <- external_status
     """
-    sop = _resolve_sop_lookup(db, doc_id, include_inactive=False)
+    sop = db.query(SOP).filter(SOP.id == doc_id, SOP.is_active == True).first()  # noqa: E712
     if not sop:
         raise HTTPException(status_code=404, detail="Document not found")
 
     versions = (
         db.query(SOPVersion)
-        .filter(SOPVersion.sop_id == sop.id)
+        .filter(SOPVersion.sop_id == doc_id)
         .order_by(SOPVersion.created_at.asc())
         .all()
     )
@@ -1733,7 +1562,7 @@ def create_version(
     """
     Create a new version row. Uses TRUE sequential integer calculation.
     """
-    sop = _resolve_sop_lookup(db, doc_id, include_inactive=False)
+    sop = db.query(SOP).filter(SOP.id == doc_id, SOP.is_active == True).first()  # noqa: E712
     if not sop:
         raise HTTPException(status_code=404, detail="Document not found")
 
@@ -1747,13 +1576,18 @@ def create_version(
         )
 
     # Calculate real next integer version
-    all_versions = db.query(SOPVersion).filter(SOPVersion.sop_id == sop.id).all()
+    all_versions = db.query(SOPVersion).filter(SOPVersion.sop_id == doc_id).all()
     max_v = 0
     for v in all_versions:
         try:
-            val = int(v.version_number)
+            val = int(float(v.version_number))
             if val > max_v: max_v = val
-        except: pass
+        except:
+            try:
+                val = int(v.version_number.split('.')[0])
+                if val > max_v: max_v = val
+            except:
+                pass
     next_version = str(max_v + 1)
 
     version = SOPVersion(
@@ -1764,6 +1598,7 @@ def create_version(
         metadata_json=payload_meta_json or {},
     )
     db.add(version)
+    db.flush()
     
     # Point parent to new version
     sop.current_version_id = version.id
@@ -1774,13 +1609,20 @@ def create_version(
         audit_trail = meta_dict.get("auditTrail", [])
         if not isinstance(audit_trail, list):
             audit_trail = []
-        audit_trail.append({
+
+        new_entry = {
             "action": "created_new_revision",
             "note": payload.change_justification,
             "version": next_version,
             "createdAt": datetime.utcnow().isoformat(),
-            "actor": "System"
-        })
+            "actor": "System",
+        }
+
+        # Deduplicate before appending: drop any pre-existing entry that has the
+        # same (action, version, note) triple so that re-runs of this endpoint
+        # (e.g. from a client retry) never produce cumulative duplicate entries.
+        audit_trail = _deduplicate_audit_trail([*audit_trail, new_entry])
+
         meta_dict["auditTrail"] = audit_trail
         meta_dict["change_justification"] = payload.change_justification
         version.metadata_json = meta_dict
@@ -1788,6 +1630,65 @@ def create_version(
     db.commit()
     db.refresh(version)
     db.refresh(sop)
+
+    accepted_suggestion = None
+    if payload.suggestion_id:
+        accepted_suggestion = (
+            db.query(AISuggestion)
+            .filter(AISuggestion.id == payload.suggestion_id, AISuggestion.sop_id == sop.id)
+            .first()
+        )
+    if accepted_suggestion is None and payload.change_justification:
+        lowered_note = payload.change_justification.lower()
+        if "accepted" in lowered_note and ("rewrite" in lowered_note or "improve" in lowered_note):
+            accepted_suggestion = (
+                db.query(AISuggestion)
+                .filter(
+                    AISuggestion.sop_id == sop.id,
+                    AISuggestion.status == "pending",
+                )
+                .order_by(AISuggestion.created_at.desc())
+                .first()
+            )
+            if accepted_suggestion is None:
+                accepted_suggestion = (
+                    db.query(AISuggestion)
+                    .filter(
+                        AISuggestion.sop_id.is_(None),
+                        AISuggestion.status == "pending",
+                    )
+                    .order_by(AISuggestion.created_at.desc())
+                    .first()
+                )
+    if accepted_suggestion is not None:
+        if accepted_suggestion.sop_id is None:
+            accepted_suggestion.sop_id = sop.id
+        if accepted_suggestion.sop_version_id is None:
+            accepted_suggestion.sop_version_id = version.id
+        accepted_suggestion.status = "accepted"
+        accepted_suggestion.accepted_version_id = version.id
+        accepted_suggestion.accepted_at = datetime.utcnow()
+        meta = dict(accepted_suggestion.metadata_json or {})
+        meta["accepted_change_justification"] = payload.change_justification
+        meta["accepted_sop_version"] = next_version
+        accepted_suggestion.metadata_json = meta
+        flag_modified(accepted_suggestion, "metadata_json")
+        should_learn = bool((accepted_suggestion.metadata_json or {}).get("learn_to_profile"))
+        if should_learn and accepted_suggestion.profile_id:
+            profile = db.query(ClientProfile).filter(ClientProfile.id == accepted_suggestion.profile_id).first()
+            if profile:
+                profile_result = save_profile_version_from_accepted_suggestion(
+                    db,
+                    profile=profile,
+                    suggestion=accepted_suggestion,
+                    change_reason=f"Auto-learned from accepted {accepted_suggestion.action} suggestion",
+                )
+                meta["profile_auto_updated"] = True
+                meta["profile_auto_update_result"] = profile_result
+                accepted_suggestion.metadata_json = meta
+                flag_modified(accepted_suggestion, "metadata_json")
+        db.commit()
+        db.refresh(accepted_suggestion)
 
     _schedule_semantic_job(background_tasks, "sop", sop.id, version.id)
     return _build_editor_version_response(version)
@@ -1799,13 +1700,13 @@ def get_version(doc_id: str, version_id: str, db: Session = Depends(get_db)):
     Fetch a specific version by doc_id (= sop_id) and version_id.
     Returns old editor field names.
     """
-    sop = _resolve_sop_lookup(db, doc_id, include_inactive=False)
+    sop = db.query(SOP).filter(SOP.id == doc_id, SOP.is_active == True).first()  # noqa: E712
     if not sop:
         raise HTTPException(status_code=404, detail="Document not found")
 
     version = (
         db.query(SOPVersion)
-        .filter(SOPVersion.sop_id == sop.id, SOPVersion.id == version_id)
+        .filter(SOPVersion.sop_id == doc_id, SOPVersion.id == version_id)
         .first()
     )
     if not version:
@@ -1825,7 +1726,7 @@ def duplicate_document(
     """
     Duplicate an existing SOP. Reset to version 1.
     """
-    source_sop = _resolve_sop_lookup(db, doc_id, include_inactive=False)
+    source_sop = db.query(SOP).filter(SOP.id == doc_id, SOP.is_active == True).first()  # noqa: E712
     if not source_sop:
         raise HTTPException(status_code=404, detail="Source document not found")
 
@@ -1893,13 +1794,13 @@ def update_version_status(
             detail=f"Invalid status '{payload.status}'. Must be one of: {', '.join(sorted(VALID_STATUSES))}"
         )
 
-    sop = _resolve_sop_lookup(db, doc_id, include_inactive=False)
+    sop = db.query(SOP).filter(SOP.id == doc_id, SOP.is_active == True).first()  # noqa: E712
     if not sop:
         raise HTTPException(status_code=404, detail="Document not found")
 
     version = (
         db.query(SOPVersion)
-        .filter(SOPVersion.sop_id == sop.id, SOPVersion.id == version_id)
+        .filter(SOPVersion.sop_id == doc_id, SOPVersion.id == version_id)
         .first()
     )
     if not version:
@@ -2411,12 +2312,13 @@ def import_dataset(payload: DatasetImportRequest, db: Session = Depends(get_db),
             for s in batch_sops:
                 sop_id = uuid.UUID(s["id"]) if s.get("id") else None
                 sop = find_existing(
-                    SOP,
+    AISuggestion,
+    SOP,
                     entity_id=sop_id,
                     external_id=s.get("external_id"),
                     lookup_field="sop_number",
                     lookup_value=s.get("sop_number"),
-                )
+)
                 if not sop:
                     sop_id = sop_id or uuid.uuid4()
                     sop = SOP(

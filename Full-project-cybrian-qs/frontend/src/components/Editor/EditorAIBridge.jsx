@@ -1,14 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import AIComparisonModal from './AIComparisonModal'
-import EditorInlineSuggestionToolbar from './EditorInlineSuggestionToolbar'
 import { performAIAction } from '../../api/editorApi'
 import { formatAiSuggestionForUi } from '../../utils/aiOutputFormatter'
-import { applyTipTapContentToEditor } from '../../utils/editorUtils'
-import {
-  buildAcceptedInsertContent,
-  coerceTipTapDocForApply,
-} from '../../utils/editorAiActionShared'
 import {
   dispatchEditorSnapshotResponse,
   subscribeEditorInlineSuggestionApply,
@@ -25,8 +19,6 @@ import {
   setInlineAiSuggestion,
 } from '../../utils/editorInlineSuggestionPlugin'
 import { resolveTargetInEditor } from '../../utils/editorTargetResolver'
-import { isExplicitFullSopRequest, wantsFullSopIntent } from '../../utils/sopActionIntent'
-import { buildPatchScopePayload } from '../../utils/tiptapScope'
 import {
   AI_ACTION_TRIGGERED_BY,
   EDITOR_AI_ACTIONS,
@@ -34,13 +26,9 @@ import {
   dispatchEditorAiActionResult,
   subscribeEditorAiActionRequest,
 } from '../../utils/editorAiBridge'
-import {
-  INLINE_APPLIED_EVENT,
-  INLINE_SHOWN_EVENT,
-  resolveRewriteImproveTarget,
-  runRewriteImproveWithInlinePreview,
-} from '../../utils/editorInlineAiFlow'
-import { getAppLanguage, getFriendlyErrorMessage } from '../../utils/friendlyErrorMessage'
+
+const INLINE_SHOWN_EVENT = 'editor-actions-inline-shown'
+const INLINE_APPLIED_EVENT = 'editor-actions-inline-applied'
 
 const ACTION_TEXT_WARNING_CHARS = 7000
 
@@ -113,7 +101,6 @@ const EditorAIBridge = ({
   const [isModalOpen, setIsModalOpen] = useState(false)
   const [aiResult, setAIResult] = useState(null)
   const [isLoading, setIsLoading] = useState(false)
-  const [loadingMessage, setLoadingMessage] = useState('KI-Assistent bearbeitet die SOP…')
   /** Snapshot of the request that opened the current modal. */
   const activeRequestRef = useRef(null)
   /** Range in the editor that should receive the accepted content. */
@@ -193,7 +180,7 @@ const EditorAIBridge = ({
         emitResult({
           ...request,
           status: EDITOR_AI_ACTION_STATUS.ERROR,
-          message: getFriendlyErrorMessage(getAppLanguage()),
+          message: err?.message || 'Versionsvergleich fehlgeschlagen.',
         })
       }
       return
@@ -226,63 +213,6 @@ const EditorAIBridge = ({
       return
     }
 
-    const actionPrompt = String(request?.prompt || '').trim()
-
-    if (action === EDITOR_AI_ACTIONS.REWRITE || action === EDITOR_AI_ACTIONS.IMPROVE) {
-      inFlightRef.current = true
-      activeRequestRef.current = request
-      notifyPreviewSession(true)
-      setLoadingMessage('Preparing inline preview…')
-      setIsLoading(true)
-      const bridgeRequestId = request.requestId || `kl-${Date.now().toString(36)}`
-
-      try {
-        const { target, normalized } = await runRewriteImproveWithInlinePreview({
-          editor: liveEditor,
-          action,
-          requestId: bridgeRequestId,
-          sopTitle,
-          documentId: documentIdRef.current || sopMetadataRef.current?.documentId || null,
-          triggeredBy: AI_ACTION_TRIGGERED_BY.KL_ASSISTANT,
-          instruction: actionPrompt,
-          userMessage: String(request?.userMessage || '').trim() || actionPrompt,
-          targetScope: String(request?.targetScope || '').trim().toLowerCase(),
-          sectionHint: String(request?.sectionHint || '').trim(),
-        })
-        targetRangeRef.current = { from: target.from, to: target.to }
-        isFullDocRef.current = target.isFullDoc
-        emitResult({
-          ...request,
-          status: EDITOR_AI_ACTION_STATUS.DISPLAYED,
-          action,
-          section_name: target.sectionName,
-          preview_excerpt: normalized.suggestedHtml,
-          is_full_sop: target.isFullDoc,
-          explanation: normalized.explanation || '',
-        })
-        console.info('[kl-editor-inline-shown]', { action, requestId: bridgeRequestId })
-      } catch (err) {
-        console.error('[kl-editor-action-failed]', err)
-        const message =
-          err?.message && /Could not find/i.test(String(err.message))
-            ? String(err.message)
-            : getFriendlyErrorMessage(getAppLanguage())
-        emitResult({
-          ...request,
-          status: EDITOR_AI_ACTION_STATUS.ERROR,
-          message,
-        })
-        notifyPreviewSession(false)
-        activeRequestRef.current = null
-        targetRangeRef.current = null
-        isFullDocRef.current = false
-      } finally {
-        inFlightRef.current = false
-        setIsLoading(false)
-      }
-      return
-    }
-
     const { state } = liveEditor
     const { selection } = state
     const hasSelection = Boolean(selection && !selection.empty)
@@ -292,35 +222,37 @@ const EditorAIBridge = ({
 
     let from = 0
     let to = state.doc.content.size
-    let selectedText = ''
-    let isFullDoc = false
-    let sectionName = 'Current block'
-    let sectionType = 'Paragraph'
+    let selectedText = state.doc.textBetween(from, to, '\n').trim()
+    let isFullDoc = true
+    let sectionName = 'Full SOP'
+    let sectionType = 'Full Document'
+
+    const actionPrompt = String(request?.prompt || '').trim()
     if (actionPrompt) {
       try {
         const resolved = resolveTargetInEditor(liveEditor, {
-          prompt: String(request?.userMessage || '').trim() || actionPrompt,
+          prompt: actionPrompt,
+          userPrompt: String(request?.userPrompt || ''),
           selection: selectionPayload,
-          sectionHint: String(request?.sectionHint || '').trim(),
-          targetScope: String(request?.targetScope || '').trim(),
+          sectionHint: String(request?.sectionHint || ''),
+          targetScope: String(request?.targetScope || ''),
+          lineNumber: request?.lineNumber ?? null,
+          recordId: String(request?.recordId || ''),
+          preferFullSection: Boolean(request?.preferFullSection),
         })
         if (resolved?.text && resolved.from != null && resolved.to != null) {
           from = resolved.from
           to = resolved.to
           selectedText = resolved.text
-          isFullDoc = Boolean(resolved.isFullDoc) && wantsFullSopIntent(actionPrompt)
+          isFullDoc = Boolean(resolved.isFullDoc)
           sectionName = resolved.sectionName || sectionName
           sectionType = resolved.sectionType || sectionType
         }
       } catch (err) {
-        const message =
-          err?.message && /Could not find/i.test(String(err.message))
-            ? String(err.message)
-            : getFriendlyErrorMessage(getAppLanguage())
         emitResult({
           ...request,
           status: EDITOR_AI_ACTION_STATUS.ERROR,
-          message,
+          message: err?.message || 'Could not resolve target in the open SOP.',
         })
         return
       }
@@ -334,16 +266,6 @@ const EditorAIBridge = ({
         sectionName = 'Selected text'
         sectionType = 'Paragraph'
       }
-    } else {
-      const block = resolveCurrentBlockAtCursor(liveEditor)
-      if (block?.text) {
-        from = block.from
-        to = block.to
-        selectedText = block.text
-        isFullDoc = false
-        sectionName = block.sectionName || sectionName
-        sectionType = block.sectionType || sectionType
-      }
     }
 
     if (!selectedText) {
@@ -355,20 +277,9 @@ const EditorAIBridge = ({
       return
     }
 
-    let explicitFullSop = isExplicitFullSopRequest({ instruction: actionPrompt })
-    if (explicitFullSop) {
-      const docSize = state.doc.content.size
-      from = 0
-      to = docSize
-      selectedText = state.doc.textBetween(from, to, '\n').trim()
-      isFullDoc = true
-      sectionName = 'Full SOP'
-      sectionType = 'Full Document'
-    }
-
-    if (explicitFullSop && selectedText.length > ACTION_TEXT_WARNING_CHARS) {
+    if (selectedText.length > ACTION_TEXT_WARNING_CHARS) {
       const proceed = window.confirm(
-        'Full-SOP rewrite/improve may take several minutes. Continue?',
+        'Dieser SOP-Inhalt ist möglicherweise zu lang für das lokale LLM und kann mit Kontextlimit-Fehlern abbrechen.\n\nMit der Aktion fortfahren?',
       )
       if (!proceed) {
         emitResult({
@@ -383,9 +294,8 @@ const EditorAIBridge = ({
     inFlightRef.current = true
     activeRequestRef.current = request
     targetRangeRef.current = { from, to }
-    isFullDocRef.current = explicitFullSop
+    isFullDocRef.current = isFullDoc
     notifyPreviewSession(true)
-    setLoadingMessage(explicitFullSop ? 'Preparing full SOP preview…' : 'Preparing preview…')
     setIsLoading(true)
 
     try {
@@ -397,41 +307,20 @@ const EditorAIBridge = ({
         isFullDoc,
         source: request?.source || 'unknown',
       })
-      const editorDocJson =
-        liveEditor && !liveEditor.isDestroyed ? liveEditor.getJSON() : null
-      const patchScope = explicitFullSop
-        ? {}
-        : buildPatchScopePayload(liveEditor, {
-            from,
-            to,
-            text: selectedText,
-            contentJson: editorDocJson,
-          })
-      const result = await performAIAction(
-        {
-          action,
-          text: selectedText,
-          document_id: documentIdRef.current || sopMetadataRef.current?.documentId || null,
-          section_id: `kl-assistant-${requestId || Date.now()}`,
-          sop_title: sopTitle,
-          section_name: sectionName,
-          section_type: sectionType,
-          edit_scope: explicitFullSop ? 'full_document' : 'section_only',
-          patch_node_ids: patchScope.patch_node_ids,
-          content_json: editorDocJson,
-          sop_entity_id: documentIdRef.current || null,
-          triggered_by: AI_ACTION_TRIGGERED_BY.KL_ASSISTANT,
-          assistant_instruction: actionPrompt.trim() || null,
-        },
-      )
-      if (!result) {
-        emitResult({
-          ...request,
-          status: EDITOR_AI_ACTION_STATUS.CANCELLED,
-          reason: 'duplicate_request',
-        })
-        return
-      }
+      const result = await performAIAction({
+        action,
+        text: selectedText,
+        document_id: documentIdRef.current || sopMetadataRef.current?.documentId || null,
+        section_id: `kl-assistant-${requestId || Date.now()}`,
+        sop_title: sopTitle,
+        section_name: sectionName,
+        section_type: sectionType,
+        edit_scope: isFullDoc ? 'full_document' : 'section_only',
+        sop_entity_id: documentIdRef.current || null,
+        triggered_by: AI_ACTION_TRIGGERED_BY.KL_ASSISTANT,
+        instruction: actionPrompt || null,
+        learn_to_profile: Boolean(request?.learn_to_profile),
+      })
 
       const safeSuggestedHtml = formatAiSuggestionForUi({
         action: result?.action || action,
@@ -446,23 +335,10 @@ const EditorAIBridge = ({
         section_name: sectionName,
       })
       setIsModalOpen(true)
-      const unchangedCount = Array.isArray(result?.structured_data?.unchanged_chunks)
-        ? result.structured_data.unchanged_chunks.length
-        : 0
-      emitResult({
-        ...request,
-        status: EDITOR_AI_ACTION_STATUS.DISPLAYED,
-        action: result?.action || action,
-        section_name: sectionName,
-        preview_excerpt: safeSuggestedHtml,
-        is_full_sop: explicitFullSop,
-        unchanged_chunks: unchangedCount,
-        explanation: result?.explanation || '',
-      })
-      console.info('[kl-editor-action-modal-open]', { action: result?.action || action, requestId, isFullDoc: explicitFullSop })
+      console.info('[kl-editor-action-modal-open]', { action: result?.action || action, requestId, isFullDoc })
     } catch (err) {
       console.error('[kl-editor-action-failed]', err)
-      const message = getFriendlyErrorMessage(getAppLanguage())
+      const message = err?.message || 'Editor-Aktion fehlgeschlagen.'
       emitResult({
         ...request,
         status: EDITOR_AI_ACTION_STATUS.ERROR,
@@ -513,13 +389,13 @@ const EditorAIBridge = ({
     }
   }, [])
 
-  const emitInlineShown = useCallback((requestId, range, action) => {
+  const emitInlineShown = useCallback((requestId, range) => {
     const liveEditor = editorRef.current
     let toolbarCoords = null
     if (liveEditor?.view && range) {
       try {
         const coords = liveEditor.view.coordsAtPos(range.to)
-        toolbarCoords = { top: coords.top + window.scrollY - 48, left: coords.left + window.scrollX }
+        toolbarCoords = { top: coords.top + window.scrollY, left: coords.left + window.scrollX }
       } catch {
         toolbarCoords = null
       }
@@ -528,7 +404,6 @@ const EditorAIBridge = ({
       new CustomEvent(INLINE_SHOWN_EVENT, {
         detail: {
           requestId,
-          action,
           toolbarCoords,
           from: range?.from,
           to: range?.to,
@@ -566,7 +441,16 @@ const EditorAIBridge = ({
   }, [])
 
   useEffect(() => {
-    const unsubSnapshot = subscribeEditorSnapshotRequest(({ requestId, prompt, sectionHint, targetScope }) => {
+    const unsubSnapshot = subscribeEditorSnapshotRequest(({
+      requestId,
+      prompt,
+      userPrompt,
+      sectionHint,
+      targetScope,
+      lineNumber,
+      recordId,
+      preferFullSection,
+    }) => {
       const liveEditor = editorRef.current
       if (!liveEditor || liveEditor.isDestroyed || !isEditableRef.current) {
         dispatchEditorSnapshotResponse({
@@ -589,10 +473,15 @@ const EditorAIBridge = ({
         : { empty: true }
 
       try {
-        const target = resolveRewriteImproveTarget(liveEditor, {
-          instruction: String(prompt || ''),
+        const target = resolveTargetInEditor(liveEditor, {
+          prompt: String(prompt || ''),
+          userPrompt: String(userPrompt || ''),
+          selection: selectionPayload,
           sectionHint: String(sectionHint || ''),
           targetScope: String(targetScope || ''),
+          lineNumber: lineNumber ?? null,
+          recordId: String(recordId || ''),
+          preferFullSection: Boolean(preferFullSection),
         })
         if (!target?.text || target.from == null || target.to == null) {
           dispatchEditorSnapshotResponse({
@@ -608,7 +497,6 @@ const EditorAIBridge = ({
           target,
           fullText: state.doc.textBetween(0, state.doc.content.size, '\n'),
           docSize: state.doc.content.size,
-          contentJson: liveEditor.getJSON(),
           selection: selectionPayload,
           sopTitle: (sopMetadataRef.current?.title || 'Untitled SOP').toString(),
           sopNumber: (sopMetadataRef.current?.documentId || '').toString(),
@@ -617,7 +505,7 @@ const EditorAIBridge = ({
         dispatchEditorSnapshotResponse({
           requestId,
           ok: false,
-          error: getFriendlyErrorMessage(getAppLanguage()),
+          error: err?.message || 'Could not resolve target in editor.',
         })
       }
     })
@@ -645,28 +533,22 @@ const EditorAIBridge = ({
       }
 
       const suggestedPlain = String(detail.suggestedPlain || '').trim()
-      const suggestedHtml = detail.suggestedHtml || null
-      if (!suggestedPlain && !suggestedHtml && !detail.suggestedContentJson) {
+      if (!suggestedPlain) {
         emitInlineShown(requestId, null)
         return
       }
 
-      const bridgeRequest =
-        activeRequestRef.current?.requestId === requestId ? activeRequestRef.current : null
-
       inlinePendingRef.current = {
         requestId,
         ...range,
-        suggestedPlain: suggestedPlain || ' ',
-        suggestedHtml,
+        suggestedPlain,
+        suggestedHtml: detail.suggestedHtml || null,
         acceptedContent: detail.acceptedContent || null,
         selectedFraction: Number(detail.selectedFraction) || 0,
         structuredData: detail.structuredData || null,
-        suggestedContentJson: detail.suggestedContentJson || null,
         action: detail.action,
         isFullDoc: Boolean(detail.isFullDoc),
         originalText: detail.originalText || liveEditor.state.doc.textBetween(range.from, range.to, '\n'),
-        bridgeRequest,
       }
 
       notifyPreviewSession(true)
@@ -683,7 +565,7 @@ const EditorAIBridge = ({
       } catch {
         // non-fatal
       }
-      emitInlineShown(requestId, range, detail.action)
+      emitInlineShown(requestId, range)
     })
 
     const unsubClear = subscribeEditorInlineSuggestionClear(({ requestId }) => {
@@ -693,19 +575,8 @@ const EditorAIBridge = ({
       if (liveEditor && !liveEditor.isDestroyed) {
         clearInlineAiSuggestion(liveEditor)
       }
-      const bridgeReq = pending?.bridgeRequest
       inlinePendingRef.current = null
       notifyPreviewSession(false)
-      if (bridgeReq) {
-        emitResult({
-          ...bridgeReq,
-          status: EDITOR_AI_ACTION_STATUS.CANCELLED,
-          action: bridgeReq.action,
-        })
-        activeRequestRef.current = null
-        targetRangeRef.current = null
-        isFullDocRef.current = false
-      }
     })
 
     const unsubApply = subscribeEditorInlineSuggestionApply(({ requestId }) => {
@@ -729,34 +600,15 @@ const EditorAIBridge = ({
           acceptedContent,
           isFullDoc,
           action,
+          structuredData,
         } = pending
-        const tiptapPayload = coerceTipTapDocForApply(
-          acceptedContent?.type === 'doc'
-            ? acceptedContent
-            : pending.suggestedContentJson,
-        )
         const insertPayload =
-          tiptapPayload
-          || acceptedContent
+          acceptedContent
           || (isFullDoc ? suggestedHtml : suggestedPlain)
           || suggestedHtml
           || suggestedPlain
 
-        if (action === EDITOR_AI_ACTIONS.REWRITE || action === EDITOR_AI_ACTIONS.IMPROVE) {
-          if (tiptapPayload) {
-            applyTipTapContentToEditor(liveEditor, { docJson: tiptapPayload })
-          } else if (pending.suggestedContentJson) {
-            emitInlineApplied(requestId, false, getFriendlyErrorMessage(getAppLanguage()))
-            return
-          } else {
-            emitInlineApplied(
-              requestId,
-              false,
-              'Suggestion could not be applied: structured document data was missing or invalid.',
-            )
-            return
-          }
-        } else if (isFullDoc) {
+        if (isFullDoc) {
           liveEditor.commands.setContent(insertPayload || '<p></p>', false)
         } else if (typeof insertPayload === 'string' && /<\/?[a-z]/i.test(insertPayload)) {
           liveEditor.chain().focus().insertContentAt({ from, to }, insertPayload).run()
@@ -764,32 +616,20 @@ const EditorAIBridge = ({
           liveEditor.chain().focus().insertContentAt({ from, to }, insertPayload || '').run()
         }
         clearInlineAiSuggestion(liveEditor)
-        const bridgeReq = pending.bridgeRequest
         inlinePendingRef.current = null
         notifyPreviewSession(false)
         emitInlineApplied(requestId, true)
-        if (bridgeReq) {
-          emitResult({
-            ...bridgeReq,
-            status: EDITOR_AI_ACTION_STATUS.APPLIED,
-            action,
-            applied_scope: isFullDoc ? 'full_document' : 'selection',
-            sop_id: documentIdRef.current || null,
-          })
-          activeRequestRef.current = null
-          targetRangeRef.current = null
-          isFullDocRef.current = false
-        }
         if (typeof onAfterApply === 'function') {
           onAfterApply({
             action,
             applied_scope: isFullDoc ? 'full_document' : 'selection',
-            source: bridgeReq ? 'kl_assistant' : 'actions_tab',
+            source: 'actions_tab',
+            suggestion_id: structuredData?.suggestion_id || null,
           })
         }
       } catch (err) {
         console.error('[editor-actions-bridge] apply failed', err)
-        emitInlineApplied(requestId, false, getFriendlyErrorMessage(getAppLanguage()))
+        emitInlineApplied(requestId, false, err?.message || 'Could not apply suggestion.')
       }
     })
 
@@ -872,59 +712,50 @@ const EditorAIBridge = ({
           .run()
         console.info('[kl-editor-action-inserted]', { action, scope: 'append', requestId: request?.requestId })
       } else if (isFullDocRef.current) {
-        const acceptedDoc = buildAcceptedInsertContent(aiResult, {
-          selectedFraction: 1,
-          isFullDoc: true,
-        })
-        const tiptapDoc = coerceTipTapDocForApply(
-          acceptedDoc?.type === 'doc' ? acceptedDoc : aiResult?.suggested_content_json,
-        )
-        if (tiptapDoc) {
-          applyTipTapContentToEditor(liveEditor, { docJson: tiptapDoc })
-        } else {
-          console.warn('[kl-editor-action] full SOP apply skipped — no TipTap structure in result')
-          window.alert(getFriendlyErrorMessage(getAppLanguage()))
-          closeModal()
-          emitResult({
-            ...request,
-            status: EDITOR_AI_ACTION_STATUS.ERROR,
-            message: getFriendlyErrorMessage(getAppLanguage()),
+        let payloadHtml = suggestedHtml
+        if (action === EDITOR_AI_ACTIONS.REWRITE) {
+          payloadHtml = formatAiSuggestionForUi({
+            action,
+            suggestedText: structuredData?.rewritten_text || aiResult?.suggested_text,
+            structuredData,
           })
-          return
+        } else if (
+          action === EDITOR_AI_ACTIONS.IMPROVE
+          || action === EDITOR_AI_ACTIONS.SUMMARIZE
+          || action === EDITOR_AI_ACTIONS.ANALYZE
+        ) {
+          const improvedSource =
+            structuredData?.improved_text || structuredData?.improved_version || aiResult?.suggested_text
+          payloadHtml = formatAiSuggestionForUi({
+            action: EDITOR_AI_ACTIONS.IMPROVE,
+            suggestedText: improvedSource,
+            structuredData,
+          })
         }
+        liveEditor.commands.setContent(payloadHtml || suggestedHtml || '<p></p>', false)
         console.info('[kl-editor-action-inserted]', { action, scope: 'full_document', requestId: request?.requestId })
       } else {
         const from = target?.from ?? 0
         const to = target?.to ?? liveEditor.state.doc.content.size
-        const acceptedDoc = buildAcceptedInsertContent(aiResult, {
-          selectedFraction: isFullDocRef.current ? 1 : Math.abs(to - from) / Math.max(1, liveEditor.state.doc.content.size),
-          isFullDoc: false,
-        })
-        const tiptapDoc = coerceTipTapDocForApply(
-          acceptedDoc?.type === 'doc' ? acceptedDoc : aiResult?.suggested_content_json,
-        )
-        if (action === EDITOR_AI_ACTIONS.REWRITE || action === EDITOR_AI_ACTIONS.IMPROVE) {
-          if (tiptapDoc) {
-            applyTipTapContentToEditor(liveEditor, { docJson: tiptapDoc })
-          } else {
-            console.warn('[kl-editor-action] TipTap apply skipped — invalid suggested_content_json')
-            window.alert(getFriendlyErrorMessage(getAppLanguage()))
-            closeModal()
-            emitResult({
-              ...request,
-              status: EDITOR_AI_ACTION_STATUS.ERROR,
-              message: getFriendlyErrorMessage(getAppLanguage()),
-            })
-            return
-          }
+        let plainContent = ''
+        if (action === EDITOR_AI_ACTIONS.REWRITE) {
+          plainContent = stripHtml(structuredData?.rewritten_text || aiResult?.suggested_text)
+        } else if (
+          action === EDITOR_AI_ACTIONS.IMPROVE
+          || action === EDITOR_AI_ACTIONS.SUMMARIZE
+          || action === EDITOR_AI_ACTIONS.ANALYZE
+        ) {
+          plainContent = stripHtml(
+            structuredData?.improved_text || structuredData?.improved_version || aiResult?.suggested_text,
+          )
         } else {
-          const plainContent = stripHtml(aiResult?.suggested_text)
-          liveEditor
-            .chain()
-            .focus()
-            .insertContentAt({ from, to }, plainContent || '')
-            .run()
+          plainContent = stripHtml(aiResult?.suggested_text)
         }
+        liveEditor
+          .chain()
+          .focus()
+          .insertContentAt({ from, to }, plainContent || '')
+          .run()
         console.info('[kl-editor-action-inserted]', { action, scope: 'selection', requestId: request?.requestId })
       }
 
@@ -939,7 +770,11 @@ const EditorAIBridge = ({
 
       if (typeof onAfterApply === 'function') {
         try {
-          onAfterApply({ action, applied_scope: isFullDocRef.current ? 'full_document' : 'selection' })
+          onAfterApply({
+            action,
+            applied_scope: isFullDocRef.current ? 'full_document' : 'selection',
+            suggestion_id: structuredData?.suggestion_id || null,
+          })
         } catch (err) {
           console.error('[editor-ai-bridge] onAfterApply failed', err)
         }
@@ -949,7 +784,7 @@ const EditorAIBridge = ({
       emitResult({
         ...request,
         status: EDITOR_AI_ACTION_STATUS.ERROR,
-        message: getFriendlyErrorMessage(getAppLanguage()),
+        message: err?.message || 'Konnte Vorschlag nicht im Editor anwenden.',
       })
     } finally {
       closeModal()
@@ -969,35 +804,25 @@ const EditorAIBridge = ({
     closeModal()
   }, [aiResult, closeModal, emitResult])
 
-  const modalAction = aiResult?.action
-  const useComparisonModal =
-    isModalOpen
-    && modalAction
-    && modalAction !== EDITOR_AI_ACTIONS.REWRITE
-    && modalAction !== EDITOR_AI_ACTIONS.IMPROVE
-
   return (
     <>
-      <EditorInlineSuggestionToolbar />
-      {useComparisonModal ? (
-        <AIComparisonModal
-          isOpen={isModalOpen}
-          onClose={handleReject}
-          action={aiResult?.action}
-          originalText={aiResult?.original_text}
-          suggestedText={aiResult?.suggested_text}
-          explanation={aiResult?.explanation}
-          structuredData={aiResult?.structured_data}
-          onAccept={handleAccept}
-          sectionName={aiResult?.section_name}
-          sopTitle={sopTitle}
-        />
-      ) : null}
+      <AIComparisonModal
+        isOpen={isModalOpen}
+        onClose={handleReject}
+        action={aiResult?.action}
+        originalText={aiResult?.original_text}
+        suggestedText={aiResult?.suggested_text}
+        explanation={aiResult?.explanation}
+        structuredData={aiResult?.structured_data}
+        onAccept={handleAccept}
+        sectionName={aiResult?.section_name}
+        sopTitle={sopTitle}
+      />
       {isLoading ? (
         <div className="editor-ai-bridge-loading" role="status" aria-live="polite">
           <div className="editor-ai-bridge-loading__inner">
             <span className="editor-ai-bridge-loading__spinner" />
-            <span>{loadingMessage}</span>
+            <span>KI-Assistent bearbeitet die SOP…</span>
           </div>
         </div>
       ) : null}

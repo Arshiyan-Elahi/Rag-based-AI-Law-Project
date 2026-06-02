@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, memo } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
-import { Send, Zap } from 'lucide-react'
+import { Plus, Send, Zap } from 'lucide-react'
 import {
   nowTime,
   runUnifiedAssistantQuery,
@@ -12,15 +12,21 @@ import {
 import {
   createDocument,
   getChatSessionMessages,
-  resolveChatSessionBySop,
 } from '../../api/editorApi'
 import { htmlToPlainText, deriveSopTitleFromText, plainTextToTiptapDoc } from '../../utils/chatSopSave'
-import { getAssistantContextStorageKeys, resetAssistantStateOnce } from '../../utils/assistantContext'
+import {
+  getKLAssistantContext,
+  getAssistantContextStorageKeys,
+  resetAssistantStateOnce,
+  clearAssistantLastAction,
+  recordAssistantTurnPlan,
+  saveAssistantLastAction,
+  saveAssistantLastFocus,
+} from '../../utils/assistantContext'
 import {
   EDITOR_AI_ACTIONS,
   EDITOR_AI_ACTION_STATUS,
   describeEditorAiResult,
-  dispatchEditorAiActionRequest,
   getActiveEditorDocumentId,
   hasActiveSopEditor,
   makeEditorAiRequestId,
@@ -29,29 +35,96 @@ import {
 } from '../../utils/editorAiBridge'
 import {
   buildEnrichedActionPrompt,
-  classifyAssistantMessage,
   planEditorActionExecution,
 } from '../../utils/assistantIntentRouter'
-import EditorChatActions from './EditorChatActions'
-import ChatActionPreview from './ChatActionPreview'
 import {
-  applyEditorInlineSuggestion,
-  clearEditorInlineSuggestion,
-} from '../../utils/editorActionsBridge'
-import { INLINE_APPLIED_EVENT } from '../../utils/editorInlineAiFlow'
-import { useLanguage } from '../../context/LanguageContext'
-import { getAppLanguage, getFriendlyErrorMessage } from '../../utils/friendlyErrorMessage'
+  buildTargetOptionsFromClassification,
+  prepareSidebarTurn,
+} from '../../utils/sidebarAssistantOrchestrator'
+import EditorChatActions from './EditorChatActions'
+import { dispatchUnifiedAction, INLINE_PREVIEW_ACTIONS } from '../../utils/actionDispatcher'
 import './DashboardComponents.css'
 
-const REWRITE_IMPROVE_ACTIONS = new Set([EDITOR_AI_ACTIONS.REWRITE, EDITOR_AI_ACTIONS.IMPROVE])
-
-function actionPreviewIntro(action, sectionName = '') {
-  const label = action === EDITOR_AI_ACTIONS.IMPROVE ? 'improvement' : 'rewrite'
-  const scope = sectionName ? ` for “${sectionName}”` : ''
-  return `Suggested ${label}${scope}. Review below and choose Accept or Reject.`
-}
+const LS_SESSION_BY_PATH = 'cybrain_kl_chat_session_by_path'
+const LS_MESSAGES_BY_PATH = 'cybrain_kl_chat_messages_by_path_v1'
 
 resetAssistantStateOnce()
+
+function readSessionIdForPath(pathname) {
+  try {
+    const raw = localStorage.getItem(LS_SESSION_BY_PATH)
+    const j = raw ? JSON.parse(raw) : {}
+    const sid = j?.[pathname]
+    return sid && String(sid).trim() ? String(sid).trim() : null
+  } catch {
+    return null
+  }
+}
+
+function writeSessionIdForPath(pathname, sessionId) {
+  try {
+    const raw = localStorage.getItem(LS_SESSION_BY_PATH)
+    const j = raw ? JSON.parse(raw) : {}
+    j[pathname] = sessionId
+    localStorage.setItem(LS_SESSION_BY_PATH, JSON.stringify(j))
+  } catch {
+    // ignore
+  }
+}
+
+function clearSessionIdForPath(pathname) {
+  try {
+    const raw = localStorage.getItem(LS_SESSION_BY_PATH)
+    const j = raw ? JSON.parse(raw) : {}
+    delete j[pathname]
+    localStorage.setItem(LS_SESSION_BY_PATH, JSON.stringify(j))
+  } catch {
+    // ignore
+  }
+}
+
+function readLocalMessagesForPath(pathname) {
+  try {
+    const raw = localStorage.getItem(LS_MESSAGES_BY_PATH)
+    const parsed = raw ? JSON.parse(raw) : {}
+    const rows = parsed?.[pathname]
+    return Array.isArray(rows) && rows.length ? rows : null
+  } catch {
+    return null
+  }
+}
+
+function writeLocalMessagesForPath(pathname, rows) {
+  try {
+    const raw = localStorage.getItem(LS_MESSAGES_BY_PATH)
+    const parsed = raw ? JSON.parse(raw) : {}
+    parsed[pathname] = (Array.isArray(rows) ? rows : [])
+      .filter((m) => m && m.role && String(m.text || '').trim())
+      .slice(-80)
+      .map((m) => ({
+        id: m.id,
+        role: m.role,
+        text: String(m.text || '').slice(0, 12000),
+        tags: Array.isArray(m.tags) ? m.tags.slice(0, 8) : [],
+        time: m.time || nowTime(),
+        isError: Boolean(m.isError),
+      }))
+    localStorage.setItem(LS_MESSAGES_BY_PATH, JSON.stringify(parsed))
+  } catch {
+    // ignore
+  }
+}
+
+function clearLocalMessagesForPath(pathname) {
+  try {
+    const raw = localStorage.getItem(LS_MESSAGES_BY_PATH)
+    const parsed = raw ? JSON.parse(raw) : {}
+    delete parsed[pathname]
+    localStorage.setItem(LS_MESSAGES_BY_PATH, JSON.stringify(parsed))
+  } catch {
+    // ignore
+  }
+}
 
 function defaultGreeting() {
   return [
@@ -70,6 +143,67 @@ function mapSourcesToWidgetTags(sources) {
   return sources.slice(0, 5).map((s, idx) => s?.label || s?.id || `Quelle ${idx + 1}`)
 }
 
+const normalizeSectionLabel = (value = '') => String(value || '')
+  .toLowerCase()
+  .replace(/^\s*\d+(?:\.\d+)*[.)\]:-]?\s*/, '')
+  .replace(/[^\p{L}\p{N}]+/gu, ' ')
+  .replace(/\s+/g, ' ')
+  .trim()
+
+function editDistance(left = '', right = '') {
+  const a = String(left || '')
+  const b = String(right || '')
+  if (!a) return b.length
+  if (!b) return a.length
+  const previous = Array.from({ length: b.length + 1 }, (_, index) => index)
+  const current = Array(b.length + 1).fill(0)
+  for (let i = 1; i <= a.length; i += 1) {
+    current[0] = i
+    for (let j = 1; j <= b.length; j += 1) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1
+      current[j] = Math.min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost)
+    }
+    for (let j = 0; j <= b.length; j += 1) previous[j] = current[j]
+  }
+  return previous[b.length]
+}
+
+function findMentionedSectionFocus(message, pathname) {
+  const context = getKLAssistantContext(pathname)
+  const sections = Array.isArray(context?.current_sop?.sections) ? context.current_sop.sections : []
+  const text = normalizeSectionLabel(message)
+  if (!text || !sections.length) return null
+
+  let best = null
+  sections.forEach((section) => {
+    const label = String(section?.label || '').trim()
+    const normalized = normalizeSectionLabel(label)
+    if (!normalized) return
+    const tokens = normalized.split(' ').filter((token) => token.length > 2)
+    const matched =
+      text.includes(`${normalized} section`)
+      || text.includes(normalized)
+      || tokens.some((token) => text.includes(`${token} section`) || text.includes(`in ${token}`))
+      || tokens.some((token) => {
+        const words = text.split(' ').filter((word) => Math.abs(word.length - token.length) <= 2)
+        return words.some((word) => editDistance(word, token) <= 2)
+      })
+    if (matched && (!best || normalized.length > best.normalized.length)) {
+      best = { label, normalized }
+    }
+  })
+
+  if (!best) return null
+  return {
+    target_scope: 'section',
+    section_name: best.label,
+    sop_id: context?.current_sop?.id || context?.active_sop_id || getActiveEditorDocumentId(),
+    sop_number: context?.current_sop?.sop_number || '',
+    sop_title: context?.current_sop?.title || '',
+    source: 'sidebar_chat_focus',
+  }
+}
+
 function dbMessagesToWidget(rows) {
   if (!Array.isArray(rows) || rows.length === 0) return defaultGreeting()
   return rows.map((m) => ({
@@ -84,6 +218,25 @@ function dbMessagesToWidget(rows) {
   }))
 }
 
+function mergeWidgetMessages(localRows, dbRows) {
+  const local = Array.isArray(localRows) ? localRows : []
+  const db = Array.isArray(dbRows) ? dbRows : []
+  if (!local.length) return db.length ? db : defaultGreeting()
+  if (!db.length) return local
+
+  const keyOf = (m) => `${m.role || ''}:${String(m.text || '').trim().slice(0, 500)}`
+  const seen = new Set(local.map(keyOf))
+  const merged = [...local]
+  db.forEach((row) => {
+    const key = keyOf(row)
+    if (!seen.has(key)) {
+      seen.add(key)
+      merged.push(row)
+    }
+  })
+  return merged
+}
+
 const CHAT_INPUT_PLACEHOLDER_EDITOR =
   'Frage oder Aktion eingeben (z. B. Rewrite, Übersetzung ins Englische)…'
 const CHAT_INPUT_PLACEHOLDER_DEFAULT = 'Frage zur SOP stellen…'
@@ -96,9 +249,6 @@ const AIWidgetMessageList = memo(function AIWidgetMessageList({
   messagesScrollRef,
   chatEndRef,
   onCreateSop,
-  onAcceptActionPreview,
-  onRejectActionPreview,
-  previewBusyRequestId,
 }) {
   return (
     <div className="ai-messages-section" ref={messagesScrollRef}>
@@ -110,19 +260,7 @@ const AIWidgetMessageList = memo(function AIWidgetMessageList({
           {idx === 0 && String(m.id).startsWith('greeting') ? (
             <p className="ai-greeting-text">{m.text}</p>
           ) : (
-            <>
-              <div className="ai-message-content" dangerouslySetInnerHTML={{ __html: toHtml(m.text) }} />
-              {m.actionPreview?.status === 'pending' ? (
-                <ChatActionPreview
-                  action={m.actionPreview.action}
-                  sectionName={m.actionPreview.sectionName}
-                  previewHtml={m.actionPreview.previewHtml}
-                  disabled={previewBusyRequestId === m.actionPreview.requestId}
-                  onAccept={() => onAcceptActionPreview?.(m.actionPreview.requestId, m.id)}
-                  onReject={() => onRejectActionPreview?.(m.actionPreview.requestId, m.id)}
-                />
-              ) : null}
-            </>
+            <div className="ai-message-content" dangerouslySetInnerHTML={{ __html: toHtml(m.text) }} />
           )}
           {m.tags && m.tags.length > 0 && (
             <div className="ai-message-tags">
@@ -133,7 +271,7 @@ const AIWidgetMessageList = memo(function AIWidgetMessageList({
               ))}
             </div>
           )}
-          {m.role === 'ai' && !m.isError && assistantMode === 'action' && /purpose|zweck|scope|geltungsbereich|procedure|verfahren|responsibilities|verantwortlichkeiten/i.test(m.text) && (
+          {m.role === 'ai' && !m.isError && assistantMode === 'query' && m._canCreateSop && (
             <button
               className="ai-kontext-btn"
               type="button"
@@ -225,7 +363,6 @@ const AIWidgetComposeFooter = memo(function AIWidgetComposeFooter({
 })
 
 function AIWidget() {
-  const { language, friendlyError } = useLanguage()
   const location = useLocation()
   const navigate = useNavigate()
   const routeMeta = getAssistantRouteMeta(location.pathname)
@@ -234,28 +371,20 @@ function AIWidget() {
   const [sending, setSending] = useState(false)
   const [pendingDeleteAction, setPendingDeleteAction] = useState(null)
   const [actionToast, setActionToast] = useState('')
-  const [previewBusyRequestId, setPreviewBusyRequestId] = useState('')
   const chatEndRef = useRef(null)
   const messagesScrollRef = useRef(null)
   const messagesRef = useRef(messages)
-  /** requestId -> { messageId, action } for in-flight editor bridge requests. */
+  /** requestId -> { messageId, action, sectionName, targetScope } for in-flight editor bridge requests. */
   const pendingBridgeRef = useRef(new Map())
-  /** In-memory only: SOP-scoped vs global KL session ids (never localStorage). */
-  const sopChatSessionIdRef = useRef(null)
-  const globalChatSessionIdRef = useRef(null)
-  const chatLoadGenRef = useRef(0)
   const suggestions = routeMeta.suggestions
   const [sopEditorActive, setSopEditorActive] = useState(() => hasActiveSopEditor(location.pathname))
-  const [activeSopId, setActiveSopId] = useState(() => (
-    hasActiveSopEditor(location.pathname) ? getActiveEditorDocumentId() : ''
-  ))
+  const [liveAssistantContext, setLiveAssistantContext] = useState(() => getKLAssistantContext(location.pathname))
   const assistantMode = sopEditorActive ? 'action' : 'query'
 
   useEffect(() => {
     const syncEditorContext = () => {
-      const onEditor = hasActiveSopEditor(location.pathname)
-      setSopEditorActive(onEditor)
-      setActiveSopId(onEditor ? getActiveEditorDocumentId() : '')
+      setSopEditorActive(hasActiveSopEditor(location.pathname))
+      setLiveAssistantContext(getKLAssistantContext(location.pathname))
     }
     syncEditorContext()
     window.addEventListener(SOP_EDITOR_CONTEXT_EVENT, syncEditorContext)
@@ -265,6 +394,29 @@ function AIWidget() {
       window.removeEventListener('storage', syncEditorContext)
     }
   }, [location.pathname])
+
+  const currentSop = liveAssistantContext?.current_sop || {}
+  const selectedSection = liveAssistantContext?.selected_section || {}
+  const currentSopLabel =
+    String(currentSop?.sop_number || currentSop?.title || '').trim() || ''
+  const selectedSectionLabel = String(selectedSection?.name || '').trim() || ''
+  const dynamicSuggestions = sopEditorActive
+    ? [
+        selectedSectionLabel
+          ? `Fasse den Abschnitt "${selectedSectionLabel}" zusammen`
+          : 'Fasse die aktuelle SOP kurz zusammen',
+        selectedSectionLabel
+          ? `Rewrite den Abschnitt "${selectedSectionLabel}" im aktuellen SOP-Stil`
+          : 'Rewrite diese SOP im aktuellen Unternehmensstil',
+        selectedSectionLabel
+          ? `Prüfe "${selectedSectionLabel}" auf Compliance-Lücken`
+          : 'Prüfe diese SOP auf Compliance-Lücken',
+        selectedSectionLabel
+          ? `Verbessere "${selectedSectionLabel}" ohne die SOP-Struktur zu ändern`
+          : 'Verbessere diese SOP ohne die Struktur zu ändern',
+      ]
+    : suggestions
+  const visibleSuggestions = dynamicSuggestions.filter(Boolean).slice(0, 4)
 
   useEffect(() => {
     if (assistantMode === 'query') setPendingDeleteAction(null)
@@ -318,85 +470,31 @@ function AIWidget() {
     })
   }, [messages, sending])
 
-  const loadMessagesForSession = useCallback(async (sessionId, { sopId } = {}) => {
-    const sid = String(sessionId || '').trim()
+  const loadChatHistory = useCallback(async () => {
+    const path = location.pathname
+    const localRows = readLocalMessagesForPath(path)
+    const sid = readSessionIdForPath(path)
     if (!sid) {
-      setMessages(defaultGreeting())
+      setMessages(localRows || defaultGreeting())
       return
     }
     try {
       const rows = await getChatSessionMessages(sid)
-      setMessages(dbMessagesToWidget(rows))
+      const dbRows = dbMessagesToWidget(rows)
+      setMessages(mergeWidgetMessages(localRows, dbRows))
     } catch (e) {
-      if (e?.status === 404) {
-        if (sopId) {
-          sopChatSessionIdRef.current = null
-          try {
-            const session = await resolveChatSessionBySop(sopId)
-            const nextSid = session?.id && String(session.id).trim()
-            if (nextSid) {
-              sopChatSessionIdRef.current = nextSid
-              const rows = await getChatSessionMessages(nextSid)
-              setMessages(dbMessagesToWidget(rows))
-              return
-            }
-          } catch (retryErr) {
-            console.warn('[chat-history-load] SOP session recovery failed', retryErr)
-          }
-        } else {
-          globalChatSessionIdRef.current = null
-        }
-        setMessages(defaultGreeting())
-        return
-      }
       console.error('[chat-history-load] AIWidget messages', e)
-      setMessages(defaultGreeting())
+      setMessages(localRows || defaultGreeting())
     }
-  }, [])
-
-  const loadChatHistory = useCallback(async () => {
-    const gen = chatLoadGenRef.current + 1
-    chatLoadGenRef.current = gen
-    const sopId = activeSopId && String(activeSopId).trim()
-
-    if (sopId) {
-      try {
-        const session = await resolveChatSessionBySop(sopId)
-        if (chatLoadGenRef.current !== gen) return
-        const sid = session?.id && String(session.id).trim()
-        sopChatSessionIdRef.current = sid || null
-        if (!sid) {
-          setMessages(defaultGreeting())
-          return
-        }
-        await loadMessagesForSession(sid, { sopId })
-      } catch (e) {
-        if (chatLoadGenRef.current !== gen) return
-        console.error('[chat-history-load] AIWidget SOP session', e)
-        sopChatSessionIdRef.current = null
-        setMessages(defaultGreeting())
-      }
-      return
-    }
-
-    sopChatSessionIdRef.current = null
-    const globalSid = globalChatSessionIdRef.current
-    if (!globalSid) {
-      setMessages(defaultGreeting())
-      return
-    }
-    if (chatLoadGenRef.current !== gen) return
-    await loadMessagesForSession(globalSid, {})
-  }, [activeSopId, loadMessagesForSession])
+  }, [location.pathname])
 
   useEffect(() => {
-    sopChatSessionIdRef.current = null
     loadChatHistory()
-  }, [activeSopId, location.pathname, loadChatHistory])
+  }, [loadChatHistory])
 
-  const updateBridgeMessage = useCallback((messageId, patch) => {
-    setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, ...patch, time: nowTime() } : m)))
-  }, [])
+  useEffect(() => {
+    writeLocalMessagesForPath(location.pathname, messages)
+  }, [location.pathname, messages])
 
   useEffect(() => {
     const pending = pendingBridgeRef.current
@@ -406,95 +504,47 @@ function AIWidget() {
       const entry = pending.get(requestId)
       if (!entry) return
       console.info('[kl-editor-bridge-received]', { requestId, status: detail?.status, action: detail?.action })
-      const { messageId, action: entryAction } = entry
-      const action = detail?.action || entryAction
-      const status = detail?.status
-
-      if (
-        status === EDITOR_AI_ACTION_STATUS.DISPLAYED
-        && REWRITE_IMPROVE_ACTIONS.has(action)
-        && (detail.preview_excerpt || detail.preview)
-      ) {
-        pending.delete(requestId)
-        updateBridgeMessage(messageId, {
-          text: actionPreviewIntro(action, detail.section_name),
-          isError: false,
-          _pendingBridge: false,
-          actionPreview: {
-            status: 'pending',
-            requestId,
-            action,
-            sectionName: detail.section_name || '',
-            previewHtml: detail.preview_excerpt || detail.preview || '',
-          },
-        })
-        return
-      }
-
       pending.delete(requestId)
-      const statusText = describeEditorAiResult(detail, language)
-      const isError = status === EDITOR_AI_ACTION_STATUS.ERROR
-      updateBridgeMessage(messageId, {
-        text: statusText,
-        isError,
-        _pendingBridge: false,
-        actionPreview: undefined,
+      const statusText = describeEditorAiResult(detail)
+      const isError = detail?.status === EDITOR_AI_ACTION_STATUS.ERROR
+      setMessages((prev) => prev.map((m) => (
+        m.id === entry.messageId
+          ? { ...m, text: statusText, isError, _pendingBridge: false, time: nowTime() }
+          : m
+      )))
+      saveAssistantLastAction({
+        action: detail?.action || entry.action,
+        target_scope: detail?.applied_scope || entry.targetScope || 'selection',
+        section_name: detail?.section_name || entry.sectionName || '',
+        sop_id: detail?.sop_id || getActiveEditorDocumentId(),
+        suggested_text_excerpt: statusText,
+        status: detail?.status || '',
+        source: 'sidebar_bridge_result',
       })
-      if (status === EDITOR_AI_ACTION_STATUS.APPLIED || status === EDITOR_AI_ACTION_STATUS.CANCELLED) {
-        setPreviewBusyRequestId('')
-      }
     })
     return () => {
       unsubscribe()
       pending.clear()
     }
-  }, [language, updateBridgeMessage])
+  }, [])
 
-  useEffect(() => {
-    const onApplied = (event) => {
-      const { requestId, ok } = event.detail || {}
-      if (!requestId || ok) {
-        if (requestId) setPreviewBusyRequestId('')
-        return
-      }
-      setPreviewBusyRequestId('')
-      setMessages((prev) => prev.map((m) => {
-        if (m.actionPreview?.requestId !== requestId) return m
-        return {
-          ...m,
-          text: friendlyError,
-          isError: true,
-          actionPreview: undefined,
-          time: nowTime(),
-        }
-      }))
+  const bridgeStatusText = (intent) => {
+    if (intent === EDITOR_AI_ACTIONS.REWRITE) {
+      return 'Rewrite wird im Editor vorbereitet. Prüfe die Inline-Vorschau und wähle Accept oder Reject unten.'
     }
-    window.addEventListener(INLINE_APPLIED_EVENT, onApplied)
-    return () => window.removeEventListener(INLINE_APPLIED_EVENT, onApplied)
-  }, [friendlyError])
-
-  const handleAcceptActionPreview = useCallback((requestId) => {
-    if (!requestId) return
-    setPreviewBusyRequestId(requestId)
-    applyEditorInlineSuggestion(requestId)
-  }, [])
-
-  const handleRejectActionPreview = useCallback((requestId) => {
-    if (!requestId) return
-    clearEditorInlineSuggestion(requestId)
-  }, [])
-
-  const bridgeStatusText = (intent, phase = 'preparing') => {
-    if (phase === 'preparing') {
-      if (REWRITE_IMPROVE_ACTIONS.has(intent)) return 'Preparing preview…'
-      if (intent === EDITOR_AI_ACTIONS.GAP_CHECK) return 'Preparing gap check preview…'
-      if (intent === EDITOR_AI_ACTIONS.SUMMARIZE) return 'Preparing summary preview…'
-      return 'Preparing preview…'
+    if (intent === EDITOR_AI_ACTIONS.IMPROVE) {
+      return 'Verbesserung wird im Editor vorbereitet. Prüfe die Inline-Vorschau und wähle Accept oder Reject unten.'
+    }
+    if (intent === EDITOR_AI_ACTIONS.GAP_CHECK) {
+      return 'Gap Check läuft…'
     }
     if (intent === EDITOR_AI_ACTIONS.READ) return 'Bestätige aktive SOP im Editor…'
+    if (intent === EDITOR_AI_ACTIONS.SUMMARIZE) {
+      return 'Zusammenfassung wird als Inline-Vorschau im Editor vorbereitet. Prüfe Accept oder Reject unten.'
+    }
     if (intent === EDITOR_AI_ACTIONS.ANALYZE) return 'Analyse wird im Editor vorbereitet…'
     if (intent === EDITOR_AI_ACTIONS.COMPARE) return 'Versionsvergleich wird geöffnet…'
-    return 'Preparing preview…'
+    return 'Editor-Aktion wird vorbereitet…'
   }
 
   /**
@@ -505,11 +555,49 @@ function AIWidget() {
     const { explicitAction = null } = opts
     if (!hasActiveSopEditor(location.pathname)) return false
 
-    const plan = planEditorActionExecution(classification, { explicitAction, message: text, fromChat: true })
+    const plan = planEditorActionExecution(classification, { explicitAction, userMessage: text })
     const intent = plan.intent
     if (!intent) return false
 
     const actionPrompt = buildEnrichedActionPrompt(text, classification)
+    const sectionHint = plan.snapshotOptions.sectionHint || classification.record_id || ''
+    const targetScope =
+      classification.target_scope === 'full_document'
+        ? 'full_document'
+        : plan.snapshotOptions.targetScope || (sectionHint ? 'section' : 'selection')
+
+    if (plan.useInline || INLINE_PREVIEW_ACTIONS.has(intent)) {
+      saveAssistantLastAction({
+        action: plan.inlineAction || intent,
+        target_scope: sectionHint ? 'section' : (targetScope || 'selection'),
+        section_name: sectionHint || '',
+        request_prompt: text,
+        status: 'requested',
+        source: 'sidebar_inline_action',
+        sop_id: getActiveEditorDocumentId(),
+      })
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `editor-action-${Date.now()}`,
+          role: 'ai',
+          text: bridgeStatusText(plan.inlineAction || intent),
+          tags: [],
+          time: nowTime(),
+        },
+      ])
+      const targetOpts = buildTargetOptionsFromClassification(classification, text)
+      dispatchUnifiedAction({
+        action: plan.inlineAction || intent,
+        prompt: actionPrompt,
+        targetOptions: {
+          ...targetOpts,
+          sectionHint: targetOpts.sectionHint || sectionHint,
+          targetScope: targetOpts.targetScope || targetScope,
+        },
+      })
+      return true
+    }
 
     if (!plan.useBridge) return false
 
@@ -532,7 +620,7 @@ function AIWidget() {
     const placeholderMsg = {
       id: placeholderId,
       role: 'ai',
-      text: bridgeStatusText(intent, 'preparing'),
+      text: bridgeStatusText(intent),
       tags: [],
       time: nowTime(),
       _pendingBridge: true,
@@ -540,15 +628,32 @@ function AIWidget() {
     setMessages((prev) => [...prev, placeholderMsg])
 
     const requestId = makeEditorAiRequestId()
-    pendingBridgeRef.current.set(requestId, { messageId: placeholderId, action: intent })
-    dispatchEditorAiActionRequest({
+    pendingBridgeRef.current.set(requestId, {
+      messageId: placeholderId,
+      action: intent,
+      sectionName: sectionHint || '',
+      targetScope: targetScope || 'selection',
+    })
+    saveAssistantLastAction({
+      action: intent,
+      target_scope: targetScope || 'selection',
+      section_name: sectionHint || '',
+      request_prompt: text,
+      status: 'requested',
+      source: 'sidebar_bridge_action',
+      sop_id: activeDocumentId,
+    })
+    const bridgeTarget = buildTargetOptionsFromClassification(classification, text)
+    dispatchUnifiedAction({
       action: intent,
       prompt: actionPrompt,
-      userMessage: text,
       requestId,
       source: 'kl_assistant',
-      targetScope: plan.snapshotOptions?.targetScope || '',
-      sectionHint: plan.snapshotOptions?.sectionHint || '',
+      targetOptions: {
+        ...bridgeTarget,
+        sectionHint: bridgeTarget.sectionHint || sectionHint,
+        targetScope: bridgeTarget.targetScope || targetScope,
+      },
     })
 
     window.setTimeout(() => {
@@ -557,13 +662,13 @@ function AIWidget() {
       pendingBridgeRef.current.delete(requestId)
       setMessages((prev) => prev.map((m) => (
         m.id === stillPending.messageId
-          ? { ...m, text: friendlyError, isError: true, _pendingBridge: false, actionPreview: undefined }
+          ? { ...m, text: 'Editor-Aktion hat zu lange gedauert. Bitte erneut versuchen.', isError: true, _pendingBridge: false }
           : m
       )))
-    }, 620000)
+    }, 360000)
 
     return true
-  }, [location.pathname, setMessages, friendlyError])
+  }, [location.pathname, setMessages])
 
   const sendMessage = useCallback(async (text, opts = {}) => {
     const trimmed = text.trim()
@@ -574,12 +679,21 @@ function AIWidget() {
     setInput('')
     setSending(true)
 
+    let classification = null
+
     try {
       if (!opts.assistantActionConfirmation) {
-        const classification = await classifyAssistantMessage({
+        const turn = await prepareSidebarTurn({
           message: trimmed,
           pathname: location.pathname,
+          recentMessages: messagesRef.current.map((msg) => ({
+            role: msg.role === 'ai' ? 'assistant' : 'user',
+            content: msg.text,
+          })),
         })
+        setLiveAssistantContext(turn.assistantContext)
+
+        classification = turn.classification
 
         if (classification.flow === 'clarify' && classification.clarification_question) {
           setMessages((prev) => [
@@ -594,11 +708,55 @@ function AIWidget() {
           return
         }
 
-        if (classification.flow === 'editor_action') {
+        if (
+          classification.flow === 'chat'
+          && classification.assistant_message
+          && (classification.chat_submode === 'explain_last_edit_diff'
+            || classification.chat_submode === 'explain_last_output')
+        ) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: Date.now() + 1,
+              role: 'ai',
+              text: classification.assistant_message,
+              time: nowTime(),
+            },
+          ])
+          return
+        }
+
+        const wantsEditor =
+          classification.run_editor_action
+          && classification.flow !== 'chat'
+          && classification.sidebar_intent !== 'sop_query'
+          && classification.sidebar_intent !== 'rag'
+        if (wantsEditor) {
+          recordAssistantTurnPlan({
+            action: classification.action,
+            targetScope: classification.target_scope,
+            sectionName:
+              classification.section_hint
+              || classification.target_resolution?.section_hint
+              || '',
+            requestPrompt: trimmed,
+            sopId: getActiveEditorDocumentId(),
+          })
           const handled = await routeClassifiedEditorAction(trimmed, classification, opts)
           if (handled) return
         }
+
+        if (classification.chat_submode === 'sop_summarize') {
+          recordAssistantTurnPlan({
+            action: 'summarize',
+            targetScope: classification.target_scope || 'section',
+            sectionName: classification.section_hint || classification.target_resolution?.section_hint,
+            requestPrompt: trimmed,
+            sopId: getActiveEditorDocumentId(),
+          })
+        }
       }
+
       const chatHistoryPayload = [
         ...messagesRef.current.map((msg) => ({
           role: msg.role === 'ai' ? 'assistant' : 'user',
@@ -606,25 +764,22 @@ function AIWidget() {
         })),
         { role: 'user', content: trimmed },
       ]
-      const sopId = activeSopId && String(activeSopId).trim()
-      let sid = sopId ? sopChatSessionIdRef.current : globalChatSessionIdRef.current
-      if (sopId && !sid) {
-        try {
-          const session = await resolveChatSessionBySop(sopId)
-          sid = session?.id && String(session.id).trim()
-          if (sid) sopChatSessionIdRef.current = sid
-        } catch (resolveErr) {
-          console.warn('[chat-history] could not resolve SOP session before send', resolveErr)
-        }
+      const sid = readSessionIdForPath(location.pathname)
+      const queryContext = {
+        ...getKLAssistantContext(location.pathname),
+        response_constraints: classification?.constraints || {},
+        chat_submode: classification?.chat_submode || null,
       }
+      setLiveAssistantContext(queryContext)
       const result = await runUnifiedAssistantQuery({
         question: trimmed,
         pathname: location.pathname,
         chatHistory: chatHistoryPayload,
         assistantActionConfirmation: opts.assistantActionConfirmation || null,
         surface: 'kl_assistant',
-        sessionId: sid || undefined,
+        sessionId: sid,
         assistantMode,
+        assistantContextOverride: queryContext,
       })
       const action = result?.assistant_action
       if (assistantMode === 'action' && action?.requires_confirmation && action?.type === 'delete_sop') {
@@ -654,29 +809,17 @@ function AIWidget() {
         }
       }
       if (result?.session_id) {
-        const nextSid = String(result.session_id).trim()
-        if (sopId) {
-          sopChatSessionIdRef.current = nextSid
-        } else {
-          globalChatSessionIdRef.current = nextSid
-        }
-        try {
-          const rows = await getChatSessionMessages(nextSid)
-          setMessages(dbMessagesToWidget(rows))
-        } catch (loadErr) {
-          if (loadErr?.status === 404) {
-            if (sopId) {
-              sopChatSessionIdRef.current = null
-              await loadChatHistory()
-            } else {
-              globalChatSessionIdRef.current = null
-              setMessages(defaultGreeting())
-            }
-          } else {
-            throw loadErr
-          }
-        }
+        const focus = findMentionedSectionFocus(trimmed, location.pathname)
+        if (focus) saveAssistantLastFocus(focus)
+        writeSessionIdForPath(location.pathname, result.session_id)
+        const rows = await getChatSessionMessages(result.session_id)
+        setMessages((prev) => {
+          const dbRows = dbMessagesToWidget(rows)
+          return mergeWidgetMessages(prev, dbRows)
+        })
       } else {
+        const focus = findMentionedSectionFocus(trimmed, location.pathname)
+        if (focus) saveAssistantLastFocus(focus)
         const aiMsg = {
           id: Date.now() + 1,
           role: 'ai',
@@ -691,7 +834,7 @@ function AIWidget() {
       const errMsg = {
         id: Date.now() + 1,
         role: 'ai',
-        text: friendlyError,
+        text: `Fehler: ${err.message || 'Unbekannter Fehler'}`,
         isError: true,
         time: nowTime(),
       }
@@ -699,13 +842,23 @@ function AIWidget() {
     } finally {
       setSending(false)
     }
-  }, [sending, location.pathname, navigate, emitSOPRefresh, showToast, clearAssistantActiveContext, assistantMode, routeClassifiedEditorAction, activeSopId, loadChatHistory])
+  }, [sending, location.pathname, navigate, emitSOPRefresh, showToast, clearAssistantActiveContext, assistantMode, routeClassifiedEditorAction])
 
   const handleSend = () => sendMessage(input)
 
   const handleInputChange = useCallback((e) => {
     setInput(e.target.value)
   }, [])
+
+  const handleNewChat = useCallback(() => {
+    clearSessionIdForPath(location.pathname)
+    clearLocalMessagesForPath(location.pathname)
+    clearAssistantLastAction()
+    setPendingDeleteAction(null)
+    pendingBridgeRef.current.clear()
+    setInput('')
+    setMessages(defaultGreeting())
+  }, [location.pathname, clearAssistantLastAction])
 
   // Clicking a suggestion triggers the actual query immediately
   const handleSuggestionClick = (text) => sendMessage(text)
@@ -782,7 +935,18 @@ function AIWidget() {
             <span className="ai-status-dot" />
             <h3 className="ai-widget-title">KI Assistent</h3>
           </div>
-          <span className="ai-aktiv-badge">Aktiv</span>
+          <div className="ai-widget-header-actions">
+            <button
+              type="button"
+              className="ai-new-chat-btn"
+              aria-label="Neuen Chat starten"
+              title="Neuen Chat starten"
+              onClick={handleNewChat}
+            >
+              <Plus size={14} />
+            </button>
+            <span className="ai-aktiv-badge">Aktiv</span>
+          </div>
         </div>
         <div className="ai-widget-divider" />
       </div>
@@ -794,6 +958,14 @@ function AIWidget() {
           <Zap size={14} className="ai-context-icon" />
           <span className="ai-context-label">{contextLabel}</span>
         </div>
+        {sopEditorActive && currentSopLabel ? (
+          <div className="ai-context-row" style={{ marginTop: 8 }}>
+            <span className="ai-context-label" style={{ fontSize: 12 }}>
+              Aktive SOP: {currentSopLabel}
+              {selectedSectionLabel ? ` • Abschnitt: ${selectedSectionLabel}` : ''}
+            </span>
+          </div>
+        ) : null}
       </div>
 
       <div className="ai-widget-divider" />
@@ -805,9 +977,6 @@ function AIWidget() {
         messagesScrollRef={messagesScrollRef}
         chatEndRef={chatEndRef}
         onCreateSop={handleCreateSOP}
-        onAcceptActionPreview={handleAcceptActionPreview}
-        onRejectActionPreview={handleRejectActionPreview}
-        previewBusyRequestId={previewBusyRequestId}
       />
 
       <div className="ai-widget-bottom-stack">
@@ -821,7 +990,7 @@ function AIWidget() {
           onSend={handleSend}
           sending={sending}
           sopEditorActive={sopEditorActive}
-          suggestions={suggestions}
+          suggestions={visibleSuggestions}
           onSuggestionClick={handleSuggestionClick}
         />
       </div>

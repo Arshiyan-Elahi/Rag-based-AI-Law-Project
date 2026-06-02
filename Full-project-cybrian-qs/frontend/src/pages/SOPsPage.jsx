@@ -213,6 +213,12 @@ function SOPImportFeedbackModal({ modal, onClose }) {
   )
 }
 
+function formatBulkImportError(fileName, error, language) {
+  const base = resolveImportUiError(error, language)
+  const scoped = String(fileName || '').trim() ? `${fileName}: ${base}` : base
+  return scoped
+}
+
 // ── Map raw /api/sops record into a display-ready shape ───────────────────
 function mapSOP(s) {
   const cv = s.current_version
@@ -705,10 +711,15 @@ export default function SOPsPage() {
       let lastImported = null
       const errors = []
 
-      for (const file of files) {
+      for (let idx = 0; idx < files.length; idx += 1) {
+        const file = files[idx]
+        showImportModal(
+          'uploading',
+          `Uploading ${idx + 1}/${files.length}: ${file.name}`,
+        )
         try {
           assertSOPImportFileAllowed(file)
-          const started = await importSOPAsync(file)
+          const started = await importSOPAsync(file, { timeoutMs: 300000 })
           const jobId = started?.job_id
           const shellDoc = started?.document
           const pollVersionId = started?.import_status?.version_id || shellDoc?.version_id
@@ -754,7 +765,10 @@ export default function SOPsPage() {
               statusRow?.status,
               statusRow?.message,
             )
-            showImportModal(phase, message)
+            showImportModal(
+              phase,
+              `${idx + 1}/${files.length} ${file.name} — ${message}`,
+            )
           }
 
           reportStatus(started?.import_status || { status: 'uploading' })
@@ -814,6 +828,7 @@ export default function SOPsPage() {
             versionId: pollVersionId,
             sopId: pollSopId,
             onStatus: reportStatus,
+            timeoutMs: 900000,
             onContentReady: async () => {
               try {
                 await refreshImportedEditorTab()
@@ -834,7 +849,7 @@ export default function SOPsPage() {
             responseBody: err?.responseBody || null,
             file: file?.name,
           })
-          errors.push(resolveImportUiError(err, language))
+          errors.push(formatBulkImportError(file?.name, err, language))
         }
       }
 
@@ -844,7 +859,8 @@ export default function SOPsPage() {
           : `${successCount} SOPs uploaded successfully.`
         showImportModal('success', successMessage)
       } else if (successCount > 0 && errors.length > 0) {
-        showImportModal('error', friendlyError)
+        const partialMsg = `${successCount}/${files.length} SOPs uploaded. ${errors.length} failed.`
+        showImportModal('error', `${partialMsg} ${errors[0] || ''}`.trim())
       } else if (errors.length > 0) {
         showImportModal('error', errors[0] || friendlyError)
       }

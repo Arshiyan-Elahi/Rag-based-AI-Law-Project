@@ -84,6 +84,13 @@ class EditorSurfaceErrorBoundary extends React.Component {
     console.error('Editor surface crashed:', error)
   }
 
+  componentDidUpdate(prevProps) {
+    if (prevProps.resetKey !== this.props.resetKey && this.state.hasError) {
+      // Allow editor surface recovery when user switches SOP/version.
+      this.setState({ hasError: false })
+    }
+  }
+
   render() {
     if (this.state.hasError) {
       return (
@@ -1398,7 +1405,7 @@ const EditorPage = ({
               <section className="figma-editor-canvas">
                 {isHistoricalView ? <span className="editor-stage-hint">{t.historicalVersionLoaded}</span> : null}
                 {isLoadingDocument ? <span className="editor-stage-hint">{t.loading}</span> : null}
-                <EditorSurfaceErrorBoundary>
+                <EditorSurfaceErrorBoundary resetKey={`${documentId || 'none'}:${currentVersionId || 'none'}`}>
                   <EditorTypingSurface
                     editor={editor}
                     isEditable={!isHistoricalView && isEditorMounted}

@@ -3001,23 +3001,10 @@ async def perform_ai_action(payload: AIActionRequest):
             return _fallback_rewrite(payload)
         if action == "improve":
             return _fallback_improve(payload)
-        if action == "summarize":
-            fb = _fallback_improve(payload)
-            return AIActionResponse(
-                action="summarize",
-                original_text=fb.original_text,
-                suggested_text=fb.suggested_text,
-                explanation="Kurzfassung (Fallback) / Executive summary (fallback).",
-                structured_data=fb.structured_data,
-            )
-        if action == "analyze":
-            fb = _fallback_improve(payload)
-            return AIActionResponse(
-                action="analyze",
-                original_text=fb.original_text,
-                suggested_text=fb.suggested_text,
-                explanation="Analyse (Fallback) / Analysis (fallback).",
-                structured_data=fb.structured_data,
+        if action in {"summarize", "analyze"}:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Action '{action}' failed and no summary-conversion fallback is allowed.",
             )
 
     raise HTTPException(status_code=400, detail=f"Action '{payload.action}' is not supported.")

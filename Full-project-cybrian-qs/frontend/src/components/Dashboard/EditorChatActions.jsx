@@ -1,14 +1,14 @@
 import React, { useCallback, useEffect, useRef, useState, memo } from 'react'
 import { useLocation } from 'react-router-dom'
 import { Check, X } from 'lucide-react'
+import { performAIAction } from '../../api/editorApi'
 import { selectionLooksLikeFormattedAiReport } from '../../utils/aiActionSelection'
 import { buildGapCheckSidebarReport } from '../../utils/actionsTabGapReport'
-import { normalizeAiActionResult } from '../../utils/editorAiActionShared'
 import {
-  INLINE_SHOWN_EVENT,
-  fetchRewriteImproveSuggestion,
-  presentInlineRewriteImproveSuggestion,
-} from '../../utils/editorInlineAiFlow'
+  buildAcceptedInsertContent,
+  buildInlineSuggestionHtml,
+  normalizeAiActionResult,
+} from '../../utils/editorAiActionShared'
 import { buildActionSummary } from '../../utils/actionsTabSummary'
 import {
   applyEditorInlineSuggestion,
@@ -16,6 +16,7 @@ import {
   clearEditorInlineSuggestion,
   requestEditorSnapshot,
   scrollEditorToRange,
+  showEditorInlineSuggestion,
   subscribeActionsTabRun,
 } from '../../utils/editorActionsBridge'
 import {
@@ -24,12 +25,13 @@ import {
   hasActiveSopEditor,
 } from '../../utils/editorAiBridge'
 import { inferEditScope } from '../../utils/editScopeInference'
+import { wantsFullSopIntent } from '../../utils/sopActionIntent'
 import { runEditorGapCheck } from '../../utils/editorGapCheck'
 import { sanitizeRenderedHtml } from '../../utils/aiOutputFormatter'
-import { useLanguage } from '../../context/LanguageContext'
-import { getFriendlyErrorMessage } from '../../utils/friendlyErrorMessage'
+import { saveAssistantLastAction } from '../../utils/assistantContext'
 
 const ACTION_TEXT_WARNING_CHARS = 7000
+const INLINE_SHOWN_EVENT = 'editor-actions-inline-shown'
 const INLINE_APPLIED_EVENT = 'editor-actions-inline-applied'
 
 /**
@@ -37,7 +39,6 @@ const INLINE_APPLIED_EVENT = 'editor-actions-inline-applied'
  * shows accept/reject review UI inside the KI Assistant chat panel.
  */
 function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
-  const { language } = useLanguage()
   const location = useLocation()
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -58,10 +59,24 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
     setPending(null)
   }, [])
 
-  const runGapCheck = useCallback(async (instructionText = '') => {
+  const runGapCheck = useCallback(async (instructionText = '', targetOptions = {}) => {
     const instruction = String(instructionText || '').trim()
-    const { target, result, normalized } = await runEditorGapCheck({ instruction })
+    const { target, result, normalized } = await runEditorGapCheck({
+      instruction,
+      targetOptions,
+      triggeredBy: AI_ACTION_TRIGGERED_BY.KL_ASSISTANT,
+    })
     const report = buildGapCheckSidebarReport(result)
+    const plainReport = report.sections
+      .map((section) => {
+        const body = section.body ? `${section.title}\n${section.body}` : section.title
+        const gaps = (section.gapItems || [])
+          .map((gap) => `- ${gap.issue}${gap.recommendation ? ` -> ${gap.recommendation}` : ''}`)
+          .join('\n')
+        return [body, gaps].filter(Boolean).join('\n')
+      })
+      .filter(Boolean)
+      .join('\n\n')
 
     setPending({
       requestId: `gap-${Date.now().toString(36)}`,
@@ -73,6 +88,17 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
       range: { from: target.from, to: target.to },
       appendHtml: normalized.suggestedHtml,
     })
+    saveAssistantLastAction({
+      action: 'gap_check',
+      target_scope: target.isFullDoc ? 'full_document' : 'section',
+      section_name: target.sectionName || '',
+      sop_id: getActiveEditorDocumentId(),
+      request_prompt: instruction,
+      original_text_excerpt: target.text || '',
+      suggested_text_excerpt: plainReport || normalized.suggestedPlain || '',
+      status: 'suggested',
+      source: 'editor_actions_tab',
+    })
   }, [])
 
   const runInlineContentAction = useCallback(async (action, instructionText = '', targetOptions = {}) => {
@@ -80,12 +106,26 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
     const instruction = String(instructionText || '').trim()
     const snapshot = await requestEditorSnapshot({
       prompt: instruction,
+      userPrompt: targetOptions.userPrompt || '',
       sectionHint: targetOptions.sectionHint || '',
       targetScope: targetOptions.targetScope || '',
+      lineNumber: targetOptions.lineNumber ?? null,
+      recordId: targetOptions.recordId || '',
+      preferFullSection: Boolean(targetOptions.preferFullSection),
     })
-    const target = snapshot.target
+    let target = snapshot.target
     if (target?.from == null || target?.to == null || !target?.text) {
       throw new Error(snapshot.error || 'Could not find that heading or paragraph in the open SOP.')
+    }
+
+    const override = targetOptions.sourceContentOverride
+    if (override?.enabled && override?.content) {
+      target = {
+        ...target,
+        text: String(override.content).trim(),
+        sectionName: target.sectionName || targetOptions.sectionHint || 'Refined section',
+        sectionType: 'Section',
+      }
     }
 
     if (selectionLooksLikeFormattedAiReport(target.text)) {
@@ -107,46 +147,92 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
           ? 1
           : 0.3
 
-    const scopeTarget = {
-      from: target.from,
-      to: target.to,
-      text: target.text,
-      isFullDoc: Boolean(target.isFullDoc),
-      sectionName: target.sectionName || 'Selected text',
-      sectionType: target.sectionType || 'Paragraph',
-      selectedFraction,
-      editScope: target.isFullDoc
-        ? 'full_document'
-        : inferEditScope({ text: target.text, instruction }),
-    }
-
-    const requestId = `actions-${Date.now().toString(36)}`
-    const { result, normalized } = await fetchRewriteImproveSuggestion({
+    const result = await performAIAction({
       action,
-      target: scopeTarget,
-      contentJson: snapshot.contentJson || null,
-      sopTitle: snapshot.sopTitle || 'Untitled SOP',
-      documentId,
-      triggeredBy: AI_ACTION_TRIGGERED_BY.ACTIONS_TAB,
+      text: target.text,
+      document_id: documentId,
       instruction,
+      section_id: `${target.from}-${target.to}`,
+      sop_title: snapshot.sopTitle || 'Untitled SOP',
+      section_name: target.sectionName || 'Selected text',
+      section_type: target.isFullDoc || wantsFullSopIntent(instruction)
+        ? 'Full Document'
+        : target.sectionType || 'Paragraph',
+      edit_scope: target.isFullDoc || wantsFullSopIntent(instruction)
+        ? 'full_document'
+        : inferEditScope({
+            text: target.text,
+            from: target.from,
+            to: target.to,
+            docSize: snapshot.docSize || target.to,
+            instruction,
+          }),
+      sop_entity_id: documentId,
+      triggered_by: AI_ACTION_TRIGGERED_BY.KL_ASSISTANT,
+      learn_to_profile: /\b(?:learn|save|update)\b[\s\S]*\b(?:profile|style)\b/i.test(instruction),
     })
 
-    await presentInlineRewriteImproveSuggestion({
-      requestId,
-      target: scopeTarget,
-      normalized,
-      action,
+    const normalized = normalizeAiActionResult(action, result)
+    if (!normalized.suggestedPlain) {
+      throw new Error('No suggestion returned.')
+    }
+
+    const acceptedContent = buildAcceptedInsertContent(normalized.raw, {
+      selectedFraction,
+      isFullDoc: Boolean(target.isFullDoc),
+    })
+    const inlineHtml = buildInlineSuggestionHtml(normalized)
+    const requestId = `actions-${Date.now().toString(36)}`
+
+    await new Promise((resolve, reject) => {
+      const timer = window.setTimeout(() => {
+        window.removeEventListener(INLINE_SHOWN_EVENT, onShow)
+        reject(new Error('Could not show inline suggestion at the target location.'))
+      }, 12000)
+
+      const onShow = (event) => {
+        if (event.detail?.requestId !== requestId) return
+        window.clearTimeout(timer)
+        window.removeEventListener(INLINE_SHOWN_EVENT, onShow)
+        resolve(event.detail || {})
+      }
+      window.addEventListener(INLINE_SHOWN_EVENT, onShow)
+      showEditorInlineSuggestion({
+        requestId,
+        from: target.from,
+        to: target.to,
+        originalText: target.text,
+        suggestedPlain: normalized.suggestedPlain,
+        suggestedHtml: inlineHtml,
+        structuredData: normalized.structured,
+        action,
+        isFullDoc: Boolean(target.isFullDoc),
+        acceptedContent,
+        selectedFraction,
+      })
     })
 
     setPending({
       requestId,
       action,
-      sectionName: scopeTarget.sectionName,
-      isFullDoc: scopeTarget.isFullDoc,
+      sectionName: target.sectionName,
+      isFullDoc: Boolean(target.isFullDoc),
       summarySections: buildActionSummary(action, result),
-      previewHtml: normalized.suggestedHtml,
-      suggestedContentJson: normalized.suggestedContentJson,
+      previewHtml: inlineHtml,
+      suggestedPlain: normalized.suggestedPlain || '',
+      originalText: target.text || '',
       range: { from: target.from, to: target.to },
+    })
+    saveAssistantLastAction({
+      action,
+      target_scope: target.isFullDoc ? 'full_document' : 'section',
+      section_name: target.sectionName || '',
+      sop_id: documentId,
+      request_prompt: instruction,
+      original_text_excerpt: target.text || '',
+      suggested_text_excerpt: normalized.suggestedPlain || '',
+      status: 'suggested',
+      source: 'editor_actions_tab',
     })
   }, [])
 
@@ -182,7 +268,7 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
 
     try {
       if (action === 'gap_check') {
-        await runGapCheck(instruction)
+        await runGapCheck(instruction, targetOptions)
       } else if (action === 'rewrite' || action === 'improve' || action === 'summarize') {
         await runInlineContentAction(action, instruction, targetOptions)
       } else {
@@ -190,8 +276,7 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
       }
       onRunComplete?.(action, instruction)
     } catch (err) {
-      console.error('[editor-chat-actions] action failed', err)
-      const msg = getFriendlyErrorMessage(language)
+      const msg = err?.message || 'Action failed.'
       setError(msg)
       clearPending()
       onRunError?.(msg)
@@ -204,7 +289,7 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
   const runActionWithTarget = useCallback(
     (action, instructionText, targetOptions = {}) => {
       if (action === 'gap_check') {
-        return runAction('gap_check', instructionText)
+        return runAction('gap_check', instructionText, targetOptions)
       }
       return runAction(action, instructionText, targetOptions)
     },
@@ -212,7 +297,17 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
   )
 
   useEffect(() => {
-    const unsubscribe = subscribeActionsTabRun(({ action, prompt: runPrompt, sectionHint, targetScope }) => {
+    const unsubscribe = subscribeActionsTabRun(({
+      action,
+      prompt: runPrompt,
+      userPrompt,
+      sectionHint,
+      targetScope,
+      lineNumber,
+      recordId,
+      preferFullSection,
+      sourceContentOverride,
+    }) => {
       const normalizedAction =
         action === 'gap_check'
           ? 'gap_check'
@@ -222,8 +317,13 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
               ? 'summarize'
               : 'rewrite'
       runActionWithTarget(normalizedAction, runPrompt || '', {
-        sectionHint: sectionHint || '',
+        userPrompt: userPrompt || '',
+        sectionHint: sectionHint || recordId || '',
         targetScope: targetScope || '',
+        lineNumber: lineNumber ?? null,
+        recordId: recordId || '',
+        preferFullSection: Boolean(preferFullSection),
+        sourceContentOverride: sourceContentOverride || null,
       })
     })
     return unsubscribe
@@ -237,6 +337,15 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
   const handleAppendGap = useCallback(() => {
     if (!pending?.appendHtml) return
     appendGapFindingsToEditor(pending.appendHtml)
+    saveAssistantLastAction({
+      action: 'gap_check',
+      target_scope: pending?.isFullDoc ? 'full_document' : 'section',
+      section_name: pending?.sectionName || '',
+      sop_id: getActiveEditorDocumentId(),
+      suggested_text_excerpt: pending?.gapReport?.analysisPlain || '',
+      status: 'applied',
+      source: 'editor_actions_tab',
+    })
     setPending(null)
     setError('')
   }, [pending])
@@ -250,10 +359,19 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
       const { requestId, ok, message } = event.detail || {}
       if (!pendingRef.current || pendingRef.current.requestId !== requestId) return
       if (!ok) {
-        console.error('[editor-chat-actions] inline apply failed', message)
-        setError(getFriendlyErrorMessage(language))
+        setError(message || 'Could not apply suggestion.')
         return
       }
+      saveAssistantLastAction({
+        action: pendingRef.current.action,
+        target_scope: pendingRef.current.isFullDoc ? 'full_document' : 'section',
+        section_name: pendingRef.current.sectionName || '',
+        sop_id: getActiveEditorDocumentId(),
+        original_text_excerpt: pendingRef.current.originalText || '',
+        suggested_text_excerpt: pendingRef.current.suggestedPlain || pendingRef.current.previewHtml || '',
+        status: 'applied',
+        source: 'editor_actions_tab',
+      })
       setPending(null)
       setError('')
     }

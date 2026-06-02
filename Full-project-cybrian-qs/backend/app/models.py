@@ -402,6 +402,10 @@ class ClientProfile(Base):
     name = Column(String(255), nullable=False)
     description = Column(Text, nullable=True)
     domain = Column(String(100), nullable=True)
+    company_name = Column(String(255), nullable=True)
+    total_sops_analyzed = Column(Integer, nullable=False, default=0)
+    active_profile_json = Column(JSONB, nullable=True)
+    active_profile_md = Column(Text, nullable=True)
     current_version_id = Column(UUID(as_uuid=True), nullable=True)
     created_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
@@ -448,3 +452,83 @@ class ProfileAuditLog(Base):
     details_json = Column(JSONB, nullable=True)
     timestamp = Column(TIMESTAMP, server_default=func.now(), nullable=False)
 
+
+# ==========================================
+# SOP DETECTED PARAMETERS
+# ==========================================
+
+class SOPDetectedParameters(Base):
+    """
+    Stores the raw NLP analysis output for an uploaded SOP version.
+    Links a specific SOP/version to a ClientProfile.
+    """
+    __tablename__ = "sop_detected_parameters"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    sop_id = Column(UUID(as_uuid=True), ForeignKey("sops.id", ondelete="CASCADE"), nullable=False, index=True)
+    sop_version_id = Column(UUID(as_uuid=True), ForeignKey("sop_versions.id", ondelete="SET NULL"), nullable=True, index=True)
+    client_profile_id = Column(UUID(as_uuid=True), ForeignKey("client_profiles.id", ondelete="SET NULL"), nullable=True, index=True)
+    client_name = Column(String(255), nullable=True)
+    source_filename = Column(String(500), nullable=True)
+    analysis_json = Column(JSONB, nullable=True)
+    document_information = Column(JSONB, nullable=True)
+    writing_style = Column(JSONB, nullable=True)
+    roles_raci = Column(JSONB, nullable=True)
+    workflows = Column(JSONB, nullable=True)
+    compliance_elements = Column(JSONB, nullable=True)
+    risks_gaps = Column(JSONB, nullable=True)
+    terminology = Column(JSONB, nullable=True)
+    structure_patterns = Column(JSONB, nullable=True)
+    style_suggestions = Column(JSONB, nullable=True)
+    readiness_check = Column(JSONB, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+# ==========================================
+# PROFILE HISTORY EVENT
+# ==========================================
+
+class ProfileHistoryEvent(Base):
+    """
+    Audit trail of events that occurred on a ClientProfile
+    (e.g. profile.md deleted, version created, rule accepted).
+    """
+    __tablename__ = "profile_history_events"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    client_profile_id = Column(UUID(as_uuid=True), ForeignKey("client_profiles.id", ondelete="CASCADE"), nullable=False, index=True)
+    event_type = Column(String(100), nullable=False)
+    event_summary = Column(Text, nullable=True)
+    metadata_json = Column(JSONB, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+
+# ==========================================
+# AI SUGGESTION
+# ==========================================
+
+class AISuggestion(Base):
+    """
+    Stores AI-generated rewrite/improve/gap-check suggestions produced
+    during editor actions. Can be accepted or rejected by the user.
+    """
+    __tablename__ = "ai_suggestions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    action_log_id = Column(UUID(as_uuid=True), ForeignKey("ai_action_logs.id", ondelete="SET NULL"), nullable=True, index=True)
+    sop_id = Column(UUID(as_uuid=True), ForeignKey("sops.id", ondelete="SET NULL"), nullable=True, index=True)
+    sop_version_id = Column(UUID(as_uuid=True), ForeignKey("sop_versions.id", ondelete="SET NULL"), nullable=True, index=True)
+    profile_id = Column(UUID(as_uuid=True), ForeignKey("client_profiles.id", ondelete="SET NULL"), nullable=True, index=True)
+    profile_version_id = Column(UUID(as_uuid=True), nullable=True)
+    action = Column(String(100), nullable=False, index=True)  # rewrite, improve, gap_check, etc.
+    target_scope = Column(String(100), nullable=True)          # section, document, etc.
+    original_text = Column(Text, nullable=True)
+    suggested_text = Column(Text, nullable=True)
+    status = Column(String(30), nullable=False, default="pending", index=True)  # pending, accepted, rejected
+    accepted_version_id = Column(UUID(as_uuid=True), nullable=True)
+    rejection_reason = Column(Text, nullable=True)
+    metadata_json = Column(JSONB, nullable=True)
+    accepted_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)

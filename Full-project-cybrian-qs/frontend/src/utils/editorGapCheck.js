@@ -3,16 +3,22 @@
  */
 
 import { performAIAction } from '../api/editorApi'
-import { getAppLanguage, getFriendlyErrorMessage } from './friendlyErrorMessage'
 import { normalizeAiActionResult } from './editorAiActionShared'
 import { requestEditorSnapshot, scrollEditorToRange } from './editorActionsBridge'
 import { AI_ACTION_TRIGGERED_BY, getActiveEditorDocumentId } from './editorAiBridge'
 import { inferEditScope } from './editScopeInference'
-import { isExplicitFullSopRequest, wantsFullSopIntent } from './sopActionIntent'
-import { buildPatchScopePayload } from './tiptapScope'
+import { wantsFullSopIntent } from './sopActionIntent'
 
-export async function resolveGapCheckTarget(instruction) {
-  const snapshot = await requestEditorSnapshot({ prompt: instruction })
+export async function resolveGapCheckTarget(instruction, targetOptions = {}) {
+  const snapshot = await requestEditorSnapshot({
+    prompt: instruction,
+    userPrompt: targetOptions.userPrompt || '',
+    sectionHint: targetOptions.sectionHint || '',
+    targetScope: targetOptions.targetScope || '',
+    lineNumber: targetOptions.lineNumber ?? null,
+    recordId: targetOptions.recordId || '',
+    preferFullSection: Boolean(targetOptions.preferFullSection),
+  })
   const target = snapshot.target
   if (!target?.text || target.from == null || target.to == null) {
     throw new Error(snapshot.error || 'Could not find that section in the open SOP.')
@@ -20,7 +26,12 @@ export async function resolveGapCheckTarget(instruction) {
   return { snapshot, target }
 }
 
-export async function runEditorGapCheck({ instruction, documentId: docIdOverride } = {}) {
+export async function runEditorGapCheck({
+  instruction,
+  documentId: docIdOverride,
+  targetOptions = {},
+  triggeredBy,
+} = {}) {
   const instructionText = String(instruction || '').trim()
   if (!instructionText) {
     throw new Error('Describe what to check, e.g. "gap check CAPAs (zugehörig zu SOP-IT-003)" or "gap check this SOP".')
@@ -31,15 +42,10 @@ export async function runEditorGapCheck({ instruction, documentId: docIdOverride
     throw new Error('No active SOP. Open a document in the editor first.')
   }
 
-  const { snapshot, target } = await resolveGapCheckTarget(instructionText)
+  const { snapshot, target } = await resolveGapCheckTarget(instructionText, targetOptions)
 
   scrollEditorToRange(target.from, target.to)
 
-  const explicitFullSop = isExplicitFullSopRequest({ instruction: instructionText })
-  const patchScope = buildPatchScopePayload(null, {
-    text: target.text,
-    contentJson: snapshot.contentJson || null,
-  })
   const result = await performAIAction({
     action: 'gap_check',
     text: target.text,
@@ -47,17 +53,21 @@ export async function runEditorGapCheck({ instruction, documentId: docIdOverride
     section_id: `${target.from}-${target.to}`,
     sop_title: snapshot.sopTitle || 'Untitled SOP',
     section_name: target.sectionName || 'Selected text',
-    section_type: explicitFullSop ? 'Full Document' : target.sectionType || 'Paragraph',
-    edit_scope: explicitFullSop ? 'full_document' : inferEditScope({ text: target.text, instruction: instructionText }),
-    patch_node_ids: explicitFullSop ? undefined : patchScope.patch_node_ids,
-    content_json: snapshot.contentJson || null,
+    section_type: target.isFullDoc || wantsFullSopIntent(instructionText)
+      ? 'Full Document'
+      : target.sectionType || 'Paragraph',
+    edit_scope: target.isFullDoc || wantsFullSopIntent(instructionText)
+      ? 'full_document'
+      : inferEditScope({
+          text: target.text,
+          from: target.from,
+          to: target.to,
+          docSize: snapshot.docSize || target.to,
+          instruction: instructionText,
+        }),
     sop_entity_id: documentId,
-    triggered_by: AI_ACTION_TRIGGERED_BY.EDITOR_BUBBLE,
-    assistant_instruction: instructionText || null,
+    triggered_by: triggeredBy || AI_ACTION_TRIGGERED_BY.EDITOR_BUBBLE,
   })
-  if (!result) {
-    throw new Error(getFriendlyErrorMessage(getAppLanguage()))
-  }
 
   const normalized = normalizeAiActionResult('gap_check', result)
   if (!normalized.suggestedPlain && !normalized.suggestedHtml) {

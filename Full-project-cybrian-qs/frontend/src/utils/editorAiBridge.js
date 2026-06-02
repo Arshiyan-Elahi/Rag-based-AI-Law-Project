@@ -1,5 +1,3 @@
-import { getAppLanguage, getFriendlyErrorMessage } from './friendlyErrorMessage'
-
 /**
  * Editor ↔ KL/KI Assistant bridge.
  *
@@ -78,13 +76,16 @@ const GAP_PATTERNS = [
   /\bwhat\s+(?:is|are)\s+the\s+gaps?\b/i,
   /\bwhat\s+gaps?\s+(?:are|exist)\b/i,
   /\bgaps?\s+in\s+(?:this\s+)?sop\b/i,
-  /\bcompliance\s+(check|gap)\b/i,
-  /\bl(?:ü|ue)cken[\s-]?(analyse|pr(?:ü|ue)fung|check)\b/i,
+  /\bcompliance\s+(check|gap|review|audit)\b/i,
+  /\bl(?:ü|ue|u)cken[\s-]?(analyse|pr(?:ü|ue|u)fung|check)?\b/i,
+  /\b(?:finde|zeige|identifiziere|pr(?:ü|ue)fe)\s+(?:die\s+)?l(?:ü|ue|u)cken\b/i,
   /\bqa\s*review\b/i,
-  /\bwelche\s+lücken\b/i,
+  /\bwelche\s+l(?:ü|ue|u)cken\b/i,
   /\bidentify\s+risks?\b/i,
   /\brisks?\s+and\s+gaps?\b/i,
-  /\brisiken\s+und\s+lücken\b/i,
+  /\brisiken\s+und\s+l(?:ü|ue|u)cken\b/i,
+  /\b(?:sop|dokument).*\bl(?:ü|ue|u)cken\b/i,
+  /\bl(?:ü|ue|u)cken\b.*\b(?:sop|dokument)\b/i,
 ]
 
 const READ_PATTERNS = [
@@ -102,8 +103,12 @@ const SUMMARIZE_PATTERNS = [
   /\bexecutive\s+summary\b/i,
   /\bzusammenfass/i,
   /\bkurzfassung\b/i,
+  /\bfasse\s+zusammen\b/i,
+  /\bverkürz/i,
   /\bsummarize\s+this\s+sop\s+in\s+\d+\s+words?\b/i,
   /\bzusammenfass(?:en|ung).*\b\d+\s+wörter\b/i,
+  /\b(?:summarize|zusammenfass).*\b(?:section|abschnitt)\b/i,
+  /\b(?:abschnitt|section)\s+.*\b(?:summarize|zusammenfass)\b/i,
 ]
 
 const ANALYZE_PATTERNS = [
@@ -210,10 +215,51 @@ export function hasActiveSopEditor(pathname) {
 }
 
 export const SOP_EDITOR_CONTEXT_EVENT = 'sop-editor-context-changed'
+export const KL_ASSISTANT_CONTEXT_REFRESH_REQUEST = 'kl-assistant-context-refresh-request'
+export const KL_ASSISTANT_CONTEXT_REFRESH_DONE = 'kl-assistant-context-refresh-done'
 
 export function notifySopEditorContextChanged() {
   if (typeof window === 'undefined') return
   window.dispatchEvent(new CustomEvent(SOP_EDITOR_CONTEXT_EVENT))
+}
+
+/**
+ * Ask the open editor to flush the latest SOP text/selection into assistant context
+ * before classify-intent or /api/ai/query (avoids stale 1.2s debounced snapshots).
+ * @param {number} [timeoutMs]
+ * @returns {Promise<boolean>} true when editor acknowledged refresh
+ */
+export function requestAssistantEditorContextRefresh(timeoutMs = 500) {
+  if (typeof window === 'undefined') {
+    return Promise.resolve(false)
+  }
+  if (!getActiveEditorDocumentId()) {
+    return Promise.resolve(false)
+  }
+
+  const requestId = `ctx-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+
+  return new Promise((resolve) => {
+    const timer = window.setTimeout(() => {
+      window.removeEventListener(KL_ASSISTANT_CONTEXT_REFRESH_DONE, onDone)
+      resolve(false)
+    }, timeoutMs)
+
+    const onDone = (event) => {
+      const d = event.detail || {}
+      if (d.requestId !== requestId) return
+      window.clearTimeout(timer)
+      window.removeEventListener(KL_ASSISTANT_CONTEXT_REFRESH_DONE, onDone)
+      resolve(d.ok !== false)
+    }
+
+    window.addEventListener(KL_ASSISTANT_CONTEXT_REFRESH_DONE, onDone)
+    window.dispatchEvent(
+      new CustomEvent(KL_ASSISTANT_CONTEXT_REFRESH_REQUEST, {
+        detail: { requestId },
+      }),
+    )
+  })
 }
 
 /** Lightweight, opaque request id. */
@@ -237,33 +283,31 @@ export function makeEditorAiRequestId() {
 export function dispatchEditorAiActionRequest({
   action,
   prompt = '',
-  userMessage = '',
+  userPrompt = '',
+  sectionHint = '',
+  targetScope = '',
+  lineNumber = null,
+  recordId = '',
+  preferFullSection = false,
   requestId,
   source = 'kl_assistant',
-  targetScope = '',
-  sectionHint = '',
 } = {}) {
   if (typeof window === 'undefined') return ''
   const id = requestId || makeEditorAiRequestId()
-  const resolvedUserMessage = String(userMessage || '').trim() || String(prompt || '').trim()
-  console.info('[kl-editor-bridge-dispatch]', {
-    action,
-    requestId: id,
-    source,
-    promptLen: String(prompt || '').length,
-    targetScope: String(targetScope || ''),
-    sectionHint: String(sectionHint || ''),
-  })
+  console.info('[kl-editor-bridge-dispatch]', { action, requestId: id, source, promptLen: String(prompt || '').length })
   window.dispatchEvent(
     new CustomEvent(EDITOR_AI_ACTION_REQUEST_EVENT, {
       detail: {
         action,
         prompt,
-        userMessage: resolvedUserMessage,
+        userPrompt: String(userPrompt || '').trim(),
+        sectionHint: String(sectionHint || '').trim(),
+        targetScope: String(targetScope || '').trim().toLowerCase(),
+        lineNumber: lineNumber ?? null,
+        recordId: String(recordId || '').trim(),
+        preferFullSection: Boolean(preferFullSection),
         requestId: id,
         source,
-        targetScope: String(targetScope || '').trim().toLowerCase(),
-        sectionHint: String(sectionHint || '').trim(),
       },
     }),
   )
@@ -328,62 +372,24 @@ const STATUS_MESSAGES_DE = {
   error: 'Editor-Aktion fehlgeschlagen.',
 }
 
-function stripPreviewPlain(text = '') {
-  return String(text || '')
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/p>/gi, '\n')
-    .replace(/<[^>]+>/g, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim()
-}
-
 /**
- * Build a short, user-facing chat status line for a bridge result.
+ * Build a short, user-facing chat status line for a bridge result. Returned
+ * text is German to match the existing assistant UI strings; callers may
+ * append additional details (e.g. error.message).
  */
-export function describeEditorAiResult(detail, language) {
-  if (!detail || typeof detail !== 'object') {
-    return getFriendlyErrorMessage(language ?? getAppLanguage())
-  }
-  const { action, status } = detail
+export function describeEditorAiResult(detail) {
+  if (!detail || typeof detail !== 'object') return STATUS_MESSAGES_DE.error
+  const { action, status, message } = detail
   if (status === EDITOR_AI_ACTION_STATUS.NOT_AVAILABLE) {
     return STATUS_MESSAGES_DE.not_available
   }
   if (status === EDITOR_AI_ACTION_STATUS.ERROR) {
-    return detail.message || getFriendlyErrorMessage(language ?? getAppLanguage())
-  }
-  if (status === EDITOR_AI_ACTION_STATUS.DISPLAYED) {
-    const preview = stripPreviewPlain(detail.preview_excerpt || detail.preview || '')
-    const section = detail.section_name ? ` (${detail.section_name})` : ''
-    const unchanged = Number(detail.unchanged_chunks || 0)
-    const unchangedNote =
-      unchanged > 0
-        ? `\n\nHinweis: ${unchanged} Textabschnitt(e) blieben unverändert (Modelllimit). Prüfe die Vorschau im Editor.`
-        : ''
-    if (preview) {
-      const verb =
-        action === EDITOR_AI_ACTIONS.REWRITE
-          ? 'Rewrite-Vorschau'
-          : action === EDITOR_AI_ACTIONS.IMPROVE
-            ? 'Verbesserungs-Vorschau'
-            : action === EDITOR_AI_ACTIONS.GAP_CHECK
-              ? 'Gap-Check-Ergebnis'
-              : action === EDITOR_AI_ACTIONS.SUMMARIZE
-                ? 'Zusammenfassung'
-                : 'Vorschau'
-      const reviewHint =
-        action === EDITOR_AI_ACTIONS.REWRITE || action === EDITOR_AI_ACTIONS.IMPROVE
-          ? 'Im Editor: Inline-Vorschau prüfen und Accept oder Reject wählen.'
-          : 'Öffne die Vorschau im Editor und wähle Übernehmen oder Verwerfen.'
-      return `${verb}${section}:\n\n${preview}\n\n${reviewHint}${unchangedNote}`
-    }
-    if (action === EDITOR_AI_ACTIONS.READ) return STATUS_MESSAGES_DE.read_displayed
-    if (action === EDITOR_AI_ACTIONS.COMPARE) return STATUS_MESSAGES_DE.compare_displayed
-    return 'Vorschau im Editor bereit. Bitte Übernehmen oder Verwerfen wählen.'
+    return message ? `${STATUS_MESSAGES_DE.error} ${message}` : STATUS_MESSAGES_DE.error
   }
   if (action === EDITOR_AI_ACTIONS.READ) return STATUS_MESSAGES_DE.read_displayed
   if (action === EDITOR_AI_ACTIONS.COMPARE && status === EDITOR_AI_ACTION_STATUS.DISPLAYED) {
     return STATUS_MESSAGES_DE.compare_displayed
   }
   const key = `${action}_${status === EDITOR_AI_ACTION_STATUS.APPLIED ? 'applied' : 'cancelled'}`
-  return STATUS_MESSAGES_DE[key] || getFriendlyErrorMessage(language ?? getAppLanguage())
+  return STATUS_MESSAGES_DE[key] || STATUS_MESSAGES_DE.error
 }

@@ -1,13 +1,11 @@
 /**
- * Semantic intent routing for the unified KL/KI Assistant chat panel.
- * Uses backend LLM classification — not fixed keyword matching.
+ * Sidebar transport for backend classify-intent — no keyword or alias logic here.
  */
 
 import { classifyAssistantIntent } from '../api/editorApi'
 import { queryEditorHasNonEmptySelection } from './editorActionsBridge'
-import { getKLAssistantContext } from './assistantContext'
+import { getKLAssistantContext, saveAssistantLastAction, saveAssistantSessionSnapshot } from './assistantContext'
 import { EDITOR_AI_ACTIONS, hasActiveSopEditor } from './editorAiBridge'
-import { isExplicitFullSopRequest } from './sopActionIntent'
 
 const ACTION_MAP = {
   rewrite: EDITOR_AI_ACTIONS.REWRITE,
@@ -22,43 +20,35 @@ const ACTION_MAP = {
 const INLINE_CONTENT_ACTIONS = new Set([
   EDITOR_AI_ACTIONS.REWRITE,
   EDITOR_AI_ACTIONS.IMPROVE,
-  EDITOR_AI_ACTIONS.SUMMARIZE,
 ])
 
 /**
  * @typedef {object} AssistantIntentClassification
- * @property {'chat'|'editor_action'|'clarify'} flow
+ * @property {'chat'|'editor_action'|'clarify'|'follow_up_action'} flow
  * @property {string|null} action
  * @property {string|null} target_scope
  * @property {string|null} section_hint
- * @property {string[]} linked_entity_types
- * @property {object} constraints
- * @property {string|null} clarification_question
- * @property {number} confidence
+ * @property {string|null} sidebar_intent — rag | sop_query | action | followup | clarify (from backend)
+ * @property {boolean} run_editor_action
+ * @property {boolean} run_query
+ * @property {string|null} enriched_instruction
+ * @property {object|null} target_resolution
  */
 
-/**
- * @typedef {object} EditorActionExecutionPlan
- * @property {string|null} intent — bridge action id
- * @property {string|null} inlineAction — action passed to inline /api/ai/action runner
- * @property {boolean} useInline — show inline diff + Accept/Reject in editor
- * @property {boolean} useBridge — legacy modal bridge (full-doc analysis only)
- * @property {{ sectionHint: string, targetScope: string }} snapshotOptions
- */
-
-/**
- * Call backend semantic intent classifier.
- * @returns {Promise<AssistantIntentClassification>}
- */
-export async function classifyAssistantMessage({ message, pathname = '/' }) {
+export async function classifyAssistantMessage({
+  message,
+  pathname = '/',
+  recentMessages = [],
+  assistantContextOverride = null,
+}) {
   const text = String(message || '').trim()
-  const assistantContext = getKLAssistantContext(pathname)
+  const assistantContext = assistantContextOverride || getKLAssistantContext(pathname)
   const hasActiveSop = hasActiveSopEditor(pathname)
 
   let hasEditorSelection = false
   if (hasActiveSop && typeof window !== 'undefined') {
     try {
-      hasEditorSelection = await queryEditorHasNonEmptySelection(180)
+      hasEditorSelection = await queryEditorHasNonEmptySelection(500)
     } catch {
       hasEditorSelection = false
     }
@@ -70,64 +60,136 @@ export async function classifyAssistantMessage({ message, pathname = '/' }) {
       route: pathname,
       has_active_sop: hasActiveSop,
       has_editor_selection: hasEditorSelection,
+      recent_messages: Array.isArray(recentMessages) ? recentMessages.slice(-8) : [],
       assistant_context: assistantContext,
     })
-    return normalizeClassification(result)
+    const normalized = normalizeClassification(result)
+    if (result?.session_snapshot) {
+      saveAssistantSessionSnapshot(result.session_snapshot)
+    } else if (result?.active_scope) {
+      saveAssistantSessionSnapshot({
+        active_scope: result.active_scope,
+        instruction_memory: result.instruction_memory || [],
+        conversation_history: result.conversation_history || [],
+      })
+    }
+    const scope = normalized.updated_active_scope || result?.active_scope
+    if (
+      normalized.run_editor_action
+      && normalized.flow !== 'chat'
+      && scope
+      && typeof scope === 'object'
+    ) {
+      const sectionLabel = String(scope.section_label || normalized.section_hint || '').trim()
+      if (sectionLabel || scope.last_action) {
+        saveAssistantLastAction({
+          action: String(scope.last_action || normalized.action || '').trim(),
+          target_scope: String(normalized.target_scope || scope.target_scope || 'section').trim(),
+          section_name: sectionLabel,
+          section_id: String(scope.section_id || sectionLabel).trim(),
+          request_prompt: text,
+          status: 'classified',
+          source: 'sidebar_classify',
+        })
+      }
+    }
+    return normalized
   } catch (err) {
-    console.warn('[assistant-intent] classification failed, defaulting to chat', err)
+    console.warn('[assistant-intent] classification failed', err)
     return {
-      flow: 'chat',
+      flow: 'clarify',
       action: null,
       target_scope: null,
       section_hint: null,
       linked_entity_types: [],
       constraints: {},
-      clarification_question: null,
+      clarification_question: 'I could not classify this request reliably. Please restate whether you want a chat answer or an editor action (rewrite, improve, gap_check, summarize, analyze).',
       confidence: 0,
       reasoning: 'classifier_unavailable',
+      sidebar_intent: 'clarify',
+      run_editor_action: false,
+      run_query: false,
+      enriched_instruction: text,
+      target_resolution: null,
     }
   }
 }
 
 function normalizeClassification(raw) {
-  const flow = ['chat', 'editor_action', 'clarify'].includes(raw?.flow) ? raw.flow : 'chat'
+  const rawFlow = String(raw?.flow || '').trim().toLowerCase()
+  const flow = ['chat', 'editor_action', 'clarify', 'follow_up_action'].includes(rawFlow) ? rawFlow : 'chat'
+  const resolved = raw?.resolved_scope && typeof raw.resolved_scope === 'object' ? raw.resolved_scope : null
+  const targetResolution =
+    raw?.target_resolution && typeof raw.target_resolution === 'object' ? raw.target_resolution : null
+
+  let targetScope = raw?.target_scope || targetResolution?.target_scope || null
+  let sectionHint = raw?.section_hint || targetResolution?.section_hint || null
+  if (resolved?.target_scope && !targetScope) targetScope = resolved.target_scope
+  if (resolved?.section_label && !sectionHint) sectionHint = resolved.section_label
+  if (targetScope === 'previous_suggestion') targetScope = 'section'
+
+  const runEditor = Boolean(raw?.run_editor_action)
+  let runQuery = Boolean(raw?.run_query)
+  const sidebarIntent = String(raw?.sidebar_intent || '').trim().toLowerCase()
+  if (flow === 'chat' || sidebarIntent === 'sop_query' || sidebarIntent === 'rag') {
+    runQuery = true
+  }
+  if (runEditor && (flow === 'editor_action' || flow === 'follow_up_action')) {
+    runQuery = false
+  }
+
   return {
     flow,
     action: raw?.action || null,
-    target_scope: raw?.target_scope || null,
-    section_hint: raw?.section_hint || null,
+    target_scope: targetScope,
+    section_hint: sectionHint,
+    line_number: raw?.line_number ?? targetResolution?.line_number ?? resolved?.line_number ?? null,
+    record_id: raw?.record_id || targetResolution?.record_id || resolved?.record_id || null,
     linked_entity_types: Array.isArray(raw?.linked_entity_types) ? raw.linked_entity_types : [],
     constraints: raw?.constraints && typeof raw.constraints === 'object' ? raw.constraints : {},
+    previous_action: raw?.previous_action && typeof raw.previous_action === 'object' ? raw.previous_action : null,
     clarification_question: raw?.clarification_question || null,
     confidence: typeof raw?.confidence === 'number' ? raw.confidence : 0.5,
-    reasoning: raw?.reasoning || null,
+    reasoning: raw?.reasoning || raw?.reason || null,
+    frustration_signal: raw?.frustration_signal && typeof raw.frustration_signal === 'object' ? raw.frustration_signal : null,
+    source_content_override: raw?.source_content_override && typeof raw.source_content_override === 'object'
+      ? raw.source_content_override
+      : null,
+    repetition_instruction: raw?.repetition_instruction || null,
+    updated_active_scope: raw?.updated_active_scope || raw?.active_scope || null,
+    sidebar_intent: raw?.sidebar_intent || null,
+    run_editor_action: flow === 'chat' ? false : runEditor,
+    run_query: flow === 'chat' ? true : (runEditor ? false : runQuery),
+    enriched_instruction: raw?.enriched_instruction || null,
+    target_resolution: targetResolution,
+    chat_submode: raw?.chat_submode || null,
+    assistant_message: raw?.assistant_message || null,
+    query_analysis: raw?.query_analysis || null,
   }
 }
 
-/** Map classifier action id to editor bridge action constant. */
 export function mapClassificationToEditorAction(classification) {
   const key = String(classification?.action || '').trim().toLowerCase()
   return ACTION_MAP[key] || null
 }
 
 /**
- * Decide inline editor diff vs modal bridge from semantic classification (not keywords).
- * @returns {EditorActionExecutionPlan}
+ * Map backend classification to editor execution plan (no local intent heuristics).
  */
 export function planEditorActionExecution(classification, opts = {}) {
   const intent = opts.explicitAction || mapClassificationToEditorAction(classification)
-  const message = String(opts.message || '').trim()
-  const fromChat = Boolean(opts.fromChat)
-  let scope = String(classification?.target_scope || '').toLowerCase()
-  if (isExplicitFullSopRequest({ instruction: message })) {
-    scope = 'full_document'
-  } else if (scope === 'full_document') {
-    scope = classification?.section_hint ? 'section' : 'selection'
-  }
-  const sectionHint = String(classification?.section_hint || '').trim()
+  const tr = classification?.target_resolution || {}
+  const sectionHint = String(
+    tr.section_hint || classification?.section_hint || classification?.record_id || '',
+  ).trim()
+  const scope = String(
+    tr.target_scope || classification?.target_scope || (sectionHint ? 'section' : 'selection'),
+  ).trim().toLowerCase()
+
   const snapshotOptions = {
     sectionHint,
     targetScope: scope,
+    preferFullSection: Boolean(tr.prefer_full_section),
   }
 
   if (!intent) {
@@ -140,20 +202,15 @@ export function planEditorActionExecution(classification, opts = {}) {
     }
   }
 
-  const inlineAction = intent
-
-  const chatContentActions = new Set([
-    EDITOR_AI_ACTIONS.REWRITE,
-    EDITOR_AI_ACTIONS.IMPROVE,
-    EDITOR_AI_ACTIONS.GAP_CHECK,
-    EDITOR_AI_ACTIONS.SUMMARIZE,
-  ])
+  const c = classification?.constraints || {}
+  let inlineAction = intent
+  if (intent === EDITOR_AI_ACTIONS.REWRITE && (c.tone === 'formal' || c.detail_level)) {
+    inlineAction = EDITOR_AI_ACTIONS.IMPROVE
+  }
 
   const useBridge =
     intent === EDITOR_AI_ACTIONS.COMPARE
     || intent === EDITOR_AI_ACTIONS.READ
-    || intent === EDITOR_AI_ACTIONS.ANALYZE
-    || (fromChat && chatContentActions.has(intent))
 
   const useInline = INLINE_CONTENT_ACTIONS.has(intent) && !useBridge
 
@@ -166,42 +223,9 @@ export function planEditorActionExecution(classification, opts = {}) {
   }
 }
 
-/**
- * Enrich the user instruction with extracted constraints and target hints
- * for the existing editor snapshot / action handlers.
- */
+/** Use server-built instruction; fallback to raw message only if missing. */
 export function buildEnrichedActionPrompt(message, classification = {}) {
-  const base = String(message || '').trim()
-  if (!base) return ''
-
-  const hints = []
-  const c = classification.constraints || {}
-
-  if (c.tone) hints.push(`Tone: ${c.tone}`)
-  if (c.word_count) hints.push(`Target length: about ${c.word_count} words`)
-  if (c.line_count) hints.push(`Keep the answer to roughly ${c.line_count} lines (short lines / bullets acceptable).`)
-  if (c.length === 'shorter') hints.push('Make the result shorter than the source.')
-  if (c.length === 'longer') hints.push('Expand the result with more detail.')
-  if (c.language) hints.push(`Output language: ${c.language}`)
-  if (c.detail_level) hints.push(`Detail level: ${c.detail_level}`)
-  if (c.format) hints.push(`Format: ${c.format}`)
-
-  if (classification.section_hint) {
-    hints.push(`Target section: ${classification.section_hint}`)
-    hints.push(
-      'Apply to the complete section body under that heading (all paragraphs until the next section), not the heading line alone.',
-    )
-  }
-  if (classification.target_scope === 'full_document' && wantsFullSopIntent(base)) {
-    hints.push('Apply to the entire SOP document (explicit full-SOP request).')
-  }
-  if (classification.target_scope === 'selection') {
-    hints.push('Apply only to the current editor selection.')
-  }
-  if (classification.target_scope === 'linked_context' && classification.linked_entity_types?.length) {
-    hints.push(`Focus on linked records: ${classification.linked_entity_types.join(', ')}`)
-  }
-
-  if (!hints.length) return base
-  return `${base}\n\n[Assistant constraints]\n${hints.join('\n')}`
+  const fromServer = String(classification?.enriched_instruction || '').trim()
+  if (fromServer) return fromServer
+  return String(message || '').trim()
 }
